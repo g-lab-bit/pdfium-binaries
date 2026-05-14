@@ -1,0 +1,151 @@
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -384,6 +384,9 @@ FPDFAnnot_IsSupportedSubtype(FPDF_ANNOTATION_SUBTYPE subtype) {
+ FPDFAnnot_IsSupportedSubtype(FPDF_ANNOTATION_SUBTYPE subtype) {
+   // The supported subtypes must also be communicated in the user doc.
+   switch (subtype) {
++    case FPDF_ANNOT_LINE:
++    case FPDF_ANNOT_POLYGON:
++    case FPDF_ANNOT_POLYLINE:
+     case FPDF_ANNOT_CIRCLE:
+     case FPDF_ANNOT_FILEATTACHMENT:
+     case FPDF_ANNOT_FREETEXT:
+@@ -1050,6 +1053,79 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_GetLine(FPDF_ANNOTATION annot,
+   return true;
+ }
+
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetVertices(FPDF_ANNOTATION annot,
++                      const FS_POINTF* points,
++                      size_t count) {
++  FPDF_ANNOTATION_SUBTYPE subtype = FPDFAnnot_GetSubtype(annot);
++  if (subtype != FPDF_ANNOT_POLYGON && subtype != FPDF_ANNOT_POLYLINE) {
++    return false;
++  }
++  if (!points && count > 0) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> annot_dict =
++      GetMutableAnnotDictFromFPDFAnnotation(annot);
++  if (!annot_dict) {
++    return false;
++  }
++  auto vertices =
++      annot_dict->SetNewFor<CPDF_Array>(pdfium::annotation::kVertices);
++  // SAFETY: required from caller.
++  auto points_span = UNSAFE_BUFFERS(pdfium::span(points, count));
++  for (const auto& pt : points_span) {
++    vertices->AppendNew<CPDF_Number>(pt.x);
++    vertices->AppendNew<CPDF_Number>(pt.y);
++  }
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
++                  const FS_POINTF* start,
++                  const FS_POINTF* end) {
++  if (!start || !end) {
++    return false;
++  }
++  FPDF_ANNOTATION_SUBTYPE subtype = FPDFAnnot_GetSubtype(annot);
++  if (subtype != FPDF_ANNOT_LINE) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> annot_dict =
++      GetMutableAnnotDictFromFPDFAnnotation(annot);
++  if (!annot_dict) {
++    return false;
++  }
++  auto line = annot_dict->SetNewFor<CPDF_Array>(pdfium::annotation::kL);
++  line->AppendNew<CPDF_Number>(start->x);
++  line->AppendNew<CPDF_Number>(start->y);
++  line->AppendNew<CPDF_Number>(end->x);
++  line->AppendNew<CPDF_Number>(end->y);
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
++                         FPDF_BYTESTRING start_name,
++                         FPDF_BYTESTRING end_name) {
++  if (!start_name || !end_name) {
++    return false;
++  }
++  FPDF_ANNOTATION_SUBTYPE subtype = FPDFAnnot_GetSubtype(annot);
++  if (subtype != FPDF_ANNOT_LINE) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> annot_dict =
++      GetMutableAnnotDictFromFPDFAnnotation(annot);
++  if (!annot_dict) {
++    return false;
++  }
++  auto le = annot_dict->SetNewFor<CPDF_Array>("LE");
++  le->AppendNew<CPDF_Name>(start_name);
++  le->AppendNew<CPDF_Name>(end_name);
++  return true;
++}
++
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetBorder(FPDF_ANNOTATION annot,
+                                                         float horizontal_radius,
+                                                         float vertical_radius,
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -472,6 +472,54 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_GetLine(FPDF_ANNOTATION annot,
+                                                       FS_POINTF* start,
+                                                       FS_POINTF* end);
+
++// Experimental API.
++// Set the /Vertices number array on a polygon or polyline annotation.
++// |points| is an array of FS_POINTF, |count| is the number of points
++// (not pairs). The /Vertices key in the annotation's dict is replaced
++// with an array of 2*count numbers in PDF user space (y-up).
++//
++//   annot  - handle to an annotation, as returned by e.g. FPDFPage_GetAnnot()
++//   points - array of FS_POINTF points
++//   count  - number of points in the |points| array
++//
++// Returns true on success, false if |annot| is not of type polygon or
++// polyline.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetVertices(FPDF_ANNOTATION annot,
++                      const FS_POINTF* points,
++                      size_t count);
++
++// Experimental API.
++// Set the starting and ending coordinates of a line annotation.
++// Writes [start.x start.y end.x end.y] as a 4-number /L array.
++//
++//   annot  - handle to an annotation, as returned by e.g. FPDFPage_GetAnnot()
++//   start  - starting point
++//   end    - ending point
++//
++// Returns true on success, false if |annot| is not of type line or
++// |start| or |end| are NULL.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
++                  const FS_POINTF* start,
++                  const FS_POINTF* end);
++
++// Experimental API.
++// Set the line ending styles (/LE name pair) of a line annotation.
++// |start_name| and |end_name| are bytestrings naming the line ending
++// style (e.g., "OpenArrow", "Circle", "None"). See PDF spec Table 175.
++//
++//   annot      - handle to an annotation
++//   start_name - name of the start line ending style
++//   end_name   - name of the end line ending style
++//
++// Returns true on success, false if |annot| is not of type line or
++// |start_name| or |end_name| are NULL.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
++                         FPDF_BYTESTRING start_name,
++                         FPDF_BYTESTRING end_name);
++
+ // Experimental API.
+ // Set the characteristics of the annotation's border (rounded rectangle).
+ //
