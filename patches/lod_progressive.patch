@@ -1,0 +1,40 @@
+--- a/core/fpdfapi/render/cpdf_progressiverenderer.cpp
++++ b/core/fpdfapi/render/cpdf_progressiverenderer.cpp
+@@ -80,6 +80,29 @@
+           pCurObj->GetRect().right >= clip_rect_.left &&
+           pCurObj->GetRect().bottom <= clip_rect_.top &&
+           pCurObj->GetRect().top >= clip_rect_.bottom) {
++        // ra-ax519.5 (Rapida LOD telemetry + skip, dev-local) -- instrument the
++        // REAL page render loop (ProgressiveRenderer bypasses RenderObjectList,
++        // where the original lod_render_skip patch sat dead). Count objects
++        // considered and, when the LOD flag is set, skip sub-pixel path objects
++        // (device bbox < 1px both dims) to measure whether skipping captures the
++        // t_reduced win on dense AEC sheets.
++        unsigned long long* lod_t = options_->GetOptions().bLodSkipSubpixel
++                                        ? CPDF_RenderStatus::LodTelem()
++                                        : nullptr;
++        bool lod_skip = false;
++        if (lod_t) {
++          ++lod_t[0];  // objects_visited (post-cull)
++          if (pCurObj->IsPath()) {
++            CFX_FloatRect dev =
++                current_layer_->GetMatrix().TransformRect(pCurObj->GetRect());
++            if (dev.Width() < 1.0f && dev.Height() < 1.0f) {
++              lod_skip = true;
++              ++lod_t[1];    // paths_skipped
++              lod_t[2] = 1;  // skip_flag_seen
++            }
++          }
++        }
++        if (!lod_skip) {
+         if (options_->GetOptions().bBreakForMasks && pCurObj->IsImage() &&
+             pCurObj->AsImage()->GetImage()->IsMask()) {
+ #if BUILDFLAG(IS_WIN)
+@@ -107,6 +130,7 @@
+         } else {
+           --nObjsToGo;
+         }
++        }  // ra-ax519.5 -- end if (!lod_skip)
+       }
+       last_object_rendered_ = iter;
+       if (nObjsToGo == 0) {
