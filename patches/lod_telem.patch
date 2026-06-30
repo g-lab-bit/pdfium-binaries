@@ -1,0 +1,106 @@
+--- a/core/fpdfapi/render/cpdf_renderstatus.cpp
++++ b/core/fpdfapi/render/cpdf_renderstatus.cpp
+@@ -210,11 +210,20 @@
+   }
+ }
+ 
++unsigned long long* CPDF_RenderStatus::LodTelem() {
++  static unsigned long long counters[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++  return counters;
++}
++
+ void CPDF_RenderStatus::RenderObjectList(
+     const CPDF_PageObjectHolder* pObjectHolder,
+     const CFX_Matrix& mtObj2Device) {
+   CFX_FloatRect clip_rect = mtObj2Device.GetInverse().TransformRect(
+       CFX_FloatRect(device_->GetClipBox()));
++  // ra-ax519.5 (Rapida LOD telemetry) -- when the LOD skip is active, accumulate
++  // per-object counts so FPDF_LodTelemGet can report the actual skip rate.
++  unsigned long long* telem =
++      options_.GetOptions().bLodSkipSubpixel ? LodTelem() : nullptr;
+   for (const auto& pCurObj : *pObjectHolder) {
+     if (pCurObj.get() == stop_obj_) {
+       stopped_ = true;
+@@ -230,6 +239,9 @@
+         pCurObj->GetRect().top < clip_rect.bottom) {
+       continue;
+     }
++    if (telem) {
++      ++telem[0];  // objects_visited (post-cull, considered for skip)
++    }
+     // ra-ax519.4 (Rapida LOD) -- skip sub-pixel path objects when requested.
+     // The clip cull above already proves the object is on-screen; here we drop
+     // path objects too small to be visible. Use the FLOAT device rect (an
+@@ -237,6 +249,10 @@
+     if (options_.GetOptions().bLodSkipSubpixel && pCurObj->IsPath()) {
+       CFX_FloatRect dev = mtObj2Device.TransformRect(pCurObj->GetRect());
+       if (dev.Width() < 1.0f && dev.Height() < 1.0f) {
++        if (telem) {
++          ++telem[1];    // paths_skipped
++          telem[2] = 1;  // skip_flag_seen
++        }
+         continue;
+       }
+     }
+--- a/core/fpdfapi/render/cpdf_renderstatus.h
++++ b/core/fpdfapi/render/cpdf_renderstatus.h
+@@ -73,6 +73,10 @@
+ 
+   void RenderObjectList(const CPDF_PageObjectHolder* pObjectHolder,
+                         const CFX_Matrix& mtObj2Device);
++  // ra-ax519.5 (Rapida LOD telemetry, dev-local) -- pointer to the render-loop
++  // counter block [0]=objects_visited [1]=paths_skipped [2]=skip_flag_seen,
++  // accumulated when bLodSkipSubpixel is set; read via FPDF_LodTelemGet.
++  static unsigned long long* LodTelem();
+   void RenderSingleObject(CPDF_PageObject* pObj,
+                           const CFX_Matrix& mtObj2Device);
+   bool ContinueSingleObject(CPDF_PageObject* pObj,
+--- a/fpdfsdk/fpdf_view.cpp
++++ b/fpdfsdk/fpdf_view.cpp
+@@ -29,6 +29,7 @@
+ #include "core/fpdfapi/render/cpdf_pagerendercontext.h"
+ #include "core/fpdfapi/render/cpdf_rendercontext.h"
+ #include "core/fpdfapi/render/cpdf_renderoptions.h"
++#include "core/fpdfapi/render/cpdf_renderstatus.h"
+ #include "core/fpdfdoc/cpdf_nametree.h"
+ #include "core/fpdfdoc/cpdf_viewerpreferences.h"
+ #include "core/fxcrt/cfx_fileaccess_stream.h"
+@@ -245,6 +246,21 @@
+   g_bLibraryInitialized = true;
+ }
+ 
++FPDF_EXPORT void FPDF_CALLCONV FPDF_LodTelemReset() {
++  unsigned long long* t = CPDF_RenderStatus::LodTelem();
++  for (int i = 0; i < 8; ++i) {
++    t[i] = 0;
++  }
++}
++
++FPDF_EXPORT void FPDF_CALLCONV
++FPDF_LodTelemGet(unsigned long long* out_counts) {
++  const unsigned long long* t = CPDF_RenderStatus::LodTelem();
++  for (int i = 0; i < 8; ++i) {
++    out_counts[i] = t[i];
++  }
++}
++
+ FPDF_EXPORT void FPDF_CALLCONV FPDF_DestroyLibrary() {
+   if (!g_bLibraryInitialized) {
+     return;
+--- a/public/fpdfview.h
++++ b/public/fpdfview.h
+@@ -345,6 +345,14 @@
+ //          closing the library with this function.
+ FPDF_EXPORT void FPDF_CALLCONV FPDF_DestroyLibrary();
+ 
++// ra-ax519.5 (Rapida LOD telemetry, dev-local diagnostic) -- read/reset the
++// render-loop counters accumulated when FPDF_RENDER_LOD_SKIP_SUBPIXEL is set.
++// |out_counts| must point to at least 8 elements:
++//   [0]=objects_visited [1]=paths_skipped [2]=skip_flag_seen (rest reserved).
++// Dev-only; no network egress, no file logging. Not for production callers.
++FPDF_EXPORT void FPDF_CALLCONV FPDF_LodTelemReset();
++FPDF_EXPORT void FPDF_CALLCONV FPDF_LodTelemGet(unsigned long long* out_counts);
++
+ // Policy for accessing the local machine time.
+ #define FPDF_POLICY_MACHINETIME_ACCESS 0
+ 

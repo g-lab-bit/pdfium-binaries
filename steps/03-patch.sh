@@ -20,6 +20,7 @@ pushd "${SOURCE}"
 apply_patch "$PATCHES/public_headers.patch"
 apply_patch "$PATCHES/annot_api.patch"
 apply_patch "$PATCHES/lod_render_skip.patch"
+apply_patch "$PATCHES/lod_telem.patch"
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
 
