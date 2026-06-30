@@ -41,11 +41,11 @@
      }
 +    // ra-ax519.4 (Rapida LOD) -- skip sub-pixel path objects when requested.
 +    // The clip cull above already proves the object is on-screen; here we drop
-+    // path objects too small to be visible at this scale. mtObj2Device is the
-+    // device transform the loop already holds, so this is a bbox read + branch.
++    // path objects too small to be visible. Use the FLOAT device rect (an
++    // integer FX_RECT rounds a sub-pixel path up to 1px and never skips).
 +    if (options_.GetOptions().bLodSkipSubpixel && pCurObj->IsPath()) {
-+      FX_RECT dev_bbox = pCurObj->GetTransformedBBox(mtObj2Device);
-+      if (dev_bbox.Width() < 1 && dev_bbox.Height() < 1) {
++      CFX_FloatRect dev = mtObj2Device.TransformRect(pCurObj->GetRect());
++      if (dev.Width() < 1.0f && dev.Height() < 1.0f) {
 +        continue;
 +      }
 +    }
