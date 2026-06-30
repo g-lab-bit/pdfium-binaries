@@ -1,0 +1,52 @@
+diff --git a/public/fpdfview.h b/public/fpdfview.h
+--- a/public/fpdfview.h
++++ b/public/fpdfview.h
+@@
+ #define FPDF_RENDER_NO_SMOOTHPATH 0x4000
++
++// ra-ax519.4 (Rapida LOD) — when set, the render loop skips PATH objects whose
++// device-space bounding box is < 1px in BOTH dimensions, so dense AEC sheets
++// render only visible-at-scale geometry. No effect on stock callers (unset).
++#define FPDF_RENDER_LOD_SKIP_SUBPIXEL 0x8000
+ // Set whether to render in a reverse Byte order, this flag is only used when
+ // rendering to a bitmap.
+ #define FPDF_REVERSE_BYTE_ORDER 0x10
+diff --git a/core/fpdfapi/render/cpdf_renderoptions.h b/core/fpdfapi/render/cpdf_renderoptions.h
+--- a/core/fpdfapi/render/cpdf_renderoptions.h
++++ b/core/fpdfapi/render/cpdf_renderoptions.h
+@@
+     bool bLimitedImageCache = false;
+     bool bConvertFillToStroke = false;
++    // ra-ax519.4 (Rapida LOD) — skip sub-pixel path objects in the render loop.
++    bool bLodSkipSubpixel = false;
+   };
+diff --git a/fpdfsdk/cpdfsdk_renderpage.cpp b/fpdfsdk/cpdfsdk_renderpage.cpp
+--- a/fpdfsdk/cpdfsdk_renderpage.cpp
++++ b/fpdfsdk/cpdfsdk_renderpage.cpp
+@@
+   options.bNoPathSmooth = !!(flags & FPDF_RENDER_NO_SMOOTHPATH);
++  options.bLodSkipSubpixel = !!(flags & FPDF_RENDER_LOD_SKIP_SUBPIXEL);
+ 
+   // Grayscale output
+   if (flags & FPDF_GRAYSCALE) {
+diff --git a/core/fpdfapi/render/cpdf_renderstatus.cpp b/core/fpdfapi/render/cpdf_renderstatus.cpp
+--- a/core/fpdfapi/render/cpdf_renderstatus.cpp
++++ b/core/fpdfapi/render/cpdf_renderstatus.cpp
+@@
+     if (pCurObj->GetRect().left > clip_rect.right ||
+         pCurObj->GetRect().right < clip_rect.left ||
+         pCurObj->GetRect().bottom > clip_rect.top ||
+         pCurObj->GetRect().top < clip_rect.bottom) {
+       continue;
+     }
++    // ra-ax519.4 (Rapida LOD) — skip sub-pixel path objects when requested.
++    // The clip cull above already proves the object is on-screen; here we drop
++    // path objects too small to be visible at this scale. mtObj2Device is the
++    // device transform the loop already holds, so this is a bbox read + branch.
++    if (options_.GetOptions().bLodSkipSubpixel && pCurObj->IsPath()) {
++      FX_RECT dev_bbox = pCurObj->GetTransformedBBox(mtObj2Device);
++      if (dev_bbox.Width() < 1 && dev_bbox.Height() < 1) {
++        continue;
++      }
++    }
+     RenderSingleObject(pCurObj.get(), mtObj2Device);
