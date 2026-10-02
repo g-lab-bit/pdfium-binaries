@@ -1,0 +1,308 @@
+diff -ruN b/fpdfsdk/fpdf_doc.cpp c/fpdfsdk/fpdf_doc.cpp
+--- b/fpdfsdk/fpdf_doc.cpp	2026-10-02 14:17:08
++++ c/fpdfsdk/fpdf_doc.cpp	2026-10-02 15:34:15
+@@ -15,6 +15,7 @@
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
++#include "core/fpdfapi/parser/cpdf_name.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+@@ -744,4 +745,225 @@
+                                                                           : 0;
+   }
+   return ArrayContainsOCG(config->GetArrayFor("OFF").Get(), ocg.Get()) ? 0 : 1;
++}
++
++// ---------------------------------------------------------------------------
++// g-lab-bit fork (ocg_write_api.patch) — OCG writes on the in-memory document.
++// ---------------------------------------------------------------------------
++
++namespace {
++
++RetainPtr<CPDF_Dictionary> GetMutableOCProperties(CPDF_Document* doc,
++                                                  bool create) {
++  RetainPtr<CPDF_Dictionary> root = doc->GetMutableRoot();
++  if (!root) {
++    return nullptr;
++  }
++  RetainPtr<CPDF_Dictionary> props = root->GetMutableDictFor("OCProperties");
++  if (!props && create) {
++    props = root->SetNewFor<CPDF_Dictionary>("OCProperties");
++    props->SetNewFor<CPDF_Array>("OCGs");
++    props->SetNewFor<CPDF_Dictionary>("D");
++  }
++  return props;
++}
++
++RetainPtr<CPDF_Dictionary> GetMutableOCGDict(CPDF_Document* doc, int index) {
++  RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, false);
++  RetainPtr<CPDF_Array> ocgs = props ? props->GetMutableArrayFor("OCGs")
++                                     : nullptr;
++  if (!ocgs || index < 0 || static_cast<size_t>(index) >= ocgs->size()) {
++    return nullptr;
++  }
++  return ocgs->GetMutableDictAt(index);
++}
++
++// Remove every indirect reference to |objnum| from |list|.
++void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
++  if (!list) {
++    return;
++  }
++  for (size_t i = list->size(); i > 0; --i) {
++    RetainPtr<const CPDF_Object> obj = list->GetObjectAt(i - 1);
++    const CPDF_Reference* ref = obj ? obj->AsReference() : nullptr;
++    if (ref && ref->GetRefObjNum() == objnum) {
++      list->RemoveAt(i - 1);
++    }
++  }
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_CreateOCG(FPDF_DOCUMENT document,
++                                               FPDF_WIDESTRING name) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || !name) {
++    return -1;
++  }
++  RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, true);
++  if (!props) {
++    return -1;
++  }
++  RetainPtr<CPDF_Array> ocgs = props->GetMutableArrayFor("OCGs");
++  if (!ocgs) {
++    ocgs = props->SetNewFor<CPDF_Array>("OCGs");
++  }
++  auto ocg = doc->NewIndirect<CPDF_Dictionary>();
++  ocg->SetNewFor<CPDF_Name>("Type", "OCG");
++  // SAFETY: required from caller.
++  WideString ws_name = UNSAFE_BUFFERS(WideStringFromFPDFWideString(name));
++  ocg->SetNewFor<CPDF_String>("Name", ws_name.AsStringView());
++  ocgs->AppendNew<CPDF_Reference>(doc, ocg->GetObjNum());
++
++  RetainPtr<CPDF_Dictionary> config = props->GetMutableDictFor("D");
++  RetainPtr<CPDF_Array> order = config ? config->GetMutableArrayFor("Order")
++                                       : nullptr;
++  if (order) {
++    order->AppendNew<CPDF_Reference>(doc, ocg->GetObjNum());
++  }
++  return pdfium::checked_cast<int>(ocgs->size()) - 1;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          FPDF_WIDESTRING value) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || !key || !value) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
++  if (!ocg) {
++    return false;
++  }
++  // SAFETY: required from caller.
++  WideString ws = UNSAFE_BUFFERS(WideStringFromFPDFWideString(value));
++  ocg->SetNewFor<CPDF_String>(key, ws.AsStringView());
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          float value) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || !key) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
++  if (!ocg) {
++    return false;
++  }
++  ocg->SetNewFor<CPDF_Number>(key, value);
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          const float* values,
++                          int count) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || !key || count < 0 || (count > 0 && !values)) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
++  if (!ocg) {
++    return false;
++  }
++  auto arr = ocg->SetNewFor<CPDF_Array>(key);
++  for (int i = 0; i < count; ++i) {
++    // SAFETY: required from caller (|values| holds |count| floats).
++    arr->AppendNew<CPDF_Number>(UNSAFE_BUFFERS(values[i]));
++  }
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
++                                int index,
++                                FPDF_BOOL visible) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
++  if (!ocg || ocg->GetObjNum() == 0) {
++    return false;
++  }
++  const uint32_t objnum = ocg->GetObjNum();
++  RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, false);
++  RetainPtr<CPDF_Dictionary> config = props->GetMutableDictFor("D");
++  if (!config) {
++    config = props->SetNewFor<CPDF_Dictionary>("D");
++  }
++  RetainPtr<CPDF_Array> on = config->GetMutableArrayFor("ON");
++  RetainPtr<CPDF_Array> off = config->GetMutableArrayFor("OFF");
++  RemoveOCGRef(on.Get(), objnum);
++  RemoveOCGRef(off.Get(), objnum);
++  const bool base_off = config->GetNameFor("BaseState") == "OFF";
++  if (!visible) {
++    if (!off) {
++      off = config->SetNewFor<CPDF_Array>("OFF");
++    }
++    off->AppendNew<CPDF_Reference>(doc, objnum);
++  } else if (base_off) {
++    if (!on) {
++      on = config->SetNewFor<CPDF_Array>("ON");
++    }
++    on->AppendNew<CPDF_Reference>(doc, objnum);
++  }
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
++                                                    FPDF_ANNOTATION annot,
++                                                    int index) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!doc || !context) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
++  if (!annot_dict) {
++    return false;
++  }
++  if (index == -1) {
++    annot_dict->RemoveFor("OC");
++    return true;
++  }
++  RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
++  if (!ocg || ocg->GetObjNum() == 0) {
++    return false;
++  }
++  annot_dict->SetNewFor<CPDF_Reference>("OC", doc, ocg->GetObjNum());
++  return true;
++}
++
++FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
++                                                   FPDF_ANNOTATION annot) {
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!context || !context->GetAnnotDict()) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Object> oc = context->GetAnnotDict()->GetObjectFor("OC");
++  const CPDF_Reference* ref = oc ? oc->AsReference() : nullptr;
++  if (!ref) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(document);
++  if (!ocgs) {
++    return -1;
++  }
++  for (size_t i = 0; i < ocgs->size(); ++i) {
++    RetainPtr<const CPDF_Object> obj = ocgs->GetObjectAt(i);
++    const CPDF_Reference* r = obj ? obj->AsReference() : nullptr;
++    if (r && r->GetRefObjNum() == ref->GetRefObjNum()) {
++      return pdfium::checked_cast<int>(i);
++    }
++  }
++  return -1;
+ }
+diff -ruN b/public/fpdf_doc.h c/public/fpdf_doc.h
+--- b/public/fpdf_doc.h	2026-10-02 14:17:08
++++ c/public/fpdf_doc.h	2026-10-02 15:34:15
+@@ -508,6 +508,67 @@
+ FPDF_EXPORT int FPDF_CALLCONV
+ FPDFDoc_GetOCGDefaultVisibility(FPDF_DOCUMENT document, int index);
+ 
++// g-lab-bit fork (ocg_write_api.patch) — optional content group writes on the
++// in-memory document. A subsequent FPDF_SaveAsCopy() persists them.
++
++// Experimental API.
++// Create a new optional content group named |name| (UTF-16LE, NUL-terminated)
++// as an indirect /Type /OCG dictionary, append it to /OCProperties /OCGs
++// (creating /OCProperties with an empty /D if absent) and, when the default
++// configuration has an /Order array, to that /Order.
++// Returns the new OCG's index (as used by FPDFDoc_GetOCG*), or -1 on error.
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_CreateOCG(FPDF_DOCUMENT document,
++                                               FPDF_WIDESTRING name);
++
++// Experimental API.
++// Set |key| in OCG |index|'s dictionary to a text string (UTF-16LE,
++// NUL-terminated), e.g. "Name" or "RapidaLayerId".
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          FPDF_WIDESTRING value);
++
++// Experimental API.
++// Set |key| in OCG |index|'s dictionary to a number.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          float value);
++
++// Experimental API.
++// Set |key| in OCG |index|'s dictionary to an array of |count| numbers.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          const float* values,
++                          int count);
++
++// Experimental API.
++// Make OCG |index| visible or hidden under the default configuration
++// (/OCProperties /D, created if absent). Removes the OCG from /D /ON and /OFF,
++// then adds it to /OFF when hidden, or to /ON when visible and /BaseState is
++// /OFF. The OCG must be an indirect object.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
++                                int index,
++                                FPDF_BOOL visible);
++
++// Experimental API.
++// Set annotation |annot|'s /OC entry to an indirect reference to OCG |index|,
++// or remove /OC when |index| is -1.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
++                                                    FPDF_ANNOTATION annot,
++                                                    int index);
++
++// Experimental API.
++// Returns the index (as used by FPDFDoc_GetOCG*) of the OCG referenced by
++// |annot|'s /OC entry, or -1 if it has none or it is not in /OCGs.
++FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
++                                                   FPDF_ANNOTATION annot);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus
