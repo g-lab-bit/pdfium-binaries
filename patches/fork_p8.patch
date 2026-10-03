@@ -1,0 +1,479 @@
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index c60ce24..00c8a05 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -527,7 +527,27 @@ FPDFAnnot_GetSubtype(FPDF_ANNOTATION annot) {
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+ FPDFAnnot_IsObjectSupportedSubtype(FPDF_ANNOTATION_SUBTYPE subtype) {
+   // The supported subtypes must also be communicated in the user doc.
+-  return subtype == FPDF_ANNOT_INK || subtype == FPDF_ANNOT_STAMP;
++  // g-lab-bit fork (fork_p8.patch): every markup subtype Rapida authors, so it
++  // can build each annotation's /AP from page objects (paths, text, images)
++  // and PDFium serializes the stream with its resources.
++  switch (subtype) {
++    case FPDF_ANNOT_INK:
++    case FPDF_ANNOT_STAMP:
++    case FPDF_ANNOT_TEXT:
++    case FPDF_ANNOT_FREETEXT:
++    case FPDF_ANNOT_LINE:
++    case FPDF_ANNOT_SQUARE:
++    case FPDF_ANNOT_CIRCLE:
++    case FPDF_ANNOT_POLYGON:
++    case FPDF_ANNOT_POLYLINE:
++    case FPDF_ANNOT_HIGHLIGHT:
++    case FPDF_ANNOT_UNDERLINE:
++    case FPDF_ANNOT_SQUIGGLY:
++    case FPDF_ANNOT_STRIKEOUT:
++      return true;
++    default:
++      return false;
++  }
+ }
+ 
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+@@ -1126,6 +1146,37 @@ FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
+   return true;
+ }
+ 
++// g-lab-bit fork (fork_p8.patch).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_GetLineEndings(FPDF_ANNOTATION annot,
++                         char* start_buffer,
++                         char* end_buffer,
++                         unsigned long buflen) {
++  if (!start_buffer || !end_buffer || buflen == 0) {
++    return false;
++  }
++  if (FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_LINE) {
++    return false;
++  }
++  const CPDF_Dictionary* annot_dict = GetAnnotDictFromFPDFAnnotation(annot);
++  if (!annot_dict) {
++    return false;
++  }
++  // Absent /LE (or a short array) means "None" for that end (PDF 32000 Table 175).
++  RetainPtr<const CPDF_Array> le = annot_dict->GetArrayFor("LE");
++  const ByteString start = le && le->size() > 0 ? le->GetByteStringAt(0) : "None";
++  const ByteString end = le && le->size() > 1 ? le->GetByteStringAt(1) : "None";
++  if (start.GetLength() + 1 > buflen || end.GetLength() + 1 > buflen) {
++    return false;
++  }
++  // SAFETY: required from caller (both buffers hold |buflen| bytes).
++  NulTerminateMaybeCopyAndReturnLength(
++      start, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(start_buffer, buflen)));
++  NulTerminateMaybeCopyAndReturnLength(
++      end, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(end_buffer, buflen)));
++  return true;
++}
++
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetBorder(FPDF_ANNOTATION annot,
+                                                         float horizontal_radius,
+                                                         float vertical_radius,
+diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
+index 047f492..a60de40 100644
+--- a/fpdfsdk/fpdf_doc.cpp
++++ b/fpdfsdk/fpdf_doc.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include "public/fpdf_doc.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <memory>
+ #include <set>
+ #include <utility>
+@@ -13,11 +15,13 @@
+ #include "constants/form_fields.h"
+ #include "core/fpdfapi/page/cpdf_annotcontext.h"
+ #include "core/fpdfapi/page/cpdf_page.h"
++#include "core/fpdfapi/page/ipdf_page.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_name.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
++#include "core/fpdfapi/parser/cpdf_parser.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fpdfapi/parser/fpdf_parser_decode.h"
+@@ -740,11 +744,16 @@ FPDFDoc_GetOCGDefaultVisibility(FPDF_DOCUMENT document, int index) {
+   if (!config) {
+     return 1;
+   }
+-  if (config->GetNameFor("BaseState") == "OFF") {
+-    return ArrayContainsOCG(config->GetArrayFor("ON").Get(), ocg.Get()) ? 1
+-                                                                          : 0;
++  // Same order as the renderer (CPDF_OCContext::LoadOCGStateFromConfig):
++  // BaseState, then /ON, then /OFF — an OCG listed in both arrays is OFF.
++  bool visible = config->GetNameFor("BaseState") != "OFF";
++  if (ArrayContainsOCG(config->GetArrayFor("ON").Get(), ocg.Get())) {
++    visible = true;
+   }
+-  return ArrayContainsOCG(config->GetArrayFor("OFF").Get(), ocg.Get()) ? 0 : 1;
++  if (ArrayContainsOCG(config->GetArrayFor("OFF").Get(), ocg.Get())) {
++    visible = false;
++  }
++  return visible ? 1 : 0;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -755,6 +764,8 @@ namespace {
+ 
+ RetainPtr<CPDF_Dictionary> GetMutableOCProperties(CPDF_Document* doc,
+                                                   bool create) {
++  // Note: configurations in /Configs may share their /ON|/OFF arrays with /D
++  // by reference; edits made through /D are then visible in them too.
+   RetainPtr<CPDF_Dictionary> root = doc->GetMutableRoot();
+   if (!root) {
+     return nullptr;
+@@ -763,6 +774,12 @@ RetainPtr<CPDF_Dictionary> GetMutableOCProperties(CPDF_Document* doc,
+   if (!props && create) {
+     props = root->SetNewFor<CPDF_Dictionary>("OCProperties");
+     props->SetNewFor<CPDF_Array>("OCGs");
++    // A fresh /D gets an /Order so readers' layer panels list the groups.
++    props->SetNewFor<CPDF_Dictionary>("D")->SetNewFor<CPDF_Array>("Order");
++    EnsureVersion15(doc, root.Get());
++  }
++  // /D is required in /OCProperties (32000-1 §8.11.4.2).
++  if (props && create && !props->GetDictFor("D")) {
+     props->SetNewFor<CPDF_Dictionary>("D");
+   }
+   return props;
+@@ -778,6 +795,77 @@ RetainPtr<CPDF_Dictionary> GetMutableOCGDict(CPDF_Document* doc, int index) {
+   return ocgs->GetMutableDictAt(index);
+ }
+ 
++// Keys the OCG setters must not overwrite: they define what the dictionary is
++// (/Type) and how readers apply it (/Intent, /Usage).
++bool IsReservedOCGKey(ByteStringView key) {
++  return key == "Type" || key == "Intent" || key == "Usage";
++}
++
++// |annot| must come from a page of |doc|, or /OC would reference an object of
++// another document.
++bool AnnotBelongsToDoc(CPDF_AnnotContext* context, CPDF_Document* doc) {
++  return context && context->GetPage() &&
++         context->GetPage()->GetDocument() == doc;
++}
++
++// Optional content needs PDF 1.5 (32000-1 §8.11.4.2 note). Raise the catalog
++// /Version when adding /OCProperties to an older file.
++void EnsureVersion15(CPDF_Document* doc, CPDF_Dictionary* root) {
++  const CPDF_Parser* parser = doc->GetParser();
++  const int file_version = parser ? parser->GetFileVersion() : 17;
++  ByteString catalog_version = root->GetNameFor("Version");
++  int declared = file_version;
++  if (catalog_version.GetLength() == 3 && catalog_version[1] == '.') {
++    declared = std::max(declared, (catalog_version[0] - '0') * 10 +
++                                      (catalog_version[2] - '0'));
++  }
++  if (declared < 15) {
++    root->SetNewFor<CPDF_Name>("Version", "1.5");
++  }
++}
++
++// Remove every indirect reference to |objnum| from |list| and from every
++// array nested in it (/Order and /RBGroups nest arrays).
++void RemoveOCGRefDeep(CPDF_Array* list, uint32_t objnum) {
++  if (!list) {
++    return;
++  }
++  for (size_t i = list->size(); i > 0; --i) {
++    RetainPtr<CPDF_Object> obj = list->GetMutableObjectAt(i - 1);
++    if (!obj) {
++      continue;
++    }
++    if (const CPDF_Reference* ref = obj->AsReference()) {
++      if (ref->GetRefObjNum() == objnum) {
++        list->RemoveAt(i - 1);
++      }
++      continue;
++    }
++    if (CPDF_Array* nested = obj->AsMutableArray()) {
++      RemoveOCGRefDeep(nested, objnum);
++    }
++  }
++}
++
++// Remove |objnum| from one optional-content configuration dictionary.
++void RemoveOCGFromConfig(CPDF_Dictionary* config, uint32_t objnum) {
++  if (!config) {
++    return;
++  }
++  for (const char* key : {"ON", "OFF", "Locked", "Order", "RBGroups"}) {
++    RemoveOCGRefDeep(config->GetMutableArrayFor(key).Get(), objnum);
++  }
++  RetainPtr<CPDF_Array> as = config->GetMutableArrayFor("AS");
++  if (as) {
++    for (size_t i = 0; i < as->size(); ++i) {
++      RetainPtr<CPDF_Dictionary> usage = as->GetMutableDictAt(i);
++      if (usage) {
++        RemoveOCGRefDeep(usage->GetMutableArrayFor("OCGs").Get(), objnum);
++      }
++    }
++  }
++}
++
+ // Remove every indirect reference to |objnum| from |list|.
+ void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
+   if (!list) {
+@@ -830,7 +918,7 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
+                           FPDF_BYTESTRING key,
+                           FPDF_WIDESTRING value) {
+   auto* doc = CPDFDocumentFromFPDFDocument(document);
+-  if (!doc || !key || !value) {
++  if (!doc || !key || !value || IsReservedOCGKey(key)) {
+     return false;
+   }
+   RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
+@@ -849,7 +937,7 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+                           FPDF_BYTESTRING key,
+                           float value) {
+   auto* doc = CPDFDocumentFromFPDFDocument(document);
+-  if (!doc || !key) {
++  if (!doc || !key || IsReservedOCGKey(key) || !std::isfinite(value)) {
+     return false;
+   }
+   RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
+@@ -867,9 +955,16 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+                           const float* values,
+                           int count) {
+   auto* doc = CPDFDocumentFromFPDFDocument(document);
+-  if (!doc || !key || count < 0 || (count > 0 && !values)) {
++  if (!doc || !key || IsReservedOCGKey(key) || count < 0 ||
++      (count > 0 && !values)) {
+     return false;
+   }
++  for (int i = 0; i < count; ++i) {
++    // SAFETY: required from caller (|values| holds |count| floats).
++    if (!std::isfinite(UNSAFE_BUFFERS(values[i]))) {
++      return false;
++    }
++  }
+   RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
+   if (!ocg) {
+     return false;
+@@ -924,7 +1019,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+                                                     int index) {
+   auto* doc = CPDFDocumentFromFPDFDocument(document);
+   CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+-  if (!doc || !context) {
++  if (!doc || !AnnotBelongsToDoc(context, doc)) {
+     return false;
+   }
+   RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
+@@ -946,7 +1041,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+                                                    FPDF_ANNOTATION annot) {
+   CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+-  if (!context || !context->GetAnnotDict()) {
++  if (!context || !context->GetAnnotDict() ||
++      !AnnotBelongsToDoc(context, CPDFDocumentFromFPDFDocument(document))) {
+     return -1;
+   }
+   RetainPtr<const CPDF_Object> oc = context->GetAnnotDict()->GetObjectFor("OC");
+@@ -967,3 +1063,84 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+   }
+   return -1;
+ }
++
++// g-lab-bit fork (fork_p8.patch).
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
++                                               int index) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return -1;
++  }
++  RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, false);
++  RetainPtr<CPDF_Array> ocgs = props ? props->GetMutableArrayFor("OCGs")
++                                     : nullptr;
++  if (!ocgs || index < 0 || static_cast<size_t>(index) >= ocgs->size()) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Object> entry = ocgs->GetObjectAt(index);
++  const CPDF_Reference* entry_ref = entry ? entry->AsReference() : nullptr;
++  if (!entry_ref) {
++    return -1;  // only indirect OCGs can be referenced, and so deleted
++  }
++  const uint32_t objnum = entry_ref->GetRefObjNum();
++
++  // 1. The group list and every configuration (/D and /Configs).
++  RemoveOCGRef(ocgs.Get(), objnum);
++  RemoveOCGFromConfig(props->GetMutableDictFor("D").Get(), objnum);
++  RetainPtr<CPDF_Array> configs = props->GetMutableArrayFor("Configs");
++  if (configs) {
++    for (size_t i = 0; i < configs->size(); ++i) {
++      RemoveOCGFromConfig(configs->GetMutableDictAt(i).Get(), objnum);
++    }
++  }
++
++  // 2. Annotations still pointing at it — directly or via an OCMD's /OCGs.
++  // The caller re-homes the annotations it cares about first; anything left
++  // becomes always-visible rather than referencing a group that is gone.
++  int touched = 0;
++  for (int p = 0; p < doc->GetPageCount(); ++p) {
++    RetainPtr<CPDF_Dictionary> page = doc->GetMutablePageDictionary(p);
++    RetainPtr<CPDF_Array> annots = page ? page->GetMutableArrayFor("Annots")
++                                        : nullptr;
++    if (!annots) {
++      continue;
++    }
++    for (size_t i = 0; i < annots->size(); ++i) {
++      RetainPtr<CPDF_Dictionary> annot = annots->GetMutableDictAt(i);
++      RetainPtr<const CPDF_Object> oc = annot ? annot->GetObjectFor("OC")
++                                              : nullptr;
++      if (!oc) {
++        continue;
++      }
++      const CPDF_Reference* oc_ref = oc->AsReference();
++      if (oc_ref && oc_ref->GetRefObjNum() == objnum) {
++        annot->RemoveFor("OC");
++        ++touched;
++        continue;
++      }
++      RetainPtr<CPDF_Dictionary> ocmd = annot->GetMutableDictFor("OC");
++      if (!ocmd || ocmd->GetNameFor("Type") != "OCMD") {
++        continue;
++      }
++      RetainPtr<CPDF_Object> members = ocmd->GetMutableDirectObjectFor("OCGs");
++      if (!members) {
++        continue;
++      }
++      if (CPDF_Array* list = members->AsMutableArray()) {
++        const size_t before = list->size();
++        RemoveOCGRef(list, objnum);
++        if (list->size() != before) {
++          ++touched;
++          if (list->IsEmpty()) {
++            annot->RemoveFor("OC");
++          }
++        }
++      } else if (members->GetObjNum() == objnum) {
++        annot->RemoveFor("OC");
++        ++touched;
++      }
++    }
++  }
++  // The OCG object itself is left unreferenced; a full rewrite drops it.
++  return touched;
++}
+diff --git a/fpdfsdk/fpdf_editpage.cpp b/fpdfsdk/fpdf_editpage.cpp
+index 06ed956..9e7c754 100644
+--- a/fpdfsdk/fpdf_editpage.cpp
++++ b/fpdfsdk/fpdf_editpage.cpp
+@@ -184,6 +184,15 @@ ParamsAndObject SetParamValueHelper(FPDF_DOCUMENT document,
+ 
+ }  // namespace
+ 
++// g-lab-bit fork (fork_p8.patch): a page from FPDFDoc_LoadPageWithoutContent
++// has no parsed page objects; generating or editing its content would write an
++// EMPTY content stream on save (the drawing would be deleted). Refuse instead.
++namespace {
++bool IsContentParsed(CPDF_Page* page) {
++  return page->GetParseState() == CPDF_PageObjectHolder::ParseState::kParsed;
++}
++}  // namespace
++
+ FPDF_EXPORT FPDF_DOCUMENT FPDF_CALLCONV FPDF_CreateNewDocument() {
+   auto doc =
+       std::make_unique<CPDF_Document>(std::make_unique<CPDF_DocRenderData>(),
+@@ -294,7 +303,7 @@ FPDFPage_InsertObject(FPDF_PAGE page, FPDF_PAGEOBJECT page_object) {
+ 
+   std::unique_ptr<CPDF_PageObject> pPageObjHolder(pPageObj);
+   CPDF_Page* pPage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(pPage)) {
++  if (!IsPageObject(pPage) || !IsContentParsed(pPage)) {
+     return;
+   }
+ 
+@@ -316,7 +325,7 @@ FPDFPage_InsertObjectAtIndex(FPDF_PAGE page,
+   std::unique_ptr<CPDF_PageObject> page_obj_holder(cpage_object);
+ 
+   CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(cpage)) {
++  if (!IsPageObject(cpage) || !IsContentParsed(cpage)) {
+     return false;
+   }
+ 
+@@ -334,7 +343,7 @@ FPDFPage_RemoveObject(FPDF_PAGE page, FPDF_PAGEOBJECT page_object) {
+   }
+ 
+   CPDF_Page* pPage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(pPage)) {
++  if (!IsPageObject(pPage) || !IsContentParsed(pPage)) {
+     return false;
+   }
+ 
+@@ -730,7 +739,7 @@ FPDFPageObj_SetIsActive(FPDF_PAGEOBJECT page_object, FPDF_BOOL active) {
+ 
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFPage_GenerateContent(FPDF_PAGE page) {
+   CPDF_Page* pPage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(pPage)) {
++  if (!IsPageObject(pPage) || !IsContentParsed(pPage)) {
+     return false;
+   }
+ 
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index e0b060c..c9f09a8 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -193,7 +193,9 @@ FPDFAnnot_GetSubtype(FPDF_ANNOTATION annot);
+ // Experimental API.
+ // Check if an annotation subtype is currently supported for object extraction,
+ // update, and removal.
+-// Currently supported subtypes: ink and stamp.
++// Currently supported subtypes: ink and stamp; in the g-lab-bit fork also
++// text, freetext, line, square, circle, polygon, polyline, highlight,
++// underline, squiggly and strikeout.
+ //
+ //   subtype   - the subtype to be checked.
+ //
+@@ -504,6 +506,24 @@ FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
+                   const FS_POINTF* start,
+                   const FS_POINTF* end);
+ 
++// Experimental API (g-lab-bit fork).
++// Get the line ending styles (/LE name pair) of a line annotation as
++// NUL-terminated names ("OpenArrow", "None", ...). A missing /LE, or a missing
++// entry, reads as "None".
++//
++//   annot        - handle to an annotation
++//   start_buffer - receives the start style name, |buflen| bytes
++//   end_buffer   - receives the end style name, |buflen| bytes
++//   buflen       - size of each buffer; 32 is enough for every standard name
++//
++// Returns true on success; false if |annot| is not a line annotation, a buffer
++// is NULL, or a name does not fit.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_GetLineEndings(FPDF_ANNOTATION annot,
++                         char* start_buffer,
++                         char* end_buffer,
++                         unsigned long buflen);
++
+ // Experimental API.
+ // Set the line ending styles (/LE name pair) of a line annotation.
+ // |start_name| and |end_name| are bytestrings naming the line ending
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index 4ef6eb5..0db2a38 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -569,6 +569,19 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+                                                    FPDF_ANNOTATION annot);
+ 
++// Experimental API (g-lab-bit fork).
++// Delete optional content group |index| (index into /OCProperties /OCGs):
++// removes it from /OCGs and from every configuration (/D and /Configs:
++// /ON, /OFF, /Locked, /Order, /RBGroups, /AS), and removes or prunes the /OC
++// entry of every annotation that still references it (directly or through an
++// OCMD). Indices of later groups shift down by one. Re-home annotations you
++// want to keep on another group BEFORE calling this.
++//
++// Returns the number of annotations whose /OC was changed (>= 0), or -1 on
++// failure (bad document or index, or a direct (non-indirect) OCG entry).
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
++                                               int index);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus
