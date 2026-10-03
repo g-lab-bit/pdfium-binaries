@@ -70,7 +70,7 @@ index c60ce24..00c8a05 100644
                                                          float horizontal_radius,
                                                          float vertical_radius,
 diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
-index 047f492..a60de40 100644
+index 047f492..8414919 100644
 --- a/fpdfsdk/fpdf_doc.cpp
 +++ b/fpdfsdk/fpdf_doc.cpp
 @@ -6,6 +6,8 @@
@@ -117,8 +117,12 @@ index 047f492..a60de40 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -755,6 +764,8 @@ namespace {
+@@ -753,8 +762,12 @@ FPDFDoc_GetOCGDefaultVisibility(FPDF_DOCUMENT document, int index) {
  
+ namespace {
+ 
++void EnsureVersion15(CPDF_Document* doc, CPDF_Dictionary* root);
++
  RetainPtr<CPDF_Dictionary> GetMutableOCProperties(CPDF_Document* doc,
                                                    bool create) {
 +  // Note: configurations in /Configs may share their /ON|/OFF arrays with /D
@@ -126,7 +130,7 @@ index 047f492..a60de40 100644
    RetainPtr<CPDF_Dictionary> root = doc->GetMutableRoot();
    if (!root) {
      return nullptr;
-@@ -763,6 +774,12 @@ RetainPtr<CPDF_Dictionary> GetMutableOCProperties(CPDF_Document* doc,
+@@ -763,6 +776,12 @@ RetainPtr<CPDF_Dictionary> GetMutableOCProperties(CPDF_Document* doc,
    if (!props && create) {
      props = root->SetNewFor<CPDF_Dictionary>("OCProperties");
      props->SetNewFor<CPDF_Array>("OCGs");
@@ -139,7 +143,7 @@ index 047f492..a60de40 100644
      props->SetNewFor<CPDF_Dictionary>("D");
    }
    return props;
-@@ -778,6 +795,77 @@ RetainPtr<CPDF_Dictionary> GetMutableOCGDict(CPDF_Document* doc, int index) {
+@@ -778,6 +797,77 @@ RetainPtr<CPDF_Dictionary> GetMutableOCGDict(CPDF_Document* doc, int index) {
    return ocgs->GetMutableDictAt(index);
  }
  
@@ -217,7 +221,7 @@ index 047f492..a60de40 100644
  // Remove every indirect reference to |objnum| from |list|.
  void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
    if (!list) {
-@@ -830,7 +918,7 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
+@@ -830,7 +920,7 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            FPDF_WIDESTRING value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -226,7 +230,7 @@ index 047f492..a60de40 100644
      return false;
    }
    RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
-@@ -849,7 +937,7 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+@@ -849,7 +939,7 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            float value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -235,7 +239,7 @@ index 047f492..a60de40 100644
      return false;
    }
    RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
-@@ -867,9 +955,16 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+@@ -867,9 +957,16 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
                            const float* values,
                            int count) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -253,7 +257,7 @@ index 047f492..a60de40 100644
    RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
    if (!ocg) {
      return false;
-@@ -924,7 +1019,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -924,7 +1021,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
                                                      int index) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -262,7 +266,7 @@ index 047f492..a60de40 100644
      return false;
    }
    RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
-@@ -946,7 +1041,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -946,7 +1043,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
  FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
                                                     FPDF_ANNOTATION annot) {
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -272,7 +276,7 @@ index 047f492..a60de40 100644
      return -1;
    }
    RetainPtr<const CPDF_Object> oc = context->GetAnnotDict()->GetObjectFor("OC");
-@@ -967,3 +1063,84 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+@@ -967,3 +1065,84 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
    }
    return -1;
  }
