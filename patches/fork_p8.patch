@@ -1,5 +1,5 @@
 diff --git a/core/fpdfdoc/cpdf_annot.cpp b/core/fpdfdoc/cpdf_annot.cpp
-index 97d3277..7ab1e1f 100644
+index 97d3277..f03b134 100644
 --- a/core/fpdfdoc/cpdf_annot.cpp
 +++ b/core/fpdfdoc/cpdf_annot.cpp
 @@ -19,6 +19,7 @@
@@ -10,7 +10,7 @@ index 97d3277..7ab1e1f 100644
  #include "core/fpdfapi/parser/cpdf_document.h"
  #include "core/fpdfapi/parser/cpdf_stream.h"
  #include "core/fpdfapi/parser/fpdf_parser_utility.h"
-@@ -144,15 +145,46 @@ void CPDF_Annot::GenerateAPIfNeeded() {
+@@ -144,15 +145,49 @@ void CPDF_Annot::GenerateAPIfNeeded() {
    if (!ShouldGenerateAP()) {
      return;
    }
@@ -27,6 +27,9 @@ index 97d3277..7ab1e1f 100644
    }
 -
 -  annot_dict_->SetNewFor<CPDF_Boolean>(kPDFiumKey_HasGeneratedAP, true);
++  // The clone is shallow: an existing /AP (e.g. a reference to a dictionary
++  // without /N) would still be the document's object. Start from none.
++  copy->RemoveFor(pdfium::annotation::kAP);
 +  auto objects = std::make_unique<CPDF_IndirectObjectHolder>();
 +  {
 +    CPDF_GenerateAP::ScopedRenderOnly render_only(objects.get());
@@ -61,7 +64,7 @@ index 97d3277..7ab1e1f 100644
  bool CPDF_Annot::ShouldGenerateAP() const {
    // If AP dictionary exists and defines an appearance for normal mode, we use
    // the appearance defined in the existing AP dictionary.
-@@ -161,6 +193,9 @@ bool CPDF_Annot::ShouldGenerateAP() const {
+@@ -161,6 +196,9 @@ bool CPDF_Annot::ShouldGenerateAP() const {
    if (pAP && pAP->GetDictFor("N")) {
      return false;
    }
@@ -71,7 +74,7 @@ index 97d3277..7ab1e1f 100644
  
    return !IsHidden();
  }
-@@ -183,10 +218,12 @@ CPDF_Annot::Subtype CPDF_Annot::GetSubtype() const {
+@@ -183,10 +221,12 @@ CPDF_Annot::Subtype CPDF_Annot::GetSubtype() const {
  CFX_FloatRect CPDF_Annot::RectForDrawing() const {
    bool bShouldUseQuadPointsCoords =
        is_text_markup_annotation_ && has_generated_ap_;
@@ -86,7 +89,7 @@ index 97d3277..7ab1e1f 100644
  }
  
  CFX_FloatRect CPDF_Annot::GetRect() const {
-@@ -216,7 +253,7 @@ RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(CPDF_Dictionary* pAnnotDict,
+@@ -216,7 +256,7 @@ RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(CPDF_Dictionary* pAnnotDict,
  }
  
  CPDF_Form* CPDF_Annot::GetAPForm(CPDF_Page* pPage, AppearanceMode mode) {
@@ -146,7 +149,7 @@ index 3e8bc5e..09d2c94 100644
  
  // Get the AP in an annotation dict for a given appearance mode.
 diff --git a/core/fpdfdoc/cpdf_annotlist.cpp b/core/fpdfdoc/cpdf_annotlist.cpp
-index db8be16..5faddae 100644
+index db8be16..307c834 100644
 --- a/core/fpdfdoc/cpdf_annotlist.cpp
 +++ b/core/fpdfdoc/cpdf_annotlist.cpp
 @@ -18,6 +18,7 @@
@@ -157,7 +160,15 @@ index db8be16..5faddae 100644
  #include "core/fpdfapi/parser/cpdf_document.h"
  #include "core/fpdfapi/parser/cpdf_name.h"
  #include "core/fpdfapi/parser/cpdf_number.h"
-@@ -207,7 +208,21 @@ CPDF_AnnotList::CPDF_AnnotList(CPDF_Page* pPage)
+@@ -202,12 +203,31 @@ CPDF_AnnotList::CPDF_AnnotList(CPDF_Page* pPage)
+       // provides its own Popup annotations.
+       continue;
+     }
+-    pAnnots->ConvertToIndirectObjectAt(i, document_);
++    // g-lab-bit fork (fork_p8.patch): upstream converted inline /Annots entries
++    // into indirect objects here, i.e. building the list for drawing rewrote
++    // the page. The annotation works the same as a direct dictionary.
+     annot_list_.push_back(std::make_unique<CPDF_Annot>(dict, document_));
      if (bRegenerateAP && subtype == "Widget" &&
          CPDF_InteractiveForm::IsUpdateAPEnabled() &&
          !dict->GetDictFor(pdfium::annotation::kAP)) {
@@ -168,6 +179,9 @@ index db8be16..5faddae 100644
 +      // copy with a private object store and draw from that instead. The
 +      // field's value and the document are untouched.
 +      RetainPtr<CPDF_Dictionary> copy = ToDictionary(dict->Clone());
++      if (copy) {
++        copy->RemoveFor(pdfium::annotation::kAP);  // never reach a document /AP
++      }
 +      auto objects = std::make_unique<CPDF_IndirectObjectHolder>();
 +      if (copy) {
 +        CPDF_GenerateAP::ScopedRenderOnly render_only(objects.get());
@@ -181,7 +195,7 @@ index db8be16..5faddae 100644
    }
  
 diff --git a/core/fpdfdoc/cpdf_generateap.cpp b/core/fpdfdoc/cpdf_generateap.cpp
-index 4a9d729..4fa2002 100644
+index 4a9d729..4a257b8 100644
 --- a/core/fpdfdoc/cpdf_generateap.cpp
 +++ b/core/fpdfdoc/cpdf_generateap.cpp
 @@ -23,6 +23,7 @@
@@ -192,7 +206,7 @@ index 4a9d729..4fa2002 100644
  #include "core/fpdfapi/parser/cpdf_reference.h"
  #include "core/fpdfapi/parser/cpdf_stream.h"
  #include "core/fpdfapi/parser/cpdf_string.h"
-@@ -42,6 +43,25 @@
+@@ -42,6 +43,40 @@
  
  namespace {
  
@@ -201,25 +215,63 @@ index 4a9d729..4fa2002 100644
 +// object store render-only appearances are registered in.
 +thread_local CPDF_IndirectObjectHolder* g_render_objects = nullptr;
 +
-+// Holder that owns |obj|: the private render-only store when the object was
-+// registered there, else the document.
-+CPDF_IndirectObjectHolder* HolderFor(CPDF_Document* doc, const CPDF_Object* obj) {
-+  if (g_render_objects && obj->GetObjNum() &&
-+      g_render_objects->GetIndirectObject(obj->GetObjNum()).Get() == obj) {
++// Process-wide holder for the one render-only fallback font, so rendering does
++// not mint (and CPDF_DocPageData does not cache) a new font per render.
++CPDF_IndirectObjectHolder* SharedFallbackFontHolder() {
++  static CPDF_IndirectObjectHolder* holder = new CPDF_IndirectObjectHolder();
++  return holder;
++}
++
++// Holder that owns |obj|: the shared fallback-font holder, the private
++// render-only store, or the document.
++CPDF_IndirectObjectHolder* HolderFor(CPDF_Document* doc,
++                                     const CPDF_Object* obj) {
++  const uint32_t objnum = obj->GetObjNum();
++  if (objnum && SharedFallbackFontHolder()->GetIndirectObject(objnum).Get() ==
++                    obj) {
++    return SharedFallbackFontHolder();
++  }
++  if (g_render_objects && objnum &&
++      g_render_objects->GetIndirectObject(objnum).Get() == obj) {
 +    return g_render_objects;
 +  }
 +  return doc;
 +}
 +
-+}  // namespace
-+
-+namespace {
++// Holder new render-time objects go into: the private store, else |doc|.
++CPDF_IndirectObjectHolder* NewObjectHolder(CPDF_Document* doc) {
++  return g_render_objects ? g_render_objects
++                          : static_cast<CPDF_IndirectObjectHolder*>(doc);
++}
 +
  constexpr char kGSDictName[] = "GS";
  
  struct CPVT_Dash {
-@@ -300,8 +320,9 @@ bool ValidateOrCreateFontResources(CPDF_Document* doc,
+@@ -279,7 +314,15 @@ bool CloneResourcesDictIfMissingFromStream(CPDF_Dictionary* stream_dict,
+     return false;
    }
+ 
+-  stream_dict->SetFor("Resources", dr_dict->Clone());
++  RetainPtr<CPDF_Dictionary> resources = ToDictionary(dr_dict->Clone());
++  // Render-only (fork_p8.patch): a shallow clone keeps /Font as a reference
++  // to the document's dictionary; make it a direct copy so adding a font
++  // resource later never writes into the document.
++  RetainPtr<const CPDF_Dictionary> fonts = dr_dict->GetDictFor("Font");
++  if (g_render_objects && resources && fonts) {
++    resources->SetFor("Font", fonts->Clone());
++  }
++  stream_dict->SetFor("Resources", std::move(resources));
+   return true;
+ }
+ 
+@@ -298,10 +341,15 @@ bool ValidateOrCreateFontResources(CPDF_Document* doc,
+   if (!ValidateFontResourceDict(font_resource_dict.Get())) {
+     return false;
+   }
++  if (g_render_objects &&
++      (resources_dict->GetObjNum() || font_resource_dict->GetObjNum())) {
++    return false;  // render-only never writes into a document object
++  }
  
    if (!font_resource_dict->KeyExist(font_name.AsStringView())) {
 -    font_resource_dict->SetNewFor<CPDF_Reference>(font_name, doc,
@@ -230,19 +282,28 @@ index 4a9d729..4fa2002 100644
    }
    return true;
  }
-@@ -610,7 +631,10 @@ ByteString GetPopupContentsString(CPDF_Document* doc,
+@@ -610,6 +658,20 @@ ByteString GetPopupContentsString(CPDF_Document* doc,
  }
  
  RetainPtr<CPDF_Dictionary> GenerateFallbackFontDict(CPDF_Document* doc) {
--  auto font_dict = doc->NewIndirect<CPDF_Dictionary>();
-+  // Render-only: registered in the private store, not the document.
-+  auto font_dict = g_render_objects
-+                       ? g_render_objects->NewIndirect<CPDF_Dictionary>()
-+                       : doc->NewIndirect<CPDF_Dictionary>();
++  // Render-only: one shared, process-wide fallback font (never the document,
++  // never a new object per render).
++  if (g_render_objects) {
++    static CPDF_Dictionary* shared = [] {
++      auto dict = SharedFallbackFontHolder()->NewIndirect<CPDF_Dictionary>();
++      dict->SetNewFor<CPDF_Name>("Type", "Font");
++      dict->SetNewFor<CPDF_Name>("Subtype", "Type1");
++      dict->SetNewFor<CPDF_Name>("BaseFont", CFX_Font::kDefaultAnsiFontName);
++      dict->SetNewFor<CPDF_Name>("Encoding",
++                                 pdfium::font_encodings::kWinAnsiEncoding);
++      return dict.Get();
++    }();
++    return pdfium::WrapRetain(shared);
++  }
+   auto font_dict = doc->NewIndirect<CPDF_Dictionary>();
    font_dict->SetNewFor<CPDF_Name>("Type", "Font");
    font_dict->SetNewFor<CPDF_Name>("Subtype", "Type1");
-   font_dict->SetNewFor<CPDF_Name>("BaseFont", CFX_Font::kDefaultAnsiFontName);
-@@ -630,18 +654,20 @@ RetainPtr<CPDF_Dictionary> GetFontFromDrFontDictOrGenerateFallback(
+@@ -630,18 +692,20 @@ RetainPtr<CPDF_Dictionary> GetFontFromDrFontDictOrGenerateFallback(
    }
  
    RetainPtr<CPDF_Dictionary> new_font_dict = GenerateFallbackFontDict(doc);
@@ -268,27 +329,30 @@ index 4a9d729..4fa2002 100644
    return resource_font_dict;
  }
  
-@@ -752,12 +778,17 @@ void GenerateAndSetAPDict(CPDF_Document* doc,
+@@ -752,12 +816,18 @@ void GenerateAndSetAPDict(CPDF_Document* doc,
    stream_dict->SetRectFor("BBox", rect);
    stream_dict->SetFor("Resources", std::move(resource_dict));
  
 -  auto normal_stream = doc->NewIndirect<CPDF_Stream>(std::move(stream_dict));
+-  normal_stream->SetDataFromStringstream(app_stream);
+-
 +  // Render-only: the stream lives in the private store, referenced from the
 +  // private annotation copy; the document never sees it.
-+  CPDF_IndirectObjectHolder* holder =
-+      g_render_objects ? g_render_objects
-+                       : static_cast<CPDF_IndirectObjectHolder*>(doc);
-+  auto normal_stream = holder->NewIndirect<CPDF_Stream>(std::move(stream_dict));
-   normal_stream->SetDataFromStringstream(app_stream);
- 
++  CPDF_IndirectObjectHolder* holder = NewObjectHolder(doc);
    RetainPtr<CPDF_Dictionary> ap_dict =
        annot_dict->GetOrCreateDictFor(pdfium::annotation::kAP);
 -  ap_dict->SetNewFor<CPDF_Reference>("N", doc, normal_stream->GetObjNum());
++  if (g_render_objects && ap_dict->GetObjNum()) {
++    return;  // /AP reached through a reference = a document object; never write
++  }
++  auto normal_stream = holder->NewIndirect<CPDF_Stream>(std::move(stream_dict));
++  normal_stream->SetDataFromStringstream(app_stream);
++
 +  ap_dict->SetNewFor<CPDF_Reference>("N", holder, normal_stream->GetObjNum());
  }
  
  ByteString GenerateTextFieldAP(const CPDF_Dictionary* annot_dict,
-@@ -1036,6 +1067,18 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1036,6 +1106,18 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    RetainPtr<CPDF_Dictionary> form_dict =
        root_dict->GetMutableDictFor("AcroForm");
@@ -300,14 +364,14 @@ index 4a9d729..4fa2002 100644
 +    RetainPtr<CPDF_Dictionary> helv = GenerateFallbackFontDict(doc);
 +    form_dict->SetNewFor<CPDF_Dictionary>("DR")
 +        ->SetNewFor<CPDF_Dictionary>("Font")
-+        ->SetNewFor<CPDF_Reference>("Helv", g_render_objects,
++        ->SetNewFor<CPDF_Reference>("Helv", HolderFor(doc, helv.Get()),
 +                                    helv->GetObjNum());
 +    form_dict->SetNewFor<CPDF_String>("DA", "/Helv 0 Tf 0 g");
 +  }
    if (!form_dict) {
      form_dict = CPDF_InteractiveForm::InitAcroFormDict(doc);
      CHECK(form_dict);
-@@ -1122,7 +1165,7 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1122,7 +1204,7 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    auto graphics_state_dict = GenerateExtGStateDict(*annot_dict, "Normal");
    auto resource_font_dict =
@@ -316,7 +380,7 @@ index 4a9d729..4fa2002 100644
    auto resource_dict = GenerateResourcesDict(
        doc, std::move(graphics_state_dict), std::move(resource_font_dict));
    GenerateAndSetAPDict(doc, annot_dict, &appearance_stream,
-@@ -1290,7 +1333,7 @@ bool GeneratePopupAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1290,7 +1372,7 @@ bool GeneratePopupAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    const ByteString font_name = "FONT";
    RetainPtr<CPDF_Dictionary> resource_font_dict =
@@ -325,7 +389,7 @@ index 4a9d729..4fa2002 100644
    RetainPtr<CPDF_Dictionary> gs_dict =
        GenerateExtGStateDict(*annot_dict, "Normal");
    RetainPtr<CPDF_Dictionary> resources_dict = GenerateResourcesDict(
-@@ -1506,9 +1549,13 @@ void CPDF_GenerateAP::GenerateFormAP(CPDF_Document* doc,
+@@ -1506,9 +1588,14 @@ void CPDF_GenerateAP::GenerateFormAP(CPDF_Document* doc,
      }
      resources_dict = stream_dict->GetMutableDictFor("Resources");
    } else {
@@ -333,16 +397,17 @@ index 4a9d729..4fa2002 100644
 -        doc->NewIndirect<CPDF_Stream>(pdfium::MakeRetain<CPDF_Dictionary>());
 -    ap_dict->SetNewFor<CPDF_Reference>("N", doc, normal_stream->GetObjNum());
 +    // Render-only (fork_p8.patch): the new stream lives in the private store.
-+    CPDF_IndirectObjectHolder* holder =
-+        g_render_objects ? g_render_objects
-+                         : static_cast<CPDF_IndirectObjectHolder*>(doc);
++    CPDF_IndirectObjectHolder* holder = NewObjectHolder(doc);
++    if (g_render_objects && ap_dict->GetObjNum()) {
++      return;  // never write into a document /AP dictionary
++    }
 +    normal_stream = holder->NewIndirect<CPDF_Stream>(
 +        pdfium::MakeRetain<CPDF_Dictionary>());
 +    ap_dict->SetNewFor<CPDF_Reference>("N", holder, normal_stream->GetObjNum());
    }
  
    const float font_size = default_appearance_info.value().font_size;
-@@ -1558,7 +1605,9 @@ void CPDF_GenerateAP::GenerateFormAP(CPDF_Document* doc,
+@@ -1558,7 +1645,9 @@ void CPDF_GenerateAP::GenerateFormAP(CPDF_Document* doc,
  
    const bool cloned =
        CloneResourcesDictIfMissingFromStream(stream_dict, dr_dict);
@@ -353,7 +418,7 @@ index 4a9d729..4fa2002 100644
      return;
    }
  
-@@ -1646,3 +1695,14 @@ bool CPDF_GenerateAP::GenerateDefaultAppearanceWithColor(
+@@ -1646,3 +1735,14 @@ bool CPDF_GenerateAP::GenerateDefaultAppearanceWithColor(
    // TODO(thestig): Call GenerateAnnotAP();
    return true;
  }
@@ -406,7 +471,7 @@ index 51ff1a1..2355a53 100644
    CPDF_GenerateAP(const CPDF_GenerateAP&) = delete;
    CPDF_GenerateAP& operator=(const CPDF_GenerateAP&) = delete;
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index c60ce24..00c8a05 100644
+index c60ce24..7ba4066 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -527,7 +527,27 @@ FPDFAnnot_GetSubtype(FPDF_ANNOTATION annot) {
@@ -438,46 +503,38 @@ index c60ce24..00c8a05 100644
  }
  
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-@@ -1126,6 +1146,37 @@ FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
+@@ -1126,6 +1146,29 @@ FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
    return true;
  }
  
 +// g-lab-bit fork (fork_p8.patch).
-+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-+FPDFAnnot_GetLineEndings(FPDF_ANNOTATION annot,
-+                         char* start_buffer,
-+                         char* end_buffer,
-+                         unsigned long buflen) {
-+  if (!start_buffer || !end_buffer || buflen == 0) {
-+    return false;
-+  }
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetLineEnding(FPDF_ANNOTATION annot,
++                        FPDF_BOOL end,
++                        char* buffer,
++                        unsigned long buflen) {
 +  if (FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_LINE) {
-+    return false;
++    return 0;
 +  }
 +  const CPDF_Dictionary* annot_dict = GetAnnotDictFromFPDFAnnotation(annot);
 +  if (!annot_dict) {
-+    return false;
++    return 0;
 +  }
-+  // Absent /LE (or a short array) means "None" for that end (PDF 32000 Table 175).
++  // Absent /LE (or a short array) means "None" for that end (32000-1 Table 176).
 +  RetainPtr<const CPDF_Array> le = annot_dict->GetArrayFor("LE");
-+  const ByteString start = le && le->size() > 0 ? le->GetByteStringAt(0) : "None";
-+  const ByteString end = le && le->size() > 1 ? le->GetByteStringAt(1) : "None";
-+  if (start.GetLength() + 1 > buflen || end.GetLength() + 1 > buflen) {
-+    return false;
-+  }
-+  // SAFETY: required from caller (both buffers hold |buflen| bytes).
-+  NulTerminateMaybeCopyAndReturnLength(
-+      start, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(start_buffer, buflen)));
-+  NulTerminateMaybeCopyAndReturnLength(
-+      end, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(end_buffer, buflen)));
-+  return true;
++  const size_t index = end ? 1 : 0;
++  const ByteString name =
++      le && le->size() > index ? le->GetByteStringAt(index) : "None";
++  // SAFETY: required from caller.
++  return NulTerminateMaybeCopyAndReturnLength(
++      name, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 +}
 +
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetBorder(FPDF_ANNOTATION annot,
                                                          float horizontal_radius,
                                                          float vertical_radius,
 diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
-index 047f492..8414919 100644
+index 047f492..e0acca0 100644
 --- a/fpdfsdk/fpdf_doc.cpp
 +++ b/fpdfsdk/fpdf_doc.cpp
 @@ -6,6 +6,8 @@
@@ -550,7 +607,7 @@ index 047f492..8414919 100644
      props->SetNewFor<CPDF_Dictionary>("D");
    }
    return props;
-@@ -778,6 +797,77 @@ RetainPtr<CPDF_Dictionary> GetMutableOCGDict(CPDF_Document* doc, int index) {
+@@ -778,6 +797,107 @@ RetainPtr<CPDF_Dictionary> GetMutableOCGDict(CPDF_Document* doc, int index) {
    return ocgs->GetMutableDictAt(index);
  }
  
@@ -606,6 +663,28 @@ index 047f492..8414919 100644
 +  }
 +}
 +
++// Drop nested /Order arrays left empty, or holding only their label string,
++// after a group was removed (32000-1 Table 101: a nested array may start with
++// a text label).
++void PruneEmptyOrderGroups(CPDF_Array* list) {
++  if (!list) {
++    return;
++  }
++  for (size_t i = list->size(); i > 0; --i) {
++    RetainPtr<CPDF_Object> obj = list->GetMutableObjectAt(i - 1);
++    CPDF_Array* nested = obj ? obj->AsMutableArray() : nullptr;
++    if (!nested) {
++      continue;
++    }
++    PruneEmptyOrderGroups(nested);
++    const bool label_only = nested->size() == 1 && nested->GetObjectAt(0) &&
++                            nested->GetObjectAt(0)->IsString();
++    if (nested->IsEmpty() || label_only) {
++      list->RemoveAt(i - 1);
++    }
++  }
++}
++
 +// Remove |objnum| from one optional-content configuration dictionary.
 +void RemoveOCGFromConfig(CPDF_Dictionary* config, uint32_t objnum) {
 +  if (!config) {
@@ -613,6 +692,14 @@ index 047f492..8414919 100644
 +  }
 +  for (const char* key : {"ON", "OFF", "Locked", "Order", "RBGroups"}) {
 +    RemoveOCGRefDeep(config->GetMutableArrayFor(key).Get(), objnum);
++  }
++  PruneEmptyOrderGroups(config->GetMutableArrayFor("Order").Get());
++  RetainPtr<CPDF_Array> rb = config->GetMutableArrayFor("RBGroups");
++  for (size_t i = rb ? rb->size() : 0; i > 0; --i) {
++    RetainPtr<const CPDF_Array> group = rb->GetArrayAt(i - 1);
++    if (group && group->IsEmpty()) {
++      rb->RemoveAt(i - 1);
++    }
 +  }
 +  RetainPtr<CPDF_Array> as = config->GetMutableArrayFor("AS");
 +  if (as) {
@@ -628,7 +715,7 @@ index 047f492..8414919 100644
  // Remove every indirect reference to |objnum| from |list|.
  void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
    if (!list) {
-@@ -830,7 +920,7 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
+@@ -830,7 +950,7 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            FPDF_WIDESTRING value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -637,7 +724,7 @@ index 047f492..8414919 100644
      return false;
    }
    RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
-@@ -849,7 +939,7 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+@@ -849,7 +969,7 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            float value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -646,7 +733,7 @@ index 047f492..8414919 100644
      return false;
    }
    RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
-@@ -867,9 +957,16 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+@@ -867,9 +987,16 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
                            const float* values,
                            int count) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -664,7 +751,7 @@ index 047f492..8414919 100644
    RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
    if (!ocg) {
      return false;
-@@ -924,7 +1021,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -924,7 +1051,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
                                                      int index) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -673,7 +760,7 @@ index 047f492..8414919 100644
      return false;
    }
    RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
-@@ -946,7 +1043,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -946,7 +1073,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
  FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
                                                     FPDF_ANNOTATION annot) {
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -683,7 +770,7 @@ index 047f492..8414919 100644
      return -1;
    }
    RetainPtr<const CPDF_Object> oc = context->GetAnnotDict()->GetObjectFor("OC");
-@@ -967,3 +1065,84 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+@@ -967,3 +1095,100 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
    }
    return -1;
  }
@@ -721,7 +808,10 @@ index 047f492..8414919 100644
 +  // 2. Annotations still pointing at it — directly or via an OCMD's /OCGs.
 +  // The caller re-homes the annotations it cares about first; anything left
 +  // becomes always-visible rather than referencing a group that is gone.
++  // An OCMD may be shared by several annotations: prune it once, count every
++  // annotation that uses it.
 +  int touched = 0;
++  std::set<const CPDF_Dictionary*> pruned_ocmds;
 +  for (int p = 0; p < doc->GetPageCount(); ++p) {
 +    RetainPtr<CPDF_Dictionary> page = doc->GetMutablePageDictionary(p);
 +    RetainPtr<CPDF_Array> annots = page ? page->GetMutableArrayFor("Annots")
@@ -746,6 +836,14 @@ index 047f492..8414919 100644
 +      if (!ocmd || ocmd->GetNameFor("Type") != "OCMD") {
 +        continue;
 +      }
++      if (pruned_ocmds.count(ocmd.Get())) {  // shared OCMD already pruned
++        ++touched;
++        RetainPtr<const CPDF_Array> left = ocmd->GetArrayFor("OCGs");
++        if (!left || left->IsEmpty()) {
++          annot->RemoveFor("OC");
++        }
++        continue;
++      }
 +      RetainPtr<CPDF_Object> members = ocmd->GetMutableDirectObjectFor("OCGs");
 +      if (!members) {
 +        continue;
@@ -754,18 +852,23 @@ index 047f492..8414919 100644
 +        const size_t before = list->size();
 +        RemoveOCGRef(list, objnum);
 +        if (list->size() != before) {
++          pruned_ocmds.insert(ocmd.Get());
 +          ++touched;
 +          if (list->IsEmpty()) {
 +            annot->RemoveFor("OC");
 +          }
 +        }
 +      } else if (members->GetObjNum() == objnum) {
++        pruned_ocmds.insert(ocmd.Get());
 +        annot->RemoveFor("OC");
 +        ++touched;
 +      }
 +    }
 +  }
-+  // The OCG object itself is left unreferenced; a full rewrite drops it.
++  // Not handled (documented in fpdf_doc.h): OCG references from page or
++  // XObject /Properties (marked content), /OC on form or image XObjects, and
++  // OCMD /VE visibility expressions. Rapida only deletes groups it created,
++  // which are referenced from annotations and configurations alone.
 +  return touched;
 +}
 diff --git a/fpdfsdk/fpdf_editpage.cpp b/fpdfsdk/fpdf_editpage.cpp
@@ -825,7 +928,7 @@ index 06ed956..9e7c754 100644
    }
  
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index e0b060c..c9f09a8 100644
+index e0b060c..db4a290 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
 @@ -193,7 +193,9 @@ FPDFAnnot_GetSubtype(FPDF_ANNOTATION annot);
@@ -839,36 +942,38 @@ index e0b060c..c9f09a8 100644
  //
  //   subtype   - the subtype to be checked.
  //
-@@ -504,6 +506,24 @@ FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
+@@ -504,6 +506,26 @@ FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
                    const FS_POINTF* start,
                    const FS_POINTF* end);
  
 +// Experimental API (g-lab-bit fork).
-+// Get the line ending styles (/LE name pair) of a line annotation as
-+// NUL-terminated names ("OpenArrow", "None", ...). A missing /LE, or a missing
-+// entry, reads as "None".
++// Get one line ending style of a line annotation (/LE, PDF 32000-1 Table 176)
++// as a NUL-terminated name ("OpenArrow", "None", ...). A missing /LE, or a
++// missing entry, reads as "None". Follows the usual PDFium buffer convention:
++// call with a NULL |buffer| to get the required length.
 +//
-+//   annot        - handle to an annotation
-+//   start_buffer - receives the start style name, |buflen| bytes
-+//   end_buffer   - receives the end style name, |buflen| bytes
-+//   buflen       - size of each buffer; 32 is enough for every standard name
++//   annot  - handle to a line annotation
++//   end    - false for the start style, true for the end style
++//   buffer - receives the name; may be NULL
++//   buflen - length of |buffer| in bytes
 +//
-+// Returns true on success; false if |annot| is not a line annotation, a buffer
-+// is NULL, or a name does not fit.
-+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-+FPDFAnnot_GetLineEndings(FPDF_ANNOTATION annot,
-+                         char* start_buffer,
-+                         char* end_buffer,
-+                         unsigned long buflen);
++// Returns the length of the name including the NUL terminator, or 0 if
++// |annot| is not a line annotation. |buffer| is only modified if |buflen| is
++// at least the returned length.
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetLineEnding(FPDF_ANNOTATION annot,
++                        FPDF_BOOL end,
++                        char* buffer,
++                        unsigned long buflen);
 +
  // Experimental API.
  // Set the line ending styles (/LE name pair) of a line annotation.
  // |start_name| and |end_name| are bytestrings naming the line ending
 diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
-index 4ef6eb5..0db2a38 100644
+index 4ef6eb5..7c690e1 100644
 --- a/public/fpdf_doc.h
 +++ b/public/fpdf_doc.h
-@@ -569,6 +569,19 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -569,6 +569,22 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
  FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
                                                     FPDF_ANNOTATION annot);
  
@@ -878,7 +983,10 @@ index 4ef6eb5..0db2a38 100644
 +// /ON, /OFF, /Locked, /Order, /RBGroups, /AS), and removes or prunes the /OC
 +// entry of every annotation that still references it (directly or through an
 +// OCMD). Indices of later groups shift down by one. Re-home annotations you
-+// want to keep on another group BEFORE calling this.
++// want to keep on another group BEFORE calling this. Nested /Order groups left
++// empty are removed. NOT handled: references from page or XObject /Properties
++// (marked content), /OC on form or image XObjects, and OCMD /VE expressions -
++// only delete groups referenced by annotations and configurations alone.
 +//
 +// Returns the number of annotations whose /OC was changed (>= 0), or -1 on
 +// failure (bad document or index, or a direct (non-indirect) OCG entry).
