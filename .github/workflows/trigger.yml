@@ -5,18 +5,10 @@ on:
     - cron:  '0 4 * * 1'
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
-
-permissions: {}
-
 jobs:
   trigger:
     name: Trigger build
     runs-on: ubuntu-latest
-    permissions:
-      actions: write # Trigger downstream workflow
     steps:
     - name: Get Chrome version
       id: chromium
@@ -27,17 +19,21 @@ jobs:
         BUILD=$(echo "$VERSION" | cut -d. -f3)
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "branch=chromium/$BUILD" >> $GITHUB_OUTPUT
-    - name: Trigger build
+    - name: Get date
+      id: date
       run: |
-        gh workflow run "Build all" \
-          --field branch="$BRANCH" \
-          --field version="$VERSION" \
-          --field is_debug=false \
-          --field enable_v8=true \
-          --field release=true \
-          --field nuget=true
-      env:
-        GH_REPO: ${{ github.repository }}
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        BRANCH: ${{ steps.chromium.outputs.branch }}
-        VERSION: ${{ steps.chromium.outputs.version }}
+        echo "day=$(date +%-d)" >> $GITHUB_OUTPUT
+    - name: Trigger build
+      uses: benc-uk/workflow-dispatch@v1
+      with:
+        workflow: Build all
+        inputs: |
+          {
+            "branch": "${{ steps.chromium.outputs.branch }}",
+            "version": "${{ steps.chromium.outputs.version }}",
+            "is_debug": "false",
+            "enable_v8": "true",
+            "release": "true",
+            "nuget": "true",
+            "anaconda": "${{ steps.date.outputs.day <= 7 && 'true' || 'false' }}"
+          }

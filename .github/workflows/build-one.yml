@@ -27,8 +27,6 @@ on:
         options:
           - arm
           - arm64
-          - mipsel
-          - mips64el
           - ppc64
           - x64
           - x86
@@ -59,17 +57,11 @@ on:
         required: false
         default: false
 
-permissions: {}
-
 jobs:
   build:
     name: Build
-    permissions:
-      contents: read
-      actions: write # Trigger reusable workflow and upload artifacts
     uses: ./.github/workflows/build.yml
-    secrets:
-      MUSL_URL: ${{ secrets.MUSL_URL }}
+    secrets: inherit
     with:
       branch: ${{ github.event.inputs.branch }}
       version: ${{ github.event.inputs.version }}

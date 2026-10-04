@@ -1,10 +1,8 @@
 name: Build all
 
-permissions: {}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.branch }}
-  cancel-in-progress: true
+permissions:
+  contents: read
+  actions: write # to upload artifacts
 
 on:
   workflow_dispatch:
@@ -37,13 +35,15 @@ on:
         type: boolean
         required: false
         default: false
+      anaconda:
+        description: Publish on anaconda.org
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   android_arm:
     name: Android ARM
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -57,9 +57,6 @@ jobs:
     name: Android ARM V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: android_arm
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -71,9 +68,6 @@ jobs:
 
   android_arm64:
     name: Android ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -87,9 +81,6 @@ jobs:
     name: Android ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: android_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -101,9 +92,6 @@ jobs:
 
   android_x64:
     name: Android x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -117,9 +105,6 @@ jobs:
     name: Android x64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: android_x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -131,9 +116,6 @@ jobs:
 
   android_x86:
     name: Android x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -147,9 +129,6 @@ jobs:
     name: Android x86 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: android_x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -161,9 +140,6 @@ jobs:
 
   ios_catalyst_arm64:
     name: iOS catalyst ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -178,9 +154,6 @@ jobs:
     name: iOS catalyst ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: ios_catalyst_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -193,9 +166,6 @@ jobs:
 
   ios_catalyst_x64:
     name: iOS catalyst x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -210,9 +180,6 @@ jobs:
     name: iOS catalyst x64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: ios_catalyst_x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -225,9 +192,6 @@ jobs:
 
   ios_device_arm64:
     name: iOS device ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -242,9 +206,6 @@ jobs:
     name: iOS device ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: ios_device_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -257,9 +218,6 @@ jobs:
 
   ios_simulator_arm64:
     name: iOS simulator ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -274,9 +232,6 @@ jobs:
     name: iOS simulator ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: ios_simulator_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -289,9 +244,6 @@ jobs:
 
   ios_simulator_x64:
     name: iOS simulator x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -306,9 +258,6 @@ jobs:
     name: iOS simulator x64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: ios_simulator_x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -321,9 +270,6 @@ jobs:
 
   linux_arm:
     name: Linux ARM
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -337,9 +283,6 @@ jobs:
     name: Linux ARM V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: linux_arm
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -351,9 +294,6 @@ jobs:
 
   linux_arm64:
     name: Linux ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -367,9 +307,6 @@ jobs:
     name: Linux ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: linux_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -379,39 +316,8 @@ jobs:
       target_cpu: arm64
       enable_v8: true
 
-  linux_mipsel:
-    name: Linux mipsel
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
-    uses: ./.github/workflows/build.yml
-    with:
-      branch: ${{ github.event.inputs.branch }}
-      version: ${{ github.event.inputs.version }}
-      is_debug: ${{ github.event.inputs.is_debug == 'true' }}
-      target_os: linux
-      target_cpu: mipsel
-      enable_v8: false
-
-  linux_mips64el:
-    name: Linux mips64el
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
-    uses: ./.github/workflows/build.yml
-    with:
-      branch: ${{ github.event.inputs.branch }}
-      version: ${{ github.event.inputs.version }}
-      is_debug: ${{ github.event.inputs.is_debug == 'true' }}
-      target_os: linux
-      target_cpu: mips64el
-      enable_v8: false
-
   linux_ppc64:
     name: Linux ppc64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -423,9 +329,6 @@ jobs:
 
   linux_x64:
     name: Linux x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -439,9 +342,6 @@ jobs:
     name: Linux x64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: linux_x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -453,9 +353,6 @@ jobs:
 
   linux_x86:
     name: Linux x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -469,9 +366,6 @@ jobs:
     name: Linux x86 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: linux_x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -483,12 +377,8 @@ jobs:
 
   linux_musl_arm64:
     name: Linux musl ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
-    secrets:
-      MUSL_URL: ${{ secrets.MUSL_URL }}
+    secrets: inherit
     with:
       branch: ${{ github.event.inputs.branch }}
       version: ${{ github.event.inputs.version }}
@@ -500,12 +390,8 @@ jobs:
 
   linux_musl_x64:
     name: Linux musl x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
-    secrets:
-      MUSL_URL: ${{ secrets.MUSL_URL }}
+    secrets: inherit
     with:
       branch: ${{ github.event.inputs.branch }}
       version: ${{ github.event.inputs.version }}
@@ -517,12 +403,8 @@ jobs:
 
   linux_musl_x86:
     name: Linux musl x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
-    secrets:
-      MUSL_URL: ${{ secrets.MUSL_URL }}
+    secrets: inherit
     with:
       branch: ${{ github.event.inputs.branch }}
       version: ${{ github.event.inputs.version }}
@@ -534,9 +416,6 @@ jobs:
 
   mac_arm64:
     name: macOS ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -550,9 +429,6 @@ jobs:
     name: macOS ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: mac_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -564,9 +440,6 @@ jobs:
 
   mac_x64:
     name: macOS x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -580,9 +453,6 @@ jobs:
     name: macOS x64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: mac_x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -594,9 +464,6 @@ jobs:
 
   win_arm64:
     name: Windows ARM64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -610,9 +477,6 @@ jobs:
     name: Windows ARM64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: win_arm64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -624,9 +488,6 @@ jobs:
 
   win_x64:
     name: Windows x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -640,9 +501,6 @@ jobs:
     name: Windows x64 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: win_x64
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -654,9 +512,6 @@ jobs:
 
   win_x86:
     name: Windows x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -670,9 +525,6 @@ jobs:
     name: Windows x86 V8
     if: github.event.inputs.enable_v8 == 'true'
     needs: win_x86
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -684,9 +536,6 @@ jobs:
 
   wasm:
     name: WASM
-    permissions:
-      contents: read
-      actions: write # Upload workflow artifacts
     uses: ./.github/workflows/build.yml
     with:
       branch: ${{ github.event.inputs.branch }}
@@ -701,9 +550,6 @@ jobs:
     needs:
       - mac_arm64
       - mac_x64
-    permissions:
-      contents: read
-      actions: write # Download/upload workflow artifacts
     uses: ./.github/workflows/mac-univ.yml
     with:
       artifact_x64: ${{ needs.mac_x64.outputs.artifact }}
@@ -714,9 +560,6 @@ jobs:
     needs:
       - mac_arm64_v8
       - mac_x64_v8
-    permissions:
-      contents: read
-      actions: write # Download/upload workflow artifacts
     uses: ./.github/workflows/mac-univ.yml
     with:
       artifact_x64: ${{ needs.mac_x64_v8.outputs.artifact }}
@@ -725,10 +568,6 @@ jobs:
   nuget:
     name: Build NuGet packages
     runs-on: windows-latest
-    permissions:
-      contents: read
-      actions: write # Download/upload artifacts
-      id-token: write  # OIDC token to log in to nuget.org
     needs:
       - android_arm
       - android_arm_v8
@@ -773,8 +612,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          persist-credentials: false
       - name: Download artifacts
         uses: actions/download-artifact@v7
         with:
@@ -785,16 +622,16 @@ jobs:
       - name: Define properties
         shell: bash
         run: |
+          VERSION="$VERSION"
           BRANCH="${GITHUB_REF#refs/heads/}"
           COMMIT="${GITHUB_SHA}"
-          RELEASE_NOTES="$RELEASES_URL"
+          RELEASE_NOTES="${{github.server_url}}/${{github.repository}}/releases"
           $RELEASE && RELEASE_NOTES+="/tag/$BRANCH"
           echo "NUSPEC_PROPERTIES=version=$VERSION;branch=$BRANCH;commit=$COMMIT;releaseNotes=$RELEASE_NOTES" >> "$GITHUB_ENV"
         env:
           VERSION: ${{ github.event.inputs.version || '0.0.0.0' }}
           RELEASE: ${{ github.event.inputs.release }}
           BRANCH: ${{ github.event.inputs.branch }}
-          RELEASES_URL: ${{ format('{0}/{1}/releases', github.server_url, github.repository) }}
       - name: Pack
         shell: bash
         run: |
@@ -808,16 +645,78 @@ jobs:
         with:
           name: NuGet packages
           path: '*.nupkg'
-      - name: Log in to nuget.org
-        uses: NuGet/login@v1
-        id: login
-        with:
-          user: ${{ vars.NUGET_USER }}
       - name: Push to nuget.org
-        if: startsWith(github.event.inputs.branch, 'chromium/') && github.event.inputs.version && github.event.inputs.nuget == 'true'
-        run: nuget push -Source nuget.org -ApiKey "$NUGET_API_KEY" *.nupkg
+        if: env.NUGET_API_KEY && startsWith(github.event.inputs.branch, 'chromium/') && github.event.inputs.version && github.event.inputs.nuget == 'true'
+        run: nuget push -Source nuget.org -ApiKey ${{ secrets.NUGET_API_KEY }} *.nupkg
         env:
-          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY  }}
+
+  conda:
+    name: Conda packages
+    if: github.event.inputs.version
+    runs-on: ubuntu-latest
+    needs:
+      - linux_arm64
+      - linux_x64
+      - linux_ppc64
+      - mac_arm64
+      - mac_x64
+      - win_arm64
+      - win_x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+      - name: Create build script
+        run: |
+          cat >conda-build.sh <<END
+          #!/bin/bash -eux
+
+          PLATFORM=\$1
+          SOURCE_DIR=\$2
+          VERSION="$VERSION"
+
+          # rename "include/" into "include/pdfium/"
+          shopt -s extglob
+          mkdir -p \$SOURCE_DIR/include/pdfium
+          mv \$SOURCE_DIR/include/!(pdfium) \$SOURCE_DIR/include/pdfium
+
+          python conda/build.py pdfium-binaries \$PLATFORM \$VERSION --about-file conda/about.json --source-dir \$SOURCE_DIR --output-dir conda/out
+          END
+          chmod +x conda-build.sh
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+      - name: Build for linux-64
+        run: ./conda-build.sh linux-64 pdfium-linux-x64
+      - name: Build for linux-aarch64
+        run: ./conda-build.sh linux-aarch64 pdfium-linux-arm64
+      - name: Build for linux-ppc64le
+        run: ./conda-build.sh linux-ppc64le pdfium-linux-ppc64
+      - name: Build for osx-arm64
+        run: ./conda-build.sh osx-arm64 pdfium-mac-arm64
+      - name: Build for osx-64
+        run: ./conda-build.sh osx-64 pdfium-mac-x64
+      - name: Build for win-64
+        run: ./conda-build.sh win-64 pdfium-win-x64
+      - name: Build for win-arm64
+        run: ./conda-build.sh win-arm64 pdfium-win-arm64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Conda packages
+          path: conda/out/
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+      - name: Install anaconda-client
+        run: conda install -yq anaconda-client
+        shell: bash -l {0}
+      - name: Upload to Anaconda
+        if: env.ANACONDA_API_TOKEN && startsWith(github.event.inputs.branch, 'chromium/') && github.event.inputs.version && github.event.inputs.anaconda == 'true'
+        run: find conda/out -name 'pdfium-binaries-*.tar.bz2' -exec anaconda upload --force {} +
+        shell: bash -l {0}
+        env:
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN  }}
 
   publish:
     name: Publish Release
@@ -835,10 +734,6 @@ jobs:
       - android_x64_v8
       - android_x86
       - android_x86_v8
-      - ios_catalyst_arm64
-      - ios_catalyst_arm64_v8
-      - ios_catalyst_x64
-      - ios_catalyst_x64_v8
       - ios_device_arm64
       - ios_device_arm64_v8
       - ios_simulator_x64
@@ -850,8 +745,6 @@ jobs:
       - linux_musl_arm64
       - linux_musl_x64
       - linux_musl_x86
-      - linux_mipsel
-      - linux_mips64el
       - linux_ppc64
       - linux_x64
       - linux_x64_v8
@@ -892,7 +785,7 @@ jobs:
         continue-on-error: true
         run: |
           CURRENT_REV=$BRANCH
-          PREVIOUS_REV=$(curl --silent "$LATEST_RELEASE_URL" | jq -r ".tag_name")
+          PREVIOUS_REV=$(curl --silent "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r ".tag_name")
           git clone -b "$BRANCH" https://pdfium.googlesource.com/pdfium.git
           cat <<END >> RELEASE.md
           ### Changes
@@ -901,7 +794,6 @@ jobs:
           git -C "pdfium" log origin/${PREVIOUS_REV}.. --pretty=format:'* [%s](https://pdfium.googlesource.com/pdfium/+/%H)' >> RELEASE.md
         env:
           BRANCH: ${{ github.event.inputs.branch }}
-          LATEST_RELEASE_URL: ${{ format('{0}/repos/{1}/releases/latest', github.api_url, github.repository) }}
       - name: Generate artifacts checksums
         id: hash
         run: echo "hashes=$(sha256sum pdfium-*.tgz | base64 -w0)" >> "$GITHUB_OUTPUT"
@@ -911,19 +803,13 @@ jobs:
         with:
           subject-path: pdfium-*.tgz
       - name: Rename provenance file
-        run: mv "$BUNDLE_PATH" pdfium-attestation.json
-        env:
-          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        run: mv "${{ steps.provenance.outputs.bundle-path }}" pdfium-attestation.json
       - name: Publish Release
-        run: |
-          gh release create "$BRANCH" \
-            pdfium-*.tgz \
-            pdfium-attestation.json \
-            --target "$GITHUB_SHA" \
-            --title "PDFium $VERSION" \
-            --notes-file RELEASE.md
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.inputs.branch }}
-          VERSION: ${{ github.event.inputs.version }}
+        uses: ncipollo/release-action@v1
+        with:
+          immutableCreate: true
+          bodyFile: RELEASE.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: PDFium ${{ github.event.inputs.version }}
+          tag: ${{ github.event.inputs.branch }}
+          artifacts: pdfium-*.tgz, pdfium-attestation.json
