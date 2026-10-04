@@ -1015,3 +1015,173 @@ index c9d2280..b1e05c7 100644
 +  // which are referenced from annotations and configurations alone.
 +  return touched;
 +}
+diff --git a/fpdfsdk/fpdf_editpage.cpp b/fpdfsdk/fpdf_editpage.cpp
+index 0335720..3ef7f8d 100644
+--- a/fpdfsdk/fpdf_editpage.cpp
++++ b/fpdfsdk/fpdf_editpage.cpp
+@@ -292,6 +292,13 @@ FPDF_BITMAP GetRenderedPattern(FPDF_DOCUMENT document,
+                                      use_stroke_color);
+ }
+ 
++// g-lab-bit fork (fork_p8.patch): a page from FPDFDoc_LoadPageWithoutContent
++// has no parsed page objects; generating or editing its content would write an
++// EMPTY content stream on save (the drawing would be deleted). Refuse instead.
++bool IsContentParsed(CPDF_Page* page) {
++  return page->GetParseState() == CPDF_PageObjectHolder::ParseState::kParsed;
++}
++
+ }  // namespace
+ 
+ FPDF_EXPORT FPDF_DOCUMENT FPDF_CALLCONV FPDF_CreateNewDocument() {
+@@ -402,7 +409,7 @@ FPDFPage_InsertObject(FPDF_PAGE page, FPDF_PAGEOBJECT page_object) {
+ 
+   std::unique_ptr<CPDF_PageObject> pPageObjHolder(pPageObj);
+   CPDF_Page* pPage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(pPage)) {
++  if (!IsPageObject(pPage) || !IsContentParsed(pPage)) {
+     return false;
+   }
+ 
+@@ -425,7 +432,7 @@ FPDFPage_InsertObjectAtIndex(FPDF_PAGE page,
+   std::unique_ptr<CPDF_PageObject> page_obj_holder(cpage_object);
+ 
+   CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(cpage)) {
++  if (!IsPageObject(cpage) || !IsContentParsed(cpage)) {
+     return false;
+   }
+ 
+@@ -443,7 +450,7 @@ FPDFPage_RemoveObject(FPDF_PAGE page, FPDF_PAGEOBJECT page_object) {
+   }
+ 
+   CPDF_Page* pPage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(pPage)) {
++  if (!IsPageObject(pPage) || !IsContentParsed(pPage)) {
+     return false;
+   }
+ 
+@@ -855,7 +862,7 @@ FPDFPageObj_SetIsActive(FPDF_PAGEOBJECT page_object, FPDF_BOOL active) {
+ 
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFPage_GenerateContent(FPDF_PAGE page) {
+   CPDF_Page* pPage = CPDFPageFromFPDFPage(page);
+-  if (!IsPageObject(pPage)) {
++  if (!IsPageObject(pPage) || !IsContentParsed(pPage)) {
+     return false;
+   }
+ 
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index 3a99d49..c01b872 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -193,7 +193,9 @@ FPDFAnnot_GetSubtype(FPDF_ANNOTATION annot);
+ // Experimental API.
+ // Check if an annotation subtype is currently supported for object extraction,
+ // update, and removal.
+-// Currently supported subtypes: ink and stamp.
++// Currently supported subtypes: ink and stamp; in the g-lab-bit fork also
++// text, freetext, line, square, circle, polygon, polyline, highlight,
++// underline, squiggly and strikeout.
+ //
+ //   subtype   - the subtype to be checked.
+ //
+@@ -501,6 +503,73 @@ FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
+                   const FS_POINTF* start,
+                   const FS_POINTF* end);
+ 
++// Experimental API (g-lab-bit fork).
++// Get one line ending style of a line annotation (/LE, PDF 32000-1 Table 176)
++// as a NUL-terminated name ("OpenArrow", "None", ...). A missing /LE, or a
++// missing entry, reads as "None". Follows the usual PDFium buffer convention:
++// call with a NULL |buffer| to get the required length.
++//
++//   annot  - handle to a line annotation
++//   end    - false for the start style, true for the end style
++//   buffer - receives the name; may be NULL
++//   buflen - length of |buffer| in bytes
++//
++// Returns the length of the name including the NUL terminator, or 0 if
++// |annot| is not a line annotation. |buffer| is only modified if |buflen| is
++// at least the returned length.
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetLineEnding(FPDF_ANNOTATION annot,
++                        FPDF_BOOL end,
++                        char* buffer,
++                        unsigned long buflen);
++
++// Experimental API (g-lab-bit fork).
++// Set the border style dictionary /BS (PDF 32000-1 Table 168): line |width|
++// in points, |style| one of "S" (solid), "D" (dashed), "B", "I", "U", and an
++// optional dash array (|dash_count| <= 16; NULL/0 = none). Removes the legacy
++// /Border array. Does not touch /AP - rebuild the appearance after.
++// Returns false on a bad annotation, style, or non-finite/negative values.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetBorderStyle(FPDF_ANNOTATION annot,
++                         float width,
++                         FPDF_BYTESTRING style,
++                         const float* dash,
++                         unsigned long dash_count);
++
++// Experimental API (g-lab-bit fork). /BS /W, or the default 1 if absent.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_GetBorderStyleWidth(FPDF_ANNOTATION annot, float* width);
++
++// Experimental API (g-lab-bit fork). /BS /S name ("S" if absent). PDFium
++// buffer convention: returns the length including the NUL terminator.
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetBorderStyleName(FPDF_ANNOTATION annot,
++                             char* buffer,
++                             unsigned long buflen);
++
++// Experimental API (g-lab-bit fork). /BS /D dash array ([3] if absent).
++// Returns the number of values; fills |values| only if |count| is enough.
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetBorderDash(FPDF_ANNOTATION annot,
++                        float* values,
++                        unsigned long count);
++
++// Experimental API (g-lab-bit fork).
++// Set the border effect /BE (PDF 32000-1 Table 167): |style| "C" (cloudy,
++// with |intensity| 0..2) or "S" (no effect - removes /BE). Does not touch /AP.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetBorderEffect(FPDF_ANNOTATION annot,
++                          FPDF_BYTESTRING style,
++                          float intensity);
++
++// Experimental API (g-lab-bit fork). /BE /S name ("S" if absent) and its
++// intensity (0 if absent). PDFium buffer convention for |buffer|.
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetBorderEffect(FPDF_ANNOTATION annot,
++                          char* buffer,
++                          unsigned long buflen,
++                          float* intensity);
++
+ // Experimental API.
+ // Set the line ending styles (/LE name pair) of a line annotation.
+ // |start_name| and |end_name| are bytestrings naming the line ending
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index 99c1efd..c653b71 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -598,6 +598,22 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+                                                    FPDF_ANNOTATION annot);
+ 
++// Experimental API (g-lab-bit fork).
++// Delete optional content group |index| (index into /OCProperties /OCGs):
++// removes it from /OCGs and from every configuration (/D and /Configs:
++// /ON, /OFF, /Locked, /Order, /RBGroups, /AS), and removes or prunes the /OC
++// entry of every annotation that still references it (directly or through an
++// OCMD). Indices of later groups shift down by one. Re-home annotations you
++// want to keep on another group BEFORE calling this. Nested /Order groups left
++// empty are removed. NOT handled: references from page or XObject /Properties
++// (marked content), /OC on form or image XObjects, and OCMD /VE expressions -
++// only delete groups referenced by annotations and configurations alone.
++//
++// Returns the number of annotations whose /OC was changed (>= 0), or -1 on
++// failure (bad document or index, or a direct (non-indirect) OCG entry).
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
++                                               int index);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus
