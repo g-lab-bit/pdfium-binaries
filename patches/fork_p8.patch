@@ -469,7 +469,7 @@ index 51ff1a1..2355a53 100644
    CPDF_GenerateAP(const CPDF_GenerateAP&) = delete;
    CPDF_GenerateAP& operator=(const CPDF_GenerateAP&) = delete;
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index 8efbfee..f9d66df 100644
+index 8efbfee..c494ace 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -5,6 +5,7 @@
@@ -509,11 +509,50 @@ index 8efbfee..f9d66df 100644
  }
  
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-@@ -1110,6 +1131,167 @@ FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
+@@ -1110,6 +1131,214 @@ FPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
    return true;
  }
  
-+// g-lab-bit fork (fork_p8.patch).
++// g-lab-bit fork (fork_p8.patch) ------------------------------------------
++namespace {
++
++// A name entry, or |fallback| when the entry is absent or not a usable name.
++ByteString NameOr(const CPDF_Dictionary* dict,
++                  ByteStringView key,
++                  ByteStringView fallback) {
++  ByteString value = dict ? dict->GetNameFor(key) : ByteString();
++  return value.IsEmpty() ? ByteString(fallback) : value;
++}
++
++// ISO 32000-1 Table 166: /BS is defined for these subtypes.
++bool SupportsBorderStyle(FPDF_ANNOTATION_SUBTYPE subtype) {
++  switch (subtype) {
++    case FPDF_ANNOT_LINK:
++    case FPDF_ANNOT_FREETEXT:
++    case FPDF_ANNOT_LINE:
++    case FPDF_ANNOT_SQUARE:
++    case FPDF_ANNOT_CIRCLE:
++    case FPDF_ANNOT_POLYGON:
++    case FPDF_ANNOT_POLYLINE:
++    case FPDF_ANNOT_INK:
++    case FPDF_ANNOT_WIDGET:
++      return true;
++    default:
++      return false;
++  }
++}
++
++// ISO 32000-1 Table 167: /BE is defined for these subtypes.
++bool SupportsBorderEffect(FPDF_ANNOTATION_SUBTYPE subtype) {
++  return subtype == FPDF_ANNOT_FREETEXT || subtype == FPDF_ANNOT_SQUARE ||
++         subtype == FPDF_ANNOT_CIRCLE || subtype == FPDF_ANNOT_POLYGON;
++}
++
++// PDFium's appearance generator reads at most this many dash entries.
++constexpr unsigned long kMaxDashCount = 10;
++
++}  // namespace
++
 +FPDF_EXPORT unsigned long FPDF_CALLCONV
 +FPDFAnnot_GetLineEnding(FPDF_ANNOTATION annot,
 +                        FPDF_BOOL end,
@@ -526,54 +565,63 @@ index 8efbfee..f9d66df 100644
 +  if (!annot_dict) {
 +    return 0;
 +  }
-+  // Absent /LE (or a short array) means "None" for that end (32000-1 Table 176).
++  // ISO 32000-1 Table 176: an absent /LE, a missing entry, or a non-name
++  // entry reads as "None".
 +  RetainPtr<const CPDF_Array> le = annot_dict->GetArrayFor("LE");
 +  const size_t index = end ? 1 : 0;
-+  const ByteString name =
-+      le && le->size() > index ? le->GetByteStringAt(index) : "None";
++  ByteString name = le && le->size() > index ? le->GetByteStringAt(index)
++                                             : ByteString();
++  if (name.IsEmpty()) {
++    name = "None";
++  }
 +  // SAFETY: required from caller.
 +  return NulTerminateMaybeCopyAndReturnLength(
 +      name, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 +}
 +
-+// g-lab-bit fork (fork_p8.patch): border style (/BS) and border effect (/BE)
-+// in the standard keys (32000-1 Tables 168 and 167), so other editors read and
-+// edit Rapida's styles. None of these touch /AP: the caller rebuilds it.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDFAnnot_SetBorderStyle(FPDF_ANNOTATION annot,
 +                         float width,
 +                         FPDF_BYTESTRING style,
 +                         const float* dash,
 +                         unsigned long dash_count) {
++  if (!SupportsBorderStyle(FPDFAnnot_GetSubtype(annot))) {
++    return false;
++  }
 +  RetainPtr<CPDF_Dictionary> annot_dict =
 +      GetMutableAnnotDictFromFPDFAnnotation(annot);
 +  if (!annot_dict || !style || !std::isfinite(width) || width < 0 ||
-+      (dash_count > 0 && !dash) || dash_count > 16) {
++      (dash_count > 0 && !dash) || dash_count > kMaxDashCount) {
 +    return false;
 +  }
 +  const ByteStringView s(style);
 +  if (s != "S" && s != "D" && s != "B" && s != "I" && s != "U") {
 +    return false;
 +  }
-+  for (unsigned long i = 0; i < dash_count; ++i) {
-+    // SAFETY: required from caller (|dash| holds |dash_count| floats).
-+    const float v = UNSAFE_BUFFERS(dash[i]);
++  // SAFETY: required from caller (|dash| holds |dash_count| floats).
++  auto dash_span = UNSAFE_BUFFERS(pdfium::span(dash, dash_count));
++  float dash_sum = 0;
++  for (float v : dash_span) {
 +    if (!std::isfinite(v) || v < 0) {
 +      return false;
 +    }
++    dash_sum += v;
++  }
++  if (dash_count > 0 && dash_sum <= 0) {
++    return false;  // an all-zero dash array is invalid (ISO 32000-1 8.4.3.6)
 +  }
 +  auto bs = annot_dict->SetNewFor<CPDF_Dictionary>("BS");
 +  bs->SetNewFor<CPDF_Name>("Type", "Border");
 +  bs->SetNewFor<CPDF_Number>("W", width);
 +  bs->SetNewFor<CPDF_Name>("S", ByteString(s));
-+  if (dash_count > 0) {
++  if (s == "D" && dash_count > 0) {  // /D only applies to dashed borders
 +    auto d = bs->SetNewFor<CPDF_Array>("D");
-+    for (unsigned long i = 0; i < dash_count; ++i) {
-+      d->AppendNew<CPDF_Number>(UNSAFE_BUFFERS(dash[i]));
++    for (float v : dash_span) {
++      d->AppendNew<CPDF_Number>(v);
 +    }
 +  }
-+  // /BS takes precedence over the legacy /Border array; drop it so readers
-+  // that consult /Border first do not disagree.
++  // When /BS is present /Border is ignored (Table 166); drop it so readers that
++  // consult /Border first do not disagree. Its corner radii are lost.
 +  annot_dict->RemoveFor(pdfium::annotation::kBorder);
 +  return true;
 +}
@@ -585,7 +633,8 @@ index 8efbfee..f9d66df 100644
 +    return false;
 +  }
 +  RetainPtr<const CPDF_Dictionary> bs = annot_dict->GetDictFor("BS");
-+  *width = bs && bs->KeyExist("W") ? bs->GetFloatFor("W") : 1.0f;  // default 1
++  float w = bs && bs->KeyExist("W") ? bs->GetFloatFor("W") : 1.0f;
++  *width = std::isfinite(w) && w >= 0 ? w : 1.0f;  // default 1 (Table 166)
 +  return true;
 +}
 +
@@ -598,10 +647,10 @@ index 8efbfee..f9d66df 100644
 +    return 0;
 +  }
 +  RetainPtr<const CPDF_Dictionary> bs = annot_dict->GetDictFor("BS");
-+  const ByteString s = bs && bs->KeyExist("S") ? bs->GetNameFor("S") : "S";
 +  // SAFETY: required from caller.
 +  return NulTerminateMaybeCopyAndReturnLength(
-+      s, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
++      NameOr(bs.Get(), "S", "S"),
++      UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 +}
 +
 +FPDF_EXPORT unsigned long FPDF_CALLCONV
@@ -614,18 +663,13 @@ index 8efbfee..f9d66df 100644
 +  }
 +  RetainPtr<const CPDF_Dictionary> bs = annot_dict->GetDictFor("BS");
 +  RetainPtr<const CPDF_Array> d = bs ? bs->GetArrayFor("D") : nullptr;
-+  if (!d) {
-+    // Default dash array [3] (Table 168).
-+    if (values && count >= 1) {
-+      UNSAFE_BUFFERS(values[0]) = 3.0f;
-+    }
-+    return 1;
-+  }
-+  const unsigned long len = pdfium::checked_cast<unsigned long>(d->size());
++  const unsigned long len =
++      d ? pdfium::checked_cast<unsigned long>(d->size()) : 1;  // default [3]
 +  if (values && count >= len) {
++    // SAFETY: required from caller (|values| holds |count| floats).
++    auto out = UNSAFE_BUFFERS(pdfium::span(values, count));
 +    for (unsigned long i = 0; i < len; ++i) {
-+      // SAFETY: required from caller (|values| holds |count| floats).
-+      UNSAFE_BUFFERS(values[i]) = d->GetFloatAt(i);
++      out[i] = d ? d->GetFloatAt(i) : 3.0f;
 +    }
 +  }
 +  return len;
@@ -635,6 +679,9 @@ index 8efbfee..f9d66df 100644
 +FPDFAnnot_SetBorderEffect(FPDF_ANNOTATION annot,
 +                          FPDF_BYTESTRING style,
 +                          float intensity) {
++  if (!SupportsBorderEffect(FPDFAnnot_GetSubtype(annot))) {
++    return false;
++  }
 +  RetainPtr<CPDF_Dictionary> annot_dict =
 +      GetMutableAnnotDictFromFPDFAnnotation(annot);
 +  if (!annot_dict || !style || !std::isfinite(intensity) || intensity < 0 ||
@@ -645,7 +692,7 @@ index 8efbfee..f9d66df 100644
 +  if (s != "S" && s != "C") {
 +    return false;
 +  }
-+  if (s == "S") {  // no effect: the default, so drop /BE
++  if (s == "S") {  // no effect is the default: drop /BE
 +    annot_dict->RemoveFor("BE");
 +    return true;
 +  }
@@ -665,13 +712,13 @@ index 8efbfee..f9d66df 100644
 +    return 0;
 +  }
 +  RetainPtr<const CPDF_Dictionary> be = annot_dict->GetDictFor("BE");
-+  const ByteString s = be && be->KeyExist("S") ? be->GetNameFor("S") : "S";
 +  if (intensity) {
 +    *intensity = be && be->KeyExist("I") ? be->GetFloatFor("I") : 0.0f;
 +  }
 +  // SAFETY: required from caller.
 +  return NulTerminateMaybeCopyAndReturnLength(
-+      s, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
++      NameOr(be.Get(), "S", "S"),
++      UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 +}
 +
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetBorder(FPDF_ANNOTATION annot,
@@ -1070,7 +1117,7 @@ index 0335720..3ef7f8d 100644
    }
  
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index 3a99d49..c01b872 100644
+index 3a99d49..bb4ea2b 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
 @@ -193,7 +193,9 @@ FPDFAnnot_GetSubtype(FPDF_ANNOTATION annot);
@@ -1084,14 +1131,14 @@ index 3a99d49..c01b872 100644
  //
  //   subtype   - the subtype to be checked.
  //
-@@ -501,6 +503,73 @@ FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
+@@ -501,6 +503,84 @@ FPDFAnnot_SetLine(FPDF_ANNOTATION annot,
                    const FS_POINTF* start,
                    const FS_POINTF* end);
  
 +// Experimental API (g-lab-bit fork).
-+// Get one line ending style of a line annotation (/LE, PDF 32000-1 Table 176)
-+// as a NUL-terminated name ("OpenArrow", "None", ...). A missing /LE, or a
-+// missing entry, reads as "None". Follows the usual PDFium buffer convention:
++// Get one line ending style of a line annotation (/LE, ISO 32000-1 Table 176)
++// as a NUL-terminated name ("OpenArrow", "None", ...). An absent /LE, a
++// missing entry or a non-name entry reads as "None". PDFium buffer convention:
 +// call with a NULL |buffer| to get the required length.
 +//
 +//   annot  - handle to a line annotation
@@ -1100,8 +1147,8 @@ index 3a99d49..c01b872 100644
 +//   buflen - length of |buffer| in bytes
 +//
 +// Returns the length of the name including the NUL terminator, or 0 if
-+// |annot| is not a line annotation. |buffer| is only modified if |buflen| is
-+// at least the returned length.
++// |annot| is invalid or not a line annotation. |buffer| is only modified if
++// |buflen| is at least the returned length.
 +FPDF_EXPORT unsigned long FPDF_CALLCONV
 +FPDFAnnot_GetLineEnding(FPDF_ANNOTATION annot,
 +                        FPDF_BOOL end,
@@ -1109,11 +1156,15 @@ index 3a99d49..c01b872 100644
 +                        unsigned long buflen);
 +
 +// Experimental API (g-lab-bit fork).
-+// Set the border style dictionary /BS (PDF 32000-1 Table 168): line |width|
-+// in points, |style| one of "S" (solid), "D" (dashed), "B", "I", "U", and an
-+// optional dash array (|dash_count| <= 16; NULL/0 = none). Removes the legacy
-+// /Border array. Does not touch /AP - rebuild the appearance after.
-+// Returns false on a bad annotation, style, or non-finite/negative values.
++// Set the border style dictionary /BS (ISO 32000-1 Table 166) of a link,
++// free text, line, square, circle, polygon, polyline, ink or widget annotation:
++// line |width| in points, |style| one of "S" (solid), "D" (dashed), "B", "I",
++// "U", and for "D" an optional dash array (|dash_count| <= 10, not all zero;
++// NULL/0 = the default [3]). Removes the legacy /Border array, whose corner
++// radii are lost and after which FPDFAnnot_GetBorder() returns false. Does not
++// touch /AP - rebuild the appearance after.
++// Returns false for another subtype, a bad style, or non-finite / negative /
++// all-zero values.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDFAnnot_SetBorderStyle(FPDF_ANNOTATION annot,
 +                         float width,
@@ -1121,34 +1172,41 @@ index 3a99d49..c01b872 100644
 +                         const float* dash,
 +                         unsigned long dash_count);
 +
-+// Experimental API (g-lab-bit fork). /BS /W, or the default 1 if absent.
++// Experimental API (g-lab-bit fork). /BS /W, or the default 1 if absent or
++// invalid. Returns false if |annot| is invalid or |width| is NULL.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDFAnnot_GetBorderStyleWidth(FPDF_ANNOTATION annot, float* width);
 +
-+// Experimental API (g-lab-bit fork). /BS /S name ("S" if absent). PDFium
-+// buffer convention: returns the length including the NUL terminator.
++// Experimental API (g-lab-bit fork). /BS /S name ("S" if absent or not a
++// name). PDFium buffer convention; returns the length including the NUL
++// terminator, or 0 if |annot| is invalid.
 +FPDF_EXPORT unsigned long FPDF_CALLCONV
 +FPDFAnnot_GetBorderStyleName(FPDF_ANNOTATION annot,
 +                             char* buffer,
 +                             unsigned long buflen);
 +
 +// Experimental API (g-lab-bit fork). /BS /D dash array ([3] if absent).
-+// Returns the number of values; fills |values| only if |count| is enough.
++// Returns the number of values (0 if |annot| is invalid); fills |values| only
++// if |count| is at least that number.
 +FPDF_EXPORT unsigned long FPDF_CALLCONV
 +FPDFAnnot_GetBorderDash(FPDF_ANNOTATION annot,
 +                        float* values,
 +                        unsigned long count);
 +
 +// Experimental API (g-lab-bit fork).
-+// Set the border effect /BE (PDF 32000-1 Table 167): |style| "C" (cloudy,
-+// with |intensity| 0..2) or "S" (no effect - removes /BE). Does not touch /AP.
++// Set the border effect /BE (ISO 32000-1 Table 167) of a free text, square,
++// circle or polygon annotation: |style| "C" (cloudy, |intensity| 0..2) or "S"
++// (no effect - removes /BE). Does not touch /AP - rebuild the appearance after.
++// Returns false for another subtype or a bad style / intensity.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDFAnnot_SetBorderEffect(FPDF_ANNOTATION annot,
 +                          FPDF_BYTESTRING style,
 +                          float intensity);
 +
-+// Experimental API (g-lab-bit fork). /BE /S name ("S" if absent) and its
-+// intensity (0 if absent). PDFium buffer convention for |buffer|.
++// Experimental API (g-lab-bit fork). /BE /S name ("S" if absent or not a
++// name) and, if |intensity| is not NULL, its /I (0 if absent) - written even
++// when |buffer| is too small. PDFium buffer convention for |buffer|; returns 0
++// if |annot| is invalid.
 +FPDF_EXPORT unsigned long FPDF_CALLCONV
 +FPDFAnnot_GetBorderEffect(FPDF_ANNOTATION annot,
 +                          char* buffer,
