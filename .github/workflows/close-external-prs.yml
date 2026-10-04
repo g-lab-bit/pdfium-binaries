@@ -1,0 +1,47 @@
+name: Close external PRs
+
+# Single-maintainer fork — auto-close any PR not opened by the
+# repository owner. See CONTRIBUTING.md.
+#
+# Safety note: this workflow uses pull_request_target (runs on the base
+# branch, has write permission to PRs) but never checks out PR-author
+# code and never runs PR-author scripts. It only calls the GitHub API
+# to comment + close. Safe pattern for this scoped use case.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: github.event.pull_request.user.login != github.repository_owner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment and close
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                "Thanks for your interest. This repository is a single-maintainer fork and",
+                "does not accept external contributions — see [CONTRIBUTING.md](../blob/master/CONTRIBUTING.md).",
+                "",
+                "If you would like to contribute to PDFium build automation in general,",
+                "please open your PR against the upstream",
+                "[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) repo instead.",
+                "",
+                "Closing this PR automatically."
+              ].join("\n")
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              state: 'closed'
+            });

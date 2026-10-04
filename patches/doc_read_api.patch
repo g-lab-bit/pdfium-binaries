@@ -1,0 +1,270 @@
+diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
+index 05866dd..c1f4791 100644
+--- a/fpdfsdk/fpdf_doc.cpp
++++ b/fpdfsdk/fpdf_doc.cpp
+@@ -18,6 +18,7 @@
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
++#include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fpdfapi/parser/fpdf_parser_decode.h"
+ #include "core/fpdfdoc/cpdf_aaction.h"
+@@ -612,3 +613,169 @@ FPDF_GetPageLabel(FPDF_DOCUMENT document,
+   return Utf16EncodeMaybeCopyAndReturnLength(
+       str.value(), UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
+ }
++
++// ---------------------------------------------------------------------------
++// g-lab-bit fork (doc_read_api.patch) — cheap document reads.
++// ---------------------------------------------------------------------------
++
++FPDF_EXPORT FPDF_PAGE FPDF_CALLCONV
++FPDFDoc_LoadPageWithoutContent(FPDF_DOCUMENT document, int page_index) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || page_index < 0 || page_index >= doc->GetPageCount()) {
++    return nullptr;
++  }
++#ifdef PDF_ENABLE_XFA
++  if (doc->GetExtension()) {
++    return nullptr;
++  }
++#endif  // PDF_ENABLE_XFA
++  RetainPtr<CPDF_Dictionary> dict = doc->GetMutablePageDictionary(page_index);
++  if (!dict) {
++    return nullptr;
++  }
++  // Same as FPDF_LoadPage() minus AddPageImageCache() and ParseContent().
++  auto page = pdfium::MakeRetain<CPDF_Page>(doc, std::move(dict));
++  return FPDFPageFromIPDFPage(page.Leak());
++}
++
++namespace {
++
++RetainPtr<const CPDF_Dictionary> GetOCProperties(FPDF_DOCUMENT document) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return nullptr;
++  }
++  const CPDF_Dictionary* root = doc->GetRoot();
++  return root ? root->GetDictFor("OCProperties") : nullptr;
++}
++
++RetainPtr<const CPDF_Array> GetOCGArray(FPDF_DOCUMENT document) {
++  RetainPtr<const CPDF_Dictionary> props = GetOCProperties(document);
++  return props ? props->GetArrayFor("OCGs") : nullptr;
++}
++
++RetainPtr<const CPDF_Dictionary> GetOCGDict(FPDF_DOCUMENT document,
++                                            int index) {
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(document);
++  if (!ocgs || index < 0 || static_cast<size_t>(index) >= ocgs->size()) {
++    return nullptr;
++  }
++  return ocgs->GetDictAt(index);
++}
++
++// True if |list| contains |ocg| (by indirect reference or the same object).
++bool ArrayContainsOCG(const CPDF_Array* list, const CPDF_Dictionary* ocg) {
++  if (!list || !ocg) {
++    return false;
++  }
++  for (size_t i = 0; i < list->size(); ++i) {
++    RetainPtr<const CPDF_Object> obj = list->GetObjectAt(i);
++    if (!obj) {
++      continue;
++    }
++    if (const CPDF_Reference* ref = obj->AsReference()) {
++      if (ocg->GetObjNum() != 0 && ref->GetRefObjNum() == ocg->GetObjNum()) {
++        return true;
++      }
++      continue;
++    }
++    if (obj->AsDictionary() == ocg) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGCount(FPDF_DOCUMENT document) {
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(document);
++  return ocgs ? pdfium::checked_cast<int>(ocgs->size()) : 0;
++}
++
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGObjectNumber(FPDF_DOCUMENT document,
++                                                        int index) {
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(document);
++  if (!ocgs || index < 0 || static_cast<size_t>(index) >= ocgs->size()) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Object> obj = ocgs->GetObjectAt(index);
++  const CPDF_Reference* ref = obj ? obj->AsReference() : nullptr;
++  return ref ? pdfium::checked_cast<int>(ref->GetRefObjNum()) : -1;
++}
++
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFDoc_GetOCGStringValue(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          FPDF_WCHAR* buffer,
++                          unsigned long buflen) {
++  RetainPtr<const CPDF_Dictionary> ocg = GetOCGDict(document, index);
++  if (!ocg || !key || !ocg->KeyExist(key)) {
++    return 0;
++  }
++  // SAFETY: required from caller.
++  return Utf16EncodeMaybeCopyAndReturnLength(
++      ocg->GetUnicodeTextFor(key),
++      UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFDoc_GetOCGNumberValue(
++    FPDF_DOCUMENT document,
++    int index,
++    FPDF_BYTESTRING key,
++    float* value) {
++  RetainPtr<const CPDF_Dictionary> ocg = GetOCGDict(document, index);
++  if (!ocg || !key || !value) {
++    return false;
++  }
++  RetainPtr<const CPDF_Object> obj = ocg->GetDirectObjectFor(key);
++  if (!obj || !obj->IsNumber()) {
++    return false;
++  }
++  *value = obj->GetNumber();
++  return true;
++}
++
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGNumberArray(FPDF_DOCUMENT document,
++                                                       int index,
++                                                       FPDF_BYTESTRING key,
++                                                       float* values,
++                                                       int count) {
++  RetainPtr<const CPDF_Dictionary> ocg = GetOCGDict(document, index);
++  if (!ocg || !key) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Array> arr = ocg->GetArrayFor(key);
++  if (!arr) {
++    return -1;
++  }
++  const int len = pdfium::checked_cast<int>(arr->size());
++  if (values && count > 0) {
++    const int n = len < count ? len : count;
++    for (int i = 0; i < n; ++i) {
++      // SAFETY: required from caller (|values| holds |count| floats).
++      UNSAFE_BUFFERS(values[i]) = arr->GetFloatAt(i);
++    }
++  }
++  return len;
++}
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFDoc_GetOCGDefaultVisibility(FPDF_DOCUMENT document, int index) {
++  RetainPtr<const CPDF_Dictionary> ocg = GetOCGDict(document, index);
++  if (!ocg) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Dictionary> props = GetOCProperties(document);
++  RetainPtr<const CPDF_Dictionary> config =
++      props ? props->GetDictFor("D") : nullptr;
++  if (!config) {
++    return 1;
++  }
++  if (config->GetNameFor("BaseState") == "OFF") {
++    return ArrayContainsOCG(config->GetArrayFor("ON").Get(), ocg.Get()) ? 1
++                                                                          : 0;
++  }
++  return ArrayContainsOCG(config->GetArrayFor("OFF").Get(), ocg.Get()) ? 0 : 1;
++}
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index a609ca9..ec882ca 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -460,6 +460,83 @@ FPDF_GetPageLabel(FPDF_DOCUMENT document,
+                   void* buffer,
+                   unsigned long buflen);
+ 
++// g-lab-bit fork (doc_read_api.patch) — cheap document reads.
++
++// Experimental API.
++// Load a page WITHOUT parsing its content stream. The returned page supports
++// annotation reads only (FPDFPage_GetAnnotCount, FPDFPage_GetAnnot and the
++// FPDFAnnot_Get* getters). Do NOT render it, count/edit page objects, or
++// generate content on it. Close with FPDF_ClosePage().
++//
++//   document   -   Handle to document.
++//   page_index -   Index number of the page. 0 for the first page.
++//
++// Returns a handle to the page, or NULL on failure (including XFA documents).
++FPDF_EXPORT FPDF_PAGE FPDF_CALLCONV
++FPDFDoc_LoadPageWithoutContent(FPDF_DOCUMENT document, int page_index);
++
++// Experimental API.
++// Optional content groups listed in the catalog's /OCProperties /OCGs array,
++// resolved through the document's cross-reference chain (the latest
++// incremental revision of each object wins).
++//
++// Returns the number of OCGs, or 0 if none / on error.
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGCount(FPDF_DOCUMENT document);
++
++// Experimental API.
++// Returns the indirect object number of OCG |index|, or -1 if it is a direct
++// object or on error.
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGObjectNumber(FPDF_DOCUMENT document,
++                                                        int index);
++
++// Experimental API.
++// Get the text string value of |key| in OCG |index|'s dictionary (e.g. "Name"
++// or a custom key such as "RapidaLayerId"), as UTF-16LE with a NUL terminator.
++//
++//   buffer - may be NULL to query the length.
++//   buflen - length of |buffer| in bytes.
++//
++// Returns the number of bytes in the value including the terminator, or 0 if
++// the key is absent / on error. |buffer| is only written if |buflen| is large
++// enough.
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFDoc_GetOCGStringValue(FPDF_DOCUMENT document,
++                          int index,
++                          FPDF_BYTESTRING key,
++                          FPDF_WCHAR* buffer,
++                          unsigned long buflen);
++
++// Experimental API.
++// Get the number value of |key| in OCG |index|'s dictionary.
++// Returns true and sets |value| if the key holds a number.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFDoc_GetOCGNumberValue(
++    FPDF_DOCUMENT document,
++    int index,
++    FPDF_BYTESTRING key,
++    float* value);
++
++// Experimental API.
++// Get the numeric array value of |key| in OCG |index|'s dictionary (e.g. a
++// custom "RapidaColor" [r g b]).
++//
++//   values - may be NULL to query the length.
++//   count  - capacity of |values|.
++//
++// Returns the array length, or -1 if the key is absent / not an array. Copies
++// min(length, count) numbers (non-numbers read as 0).
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGNumberArray(FPDF_DOCUMENT document,
++                                                       int index,
++                                                       FPDF_BYTESTRING key,
++                                                       float* values,
++                                                       int count);
++
++// Experimental API.
++// Visibility of OCG |index| under the default configuration (/OCProperties
++// /D): /BaseState (default /ON) adjusted by the /D /ON and /OFF arrays.
++// Returns 1 if visible, 0 if hidden, -1 on error.
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFDoc_GetOCGDefaultVisibility(FPDF_DOCUMENT document, int index);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus

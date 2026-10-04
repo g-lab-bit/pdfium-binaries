@@ -26,6 +26,14 @@ case "$BUILD_TYPE" in
 esac
 
 apply_patch "$PATCHES/public_headers.patch"
+# g-lab-bit fork patches (see FORK.md), in order:
+apply_patch "$PATCHES/annot_api.patch"
+apply_patch "$PATCHES/lod_render_skip.patch"
+apply_patch "$PATCHES/lod_telem.patch"
+apply_patch "$PATCHES/lod_progressive.patch"
+apply_patch "$PATCHES/doc_read_api.patch"
+apply_patch "$PATCHES/ocg_write_api.patch"
+apply_patch "$PATCHES/fork_p8.patch"
 apply_patch "$PATCHES/clang_rt.patch" build
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
