@@ -1,5 +1,5 @@
 diff --git a/core/fpdfdoc/cpdf_annot.cpp b/core/fpdfdoc/cpdf_annot.cpp
-index 97d3277..dc763b6 100644
+index 97d3277..7ab1e1f 100644
 --- a/core/fpdfdoc/cpdf_annot.cpp
 +++ b/core/fpdfdoc/cpdf_annot.cpp
 @@ -19,6 +19,7 @@
@@ -10,7 +10,7 @@ index 97d3277..dc763b6 100644
  #include "core/fpdfapi/parser/cpdf_document.h"
  #include "core/fpdfapi/parser/cpdf_stream.h"
  #include "core/fpdfapi/parser/fpdf_parser_utility.h"
-@@ -144,15 +145,37 @@ void CPDF_Annot::GenerateAPIfNeeded() {
+@@ -144,15 +145,46 @@ void CPDF_Annot::GenerateAPIfNeeded() {
    if (!ShouldGenerateAP()) {
      return;
    }
@@ -40,6 +40,15 @@ index 97d3277..dc763b6 100644
    has_generated_ap_ = true;
  }
  
++void CPDF_Annot::SetRenderOnlyAppearance(
++    std::unique_ptr<CPDF_IndirectObjectHolder> render_objects,
++    RetainPtr<CPDF_Dictionary> render_dict) {
++  ClearCachedAP();
++  render_dict_.Reset();
++  render_objects_ = std::move(render_objects);
++  render_dict_ = std::move(render_dict);
++}
++
 +CPDF_Dictionary* CPDF_Annot::DrawingDict() const {
 +  RetainPtr<const CPDF_Dictionary> ap =
 +      annot_dict_->GetDictFor(pdfium::annotation::kAP);
@@ -52,7 +61,7 @@ index 97d3277..dc763b6 100644
  bool CPDF_Annot::ShouldGenerateAP() const {
    // If AP dictionary exists and defines an appearance for normal mode, we use
    // the appearance defined in the existing AP dictionary.
-@@ -161,6 +184,9 @@ bool CPDF_Annot::ShouldGenerateAP() const {
+@@ -161,6 +193,9 @@ bool CPDF_Annot::ShouldGenerateAP() const {
    if (pAP && pAP->GetDictFor("N")) {
      return false;
    }
@@ -62,7 +71,7 @@ index 97d3277..dc763b6 100644
  
    return !IsHidden();
  }
-@@ -183,10 +209,12 @@ CPDF_Annot::Subtype CPDF_Annot::GetSubtype() const {
+@@ -183,10 +218,12 @@ CPDF_Annot::Subtype CPDF_Annot::GetSubtype() const {
  CFX_FloatRect CPDF_Annot::RectForDrawing() const {
    bool bShouldUseQuadPointsCoords =
        is_text_markup_annotation_ && has_generated_ap_;
@@ -77,7 +86,7 @@ index 97d3277..dc763b6 100644
  }
  
  CFX_FloatRect CPDF_Annot::GetRect() const {
-@@ -216,7 +244,7 @@ RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(CPDF_Dictionary* pAnnotDict,
+@@ -216,7 +253,7 @@ RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(CPDF_Dictionary* pAnnotDict,
  }
  
  CPDF_Form* CPDF_Annot::GetAPForm(CPDF_Page* pPage, AppearanceMode mode) {
@@ -87,7 +96,7 @@ index 97d3277..dc763b6 100644
      return nullptr;
    }
 diff --git a/core/fpdfdoc/cpdf_annot.h b/core/fpdfdoc/cpdf_annot.h
-index 3e8bc5e..372e651 100644
+index 3e8bc5e..09d2c94 100644
 --- a/core/fpdfdoc/cpdf_annot.h
 +++ b/core/fpdfdoc/cpdf_annot.h
 @@ -26,6 +26,7 @@ class CPDF_Array;
@@ -98,7 +107,21 @@ index 3e8bc5e..372e651 100644
  class CPDF_Page;
  class CPDF_RenderContext;
  
-@@ -107,6 +108,10 @@ class CPDF_Annot {
+@@ -100,6 +101,13 @@ class CPDF_Annot {
+   void SetPopupAnnotOpenState(bool bOpenState);
+   std::optional<CFX_FloatRect> GetPopupAnnotRect() const;
+   void SetPopupAnnot(CPDF_Annot* pAnnot) { popup_annot_ = pAnnot; }
++  // g-lab-bit fork (fork_p8.patch): draw from |render_dict| (a private copy of
++  // this annotation's dictionary with an appearance generated into it, its new
++  // objects in |render_objects|) instead of writing that appearance into the
++  // document. Used for form fields regenerated because of NeedAppearances.
++  void SetRenderOnlyAppearance(
++      std::unique_ptr<CPDF_IndirectObjectHolder> render_objects,
++      RetainPtr<CPDF_Dictionary> render_dict);
+ 
+  private:
+   void GenerateAPIfNeeded();
+@@ -107,6 +115,10 @@ class CPDF_Annot {
    bool ShouldDrawAnnotation() const;
  
    CFX_FloatRect RectForDrawing() const;
@@ -109,7 +132,7 @@ index 3e8bc5e..372e651 100644
  
    RetainPtr<CPDF_Dictionary> const annot_dict_;
    UnownedPtr<CPDF_Document> const document_;
-@@ -118,6 +123,12 @@ class CPDF_Annot {
+@@ -118,6 +130,12 @@ class CPDF_Annot {
    // |open_state_| is only set for popup annotations.
    bool open_state_ = false;
    bool has_generated_ap_;
@@ -122,8 +145,43 @@ index 3e8bc5e..372e651 100644
  };
  
  // Get the AP in an annotation dict for a given appearance mode.
+diff --git a/core/fpdfdoc/cpdf_annotlist.cpp b/core/fpdfdoc/cpdf_annotlist.cpp
+index db8be16..5faddae 100644
+--- a/core/fpdfdoc/cpdf_annotlist.cpp
++++ b/core/fpdfdoc/cpdf_annotlist.cpp
+@@ -18,6 +18,7 @@
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
++#include "core/fpdfapi/parser/cpdf_indirect_object_holder.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_name.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
+@@ -207,7 +208,21 @@ CPDF_AnnotList::CPDF_AnnotList(CPDF_Page* pPage)
+     if (bRegenerateAP && subtype == "Widget" &&
+         CPDF_InteractiveForm::IsUpdateAPEnabled() &&
+         !dict->GetDictFor(pdfium::annotation::kAP)) {
+-      GenerateAP(document_, dict.Get());
++      // g-lab-bit fork (fork_p8.patch): rendering never changes the document.
++      // Upstream wrote the regenerated field appearance into the field's
++      // dictionary (and could extend the form's /DR); generate into a private
++      // copy with a private object store and draw from that instead. The
++      // field's value and the document are untouched.
++      RetainPtr<CPDF_Dictionary> copy = ToDictionary(dict->Clone());
++      auto objects = std::make_unique<CPDF_IndirectObjectHolder>();
++      if (copy) {
++        CPDF_GenerateAP::ScopedRenderOnly render_only(objects.get());
++        GenerateAP(document_, copy.Get());
++      }
++      if (copy && copy->GetDictFor(pdfium::annotation::kAP)) {
++        annot_list_.back()->SetRenderOnlyAppearance(std::move(objects),
++                                                    std::move(copy));
++      }
+     }
+   }
+ 
 diff --git a/core/fpdfdoc/cpdf_generateap.cpp b/core/fpdfdoc/cpdf_generateap.cpp
-index 4a9d729..46c1e12 100644
+index 4a9d729..4fa2002 100644
 --- a/core/fpdfdoc/cpdf_generateap.cpp
 +++ b/core/fpdfdoc/cpdf_generateap.cpp
 @@ -23,6 +23,7 @@
@@ -160,7 +218,19 @@ index 4a9d729..46c1e12 100644
  constexpr char kGSDictName[] = "GS";
  
  struct CPVT_Dash {
-@@ -610,7 +630,10 @@ ByteString GetPopupContentsString(CPDF_Document* doc,
+@@ -300,8 +320,9 @@ bool ValidateOrCreateFontResources(CPDF_Document* doc,
+   }
+ 
+   if (!font_resource_dict->KeyExist(font_name.AsStringView())) {
+-    font_resource_dict->SetNewFor<CPDF_Reference>(font_name, doc,
+-                                                  font_dict->GetObjNum());
++    // The font may live in the private render-only store (fork_p8.patch).
++    font_resource_dict->SetNewFor<CPDF_Reference>(
++        font_name, HolderFor(doc, font_dict), font_dict->GetObjNum());
+   }
+   return true;
+ }
+@@ -610,7 +631,10 @@ ByteString GetPopupContentsString(CPDF_Document* doc,
  }
  
  RetainPtr<CPDF_Dictionary> GenerateFallbackFontDict(CPDF_Document* doc) {
@@ -172,7 +242,7 @@ index 4a9d729..46c1e12 100644
    font_dict->SetNewFor<CPDF_Name>("Type", "Font");
    font_dict->SetNewFor<CPDF_Name>("Subtype", "Type1");
    font_dict->SetNewFor<CPDF_Name>("BaseFont", CFX_Font::kDefaultAnsiFontName);
-@@ -630,18 +653,20 @@ RetainPtr<CPDF_Dictionary> GetFontFromDrFontDictOrGenerateFallback(
+@@ -630,18 +654,20 @@ RetainPtr<CPDF_Dictionary> GetFontFromDrFontDictOrGenerateFallback(
    }
  
    RetainPtr<CPDF_Dictionary> new_font_dict = GenerateFallbackFontDict(doc);
@@ -198,7 +268,7 @@ index 4a9d729..46c1e12 100644
    return resource_font_dict;
  }
  
-@@ -752,12 +777,17 @@ void GenerateAndSetAPDict(CPDF_Document* doc,
+@@ -752,12 +778,17 @@ void GenerateAndSetAPDict(CPDF_Document* doc,
    stream_dict->SetRectFor("BBox", rect);
    stream_dict->SetFor("Resources", std::move(resource_dict));
  
@@ -218,7 +288,7 @@ index 4a9d729..46c1e12 100644
  }
  
  ByteString GenerateTextFieldAP(const CPDF_Dictionary* annot_dict,
-@@ -1036,6 +1066,18 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1036,6 +1067,18 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    RetainPtr<CPDF_Dictionary> form_dict =
        root_dict->GetMutableDictFor("AcroForm");
@@ -237,7 +307,7 @@ index 4a9d729..46c1e12 100644
    if (!form_dict) {
      form_dict = CPDF_InteractiveForm::InitAcroFormDict(doc);
      CHECK(form_dict);
-@@ -1122,7 +1164,7 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1122,7 +1165,7 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    auto graphics_state_dict = GenerateExtGStateDict(*annot_dict, "Normal");
    auto resource_font_dict =
@@ -246,7 +316,7 @@ index 4a9d729..46c1e12 100644
    auto resource_dict = GenerateResourcesDict(
        doc, std::move(graphics_state_dict), std::move(resource_font_dict));
    GenerateAndSetAPDict(doc, annot_dict, &appearance_stream,
-@@ -1290,7 +1332,7 @@ bool GeneratePopupAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1290,7 +1333,7 @@ bool GeneratePopupAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    const ByteString font_name = "FONT";
    RetainPtr<CPDF_Dictionary> resource_font_dict =
@@ -255,7 +325,35 @@ index 4a9d729..46c1e12 100644
    RetainPtr<CPDF_Dictionary> gs_dict =
        GenerateExtGStateDict(*annot_dict, "Normal");
    RetainPtr<CPDF_Dictionary> resources_dict = GenerateResourcesDict(
-@@ -1646,3 +1688,14 @@ bool CPDF_GenerateAP::GenerateDefaultAppearanceWithColor(
+@@ -1506,9 +1549,13 @@ void CPDF_GenerateAP::GenerateFormAP(CPDF_Document* doc,
+     }
+     resources_dict = stream_dict->GetMutableDictFor("Resources");
+   } else {
+-    normal_stream =
+-        doc->NewIndirect<CPDF_Stream>(pdfium::MakeRetain<CPDF_Dictionary>());
+-    ap_dict->SetNewFor<CPDF_Reference>("N", doc, normal_stream->GetObjNum());
++    // Render-only (fork_p8.patch): the new stream lives in the private store.
++    CPDF_IndirectObjectHolder* holder =
++        g_render_objects ? g_render_objects
++                         : static_cast<CPDF_IndirectObjectHolder*>(doc);
++    normal_stream = holder->NewIndirect<CPDF_Stream>(
++        pdfium::MakeRetain<CPDF_Dictionary>());
++    ap_dict->SetNewFor<CPDF_Reference>("N", holder, normal_stream->GetObjNum());
+   }
+ 
+   const float font_size = default_appearance_info.value().font_size;
+@@ -1558,7 +1605,9 @@ void CPDF_GenerateAP::GenerateFormAP(CPDF_Document* doc,
+ 
+   const bool cloned =
+       CloneResourcesDictIfMissingFromStream(stream_dict, dr_dict);
+-  if (cloned) {
++  // Render-only never adds a fallback font to the form's /DR, so the cloned
++  // resources may lack it: reference it from the stream's own resources.
++  if (cloned && !g_render_objects) {
+     return;
+   }
+ 
+@@ -1646,3 +1695,14 @@ bool CPDF_GenerateAP::GenerateDefaultAppearanceWithColor(
    // TODO(thestig): Call GenerateAnnotAP();
    return true;
  }
