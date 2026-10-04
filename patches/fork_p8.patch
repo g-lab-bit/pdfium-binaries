@@ -469,7 +469,7 @@ index 51ff1a1..2355a53 100644
    CPDF_GenerateAP(const CPDF_GenerateAP&) = delete;
    CPDF_GenerateAP& operator=(const CPDF_GenerateAP&) = delete;
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index 8efbfee..4b3f0ca 100644
+index 8efbfee..f9d66df 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -5,6 +5,7 @@
@@ -565,7 +565,7 @@ index 8efbfee..4b3f0ca 100644
 +  auto bs = annot_dict->SetNewFor<CPDF_Dictionary>("BS");
 +  bs->SetNewFor<CPDF_Name>("Type", "Border");
 +  bs->SetNewFor<CPDF_Number>("W", width);
-+  bs->SetNewFor<CPDF_Name>("S", s);
++  bs->SetNewFor<CPDF_Name>("S", ByteString(s));
 +  if (dash_count > 0) {
 +    auto d = bs->SetNewFor<CPDF_Array>("D");
 +    for (unsigned long i = 0; i < dash_count; ++i) {
@@ -650,7 +650,7 @@ index 8efbfee..4b3f0ca 100644
 +    return true;
 +  }
 +  auto be = annot_dict->SetNewFor<CPDF_Dictionary>("BE");
-+  be->SetNewFor<CPDF_Name>("S", s);
++  be->SetNewFor<CPDF_Name>("S", ByteString(s));
 +  be->SetNewFor<CPDF_Number>("I", intensity);
 +  return true;
 +}
