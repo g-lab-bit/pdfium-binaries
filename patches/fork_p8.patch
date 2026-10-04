@@ -1,8 +1,16 @@
 diff --git a/core/fpdfdoc/cpdf_annot.cpp b/core/fpdfdoc/cpdf_annot.cpp
-index 97d3277..879beb0 100644
+index 97d3277..dc763b6 100644
 --- a/core/fpdfdoc/cpdf_annot.cpp
 +++ b/core/fpdfdoc/cpdf_annot.cpp
-@@ -144,15 +144,35 @@ void CPDF_Annot::GenerateAPIfNeeded() {
+@@ -19,6 +19,7 @@
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_boolean.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
++#include "core/fpdfapi/parser/cpdf_indirect_object_holder.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_stream.h"
+ #include "core/fpdfapi/parser/fpdf_parser_utility.h"
+@@ -144,15 +145,37 @@ void CPDF_Annot::GenerateAPIfNeeded() {
    if (!ShouldGenerateAP()) {
      return;
    }
@@ -12,19 +20,22 @@ index 97d3277..879beb0 100644
 +  // Upstream wrote the generated /AP (plus a private PDFIUM_HasGeneratedAP key,
 +  // and for some subtypes a new /Rect or a catalog /AcroForm) into the real
 +  // annotation dictionary, which a later save then persisted. Generate into a
-+  // private copy instead, with every new object owned by that copy.
++  // private copy instead, with every new object in a private store.
 +  RetainPtr<CPDF_Dictionary> copy = ToDictionary(annot_dict_->Clone());
 +  if (!copy) {
      return;
    }
 -
 -  annot_dict_->SetNewFor<CPDF_Boolean>(kPDFiumKey_HasGeneratedAP, true);
++  auto objects = std::make_unique<CPDF_IndirectObjectHolder>();
 +  {
-+    CPDF_GenerateAP::ScopedRenderOnly render_only;
++    CPDF_GenerateAP::ScopedRenderOnly render_only(objects.get());
 +    if (!CPDF_GenerateAP::GenerateAnnotAP(document_, copy.Get(), subtype_)) {
 +      return;
 +    }
 +  }
++  render_dict_.Reset();
++  render_objects_ = std::move(objects);
 +  render_dict_ = std::move(copy);
    has_generated_ap_ = true;
  }
@@ -32,8 +43,7 @@ index 97d3277..879beb0 100644
 +CPDF_Dictionary* CPDF_Annot::DrawingDict() const {
 +  RetainPtr<const CPDF_Dictionary> ap =
 +      annot_dict_->GetDictFor(pdfium::annotation::kAP);
-+  if ((ap && ap->GetDictFor("N")) || (ap && ap->GetStreamFor("N")) ||
-+      !render_dict_) {
++  if ((ap && ap->GetDictFor("N")) || !render_dict_) {
 +    return annot_dict_.Get();
 +  }
 +  return render_dict_.Get();
@@ -42,7 +52,7 @@ index 97d3277..879beb0 100644
  bool CPDF_Annot::ShouldGenerateAP() const {
    // If AP dictionary exists and defines an appearance for normal mode, we use
    // the appearance defined in the existing AP dictionary.
-@@ -161,6 +181,9 @@ bool CPDF_Annot::ShouldGenerateAP() const {
+@@ -161,6 +184,9 @@ bool CPDF_Annot::ShouldGenerateAP() const {
    if (pAP && pAP->GetDictFor("N")) {
      return false;
    }
@@ -52,7 +62,7 @@ index 97d3277..879beb0 100644
  
    return !IsHidden();
  }
-@@ -183,10 +206,12 @@ CPDF_Annot::Subtype CPDF_Annot::GetSubtype() const {
+@@ -183,10 +209,12 @@ CPDF_Annot::Subtype CPDF_Annot::GetSubtype() const {
  CFX_FloatRect CPDF_Annot::RectForDrawing() const {
    bool bShouldUseQuadPointsCoords =
        is_text_markup_annotation_ && has_generated_ap_;
@@ -67,7 +77,7 @@ index 97d3277..879beb0 100644
  }
  
  CFX_FloatRect CPDF_Annot::GetRect() const {
-@@ -216,7 +241,7 @@ RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(CPDF_Dictionary* pAnnotDict,
+@@ -216,7 +244,7 @@ RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(CPDF_Dictionary* pAnnotDict,
  }
  
  CPDF_Form* CPDF_Annot::GetAPForm(CPDF_Page* pPage, AppearanceMode mode) {
@@ -77,10 +87,18 @@ index 97d3277..879beb0 100644
      return nullptr;
    }
 diff --git a/core/fpdfdoc/cpdf_annot.h b/core/fpdfdoc/cpdf_annot.h
-index 3e8bc5e..9bc335c 100644
+index 3e8bc5e..372e651 100644
 --- a/core/fpdfdoc/cpdf_annot.h
 +++ b/core/fpdfdoc/cpdf_annot.h
-@@ -107,6 +107,10 @@ class CPDF_Annot {
+@@ -26,6 +26,7 @@ class CPDF_Array;
+ class CPDF_Dictionary;
+ class CPDF_Document;
+ class CPDF_Form;
++class CPDF_IndirectObjectHolder;
+ class CPDF_Page;
+ class CPDF_RenderContext;
+ 
+@@ -107,6 +108,10 @@ class CPDF_Annot {
    bool ShouldDrawAnnotation() const;
  
    CFX_FloatRect RectForDrawing() const;
@@ -91,26 +109,49 @@ index 3e8bc5e..9bc335c 100644
  
    RetainPtr<CPDF_Dictionary> const annot_dict_;
    UnownedPtr<CPDF_Document> const document_;
-@@ -118,6 +122,9 @@ class CPDF_Annot {
+@@ -118,6 +123,12 @@ class CPDF_Annot {
    // |open_state_| is only set for popup annotations.
    bool open_state_ = false;
    bool has_generated_ap_;
-+  // g-lab-bit fork (fork_p8.patch): private copy of |annot_dict_| holding a
-+  // render-only generated appearance; null when none was generated.
++  // g-lab-bit fork (fork_p8.patch): private object store + private copy of
++  // |annot_dict_| holding a render-only generated appearance (null when none
++  // was generated). The store is declared first so it outlives the copy that
++  // references into it.
++  std::unique_ptr<CPDF_IndirectObjectHolder> render_objects_;
 +  RetainPtr<CPDF_Dictionary> render_dict_;
  };
  
  // Get the AP in an annotation dict for a given appearance mode.
 diff --git a/core/fpdfdoc/cpdf_generateap.cpp b/core/fpdfdoc/cpdf_generateap.cpp
-index 4a9d729..ed9a277 100644
+index 4a9d729..46c1e12 100644
 --- a/core/fpdfdoc/cpdf_generateap.cpp
 +++ b/core/fpdfdoc/cpdf_generateap.cpp
-@@ -42,6 +42,13 @@
+@@ -23,6 +23,7 @@
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_name.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
++#include "core/fpdfapi/parser/cpdf_indirect_object_holder.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_stream.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+@@ -42,6 +43,25 @@
  
  namespace {
  
-+// g-lab-bit fork (fork_p8.patch): see CPDF_GenerateAP::ScopedRenderOnly.
-+thread_local bool g_render_only = false;
++// g-lab-bit fork (fork_p8.patch): non-null while a
++// CPDF_GenerateAP::ScopedRenderOnly is alive on this thread — the private
++// object store render-only appearances are registered in.
++thread_local CPDF_IndirectObjectHolder* g_render_objects = nullptr;
++
++// Holder that owns |obj|: the private render-only store when the object was
++// registered there, else the document.
++CPDF_IndirectObjectHolder* HolderFor(CPDF_Document* doc, const CPDF_Object* obj) {
++  if (g_render_objects && obj->GetObjNum() &&
++      g_render_objects->GetIndirectObject(obj->GetObjNum()).Get() == obj) {
++    return g_render_objects;
++  }
++  return doc;
++}
 +
 +}  // namespace
 +
@@ -119,24 +160,25 @@ index 4a9d729..ed9a277 100644
  constexpr char kGSDictName[] = "GS";
  
  struct CPVT_Dash {
-@@ -610,7 +617,9 @@ ByteString GetPopupContentsString(CPDF_Document* doc,
+@@ -610,7 +630,10 @@ ByteString GetPopupContentsString(CPDF_Document* doc,
  }
  
  RetainPtr<CPDF_Dictionary> GenerateFallbackFontDict(CPDF_Document* doc) {
 -  auto font_dict = doc->NewIndirect<CPDF_Dictionary>();
-+  // Render-only: a direct dictionary, not registered in the document.
-+  auto font_dict = g_render_only ? doc->New<CPDF_Dictionary>()
-+                                 : doc->NewIndirect<CPDF_Dictionary>();
++  // Render-only: registered in the private store, not the document.
++  auto font_dict = g_render_objects
++                       ? g_render_objects->NewIndirect<CPDF_Dictionary>()
++                       : doc->NewIndirect<CPDF_Dictionary>();
    font_dict->SetNewFor<CPDF_Name>("Type", "Font");
    font_dict->SetNewFor<CPDF_Name>("Subtype", "Type1");
    font_dict->SetNewFor<CPDF_Name>("BaseFont", CFX_Font::kDefaultAnsiFontName);
-@@ -630,18 +639,24 @@ RetainPtr<CPDF_Dictionary> GetFontFromDrFontDictOrGenerateFallback(
+@@ -630,18 +653,20 @@ RetainPtr<CPDF_Dictionary> GetFontFromDrFontDictOrGenerateFallback(
    }
  
    RetainPtr<CPDF_Dictionary> new_font_dict = GenerateFallbackFontDict(doc);
 -  dr_font_dict->SetNewFor<CPDF_Reference>(font_name, doc,
 -                                          new_font_dict->GetObjNum());
-+  if (!g_render_only) {  // render-only never extends the form's /DR
++  if (!g_render_objects) {  // render-only never extends the form's /DR
 +    dr_font_dict->SetNewFor<CPDF_Reference>(font_name, doc,
 +                                            new_font_dict->GetObjNum());
 +  }
@@ -147,114 +189,119 @@ index 4a9d729..ed9a277 100644
      CPDF_Document* doc,
      const ByteString& font_name,
 -    uint32_t font_dict_obj_num) {
-+    RetainPtr<CPDF_Dictionary> font_dict) {
++    const CPDF_Dictionary* font_dict) {
    auto resource_font_dict = doc->New<CPDF_Dictionary>();
 -  resource_font_dict->SetNewFor<CPDF_Reference>(font_name, doc,
 -                                                font_dict_obj_num);
-+  if (font_dict->GetObjNum() == 0) {  // render-only: direct font dictionary
-+    resource_font_dict->SetFor(font_name, std::move(font_dict));
-+  } else {
-+    resource_font_dict->SetNewFor<CPDF_Reference>(font_name, doc,
-+                                                  font_dict->GetObjNum());
-+  }
++  resource_font_dict->SetNewFor<CPDF_Reference>(
++      font_name, HolderFor(doc, font_dict), font_dict->GetObjNum());
    return resource_font_dict;
  }
  
-@@ -752,11 +767,18 @@ void GenerateAndSetAPDict(CPDF_Document* doc,
+@@ -752,12 +777,17 @@ void GenerateAndSetAPDict(CPDF_Document* doc,
    stream_dict->SetRectFor("BBox", rect);
    stream_dict->SetFor("Resources", std::move(resource_dict));
  
 -  auto normal_stream = doc->NewIndirect<CPDF_Stream>(std::move(stream_dict));
--  normal_stream->SetDataFromStringstream(app_stream);
--
++  // Render-only: the stream lives in the private store, referenced from the
++  // private annotation copy; the document never sees it.
++  CPDF_IndirectObjectHolder* holder =
++      g_render_objects ? g_render_objects
++                       : static_cast<CPDF_IndirectObjectHolder*>(doc);
++  auto normal_stream = holder->NewIndirect<CPDF_Stream>(std::move(stream_dict));
+   normal_stream->SetDataFromStringstream(app_stream);
+ 
    RetainPtr<CPDF_Dictionary> ap_dict =
        annot_dict->GetOrCreateDictFor(pdfium::annotation::kAP);
-+  if (g_render_only) {
-+    // Render-only: the stream is owned by |annot_dict| (a private copy) and
-+    // never registered in the document.
-+    auto normal_stream = pdfium::MakeRetain<CPDF_Stream>(std::move(stream_dict));
-+    normal_stream->SetDataFromStringstream(app_stream);
-+    ap_dict->SetFor("N", std::move(normal_stream));
-+    return;
-+  }
-+  auto normal_stream = doc->NewIndirect<CPDF_Stream>(std::move(stream_dict));
-+  normal_stream->SetDataFromStringstream(app_stream);
-   ap_dict->SetNewFor<CPDF_Reference>("N", doc, normal_stream->GetObjNum());
+-  ap_dict->SetNewFor<CPDF_Reference>("N", doc, normal_stream->GetObjNum());
++  ap_dict->SetNewFor<CPDF_Reference>("N", holder, normal_stream->GetObjNum());
  }
  
-@@ -1036,6 +1058,17 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+ ByteString GenerateTextFieldAP(const CPDF_Dictionary* annot_dict,
+@@ -1036,6 +1066,18 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    RetainPtr<CPDF_Dictionary> form_dict =
        root_dict->GetMutableDictFor("AcroForm");
-+  if (!form_dict && g_render_only) {
++  if (!form_dict && g_render_objects) {
 +    // Render-only: never create /AcroForm in the document. Use a detached
-+    // stand-in with the same defaults InitAcroFormDict() would provide
-+    // (/DR /Font /Helv = the fallback font, form /DA "/Helv 0 Tf 0 g"), all
-+    // direct objects owned by the stand-in.
++    // stand-in with the defaults InitAcroFormDict() would provide
++    // (/DR /Font /Helv = the fallback font, form /DA "/Helv 0 Tf 0 g").
 +    form_dict = doc->New<CPDF_Dictionary>();
++    RetainPtr<CPDF_Dictionary> helv = GenerateFallbackFontDict(doc);
 +    form_dict->SetNewFor<CPDF_Dictionary>("DR")
 +        ->SetNewFor<CPDF_Dictionary>("Font")
-+        ->SetFor("Helv", GenerateFallbackFontDict(doc));
++        ->SetNewFor<CPDF_Reference>("Helv", g_render_objects,
++                                    helv->GetObjNum());
 +    form_dict->SetNewFor<CPDF_String>("DA", "/Helv 0 Tf 0 g");
 +  }
    if (!form_dict) {
      form_dict = CPDF_InteractiveForm::InitAcroFormDict(doc);
      CHECK(form_dict);
-@@ -1121,8 +1154,7 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
-   }
+@@ -1122,7 +1164,7 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    auto graphics_state_dict = GenerateExtGStateDict(*annot_dict, "Normal");
--  auto resource_font_dict =
+   auto resource_font_dict =
 -      GenerateResourceFontDict(doc, font_name, font_dict->GetObjNum());
-+  auto resource_font_dict = GenerateResourceFontDict(doc, font_name, font_dict);
++      GenerateResourceFontDict(doc, font_name, font_dict.Get());
    auto resource_dict = GenerateResourcesDict(
        doc, std::move(graphics_state_dict), std::move(resource_font_dict));
    GenerateAndSetAPDict(doc, annot_dict, &appearance_stream,
-@@ -1290,7 +1322,7 @@ bool GeneratePopupAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+@@ -1290,7 +1332,7 @@ bool GeneratePopupAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
  
    const ByteString font_name = "FONT";
    RetainPtr<CPDF_Dictionary> resource_font_dict =
 -      GenerateResourceFontDict(doc, font_name, font_dict->GetObjNum());
-+      GenerateResourceFontDict(doc, font_name, font_dict);
++      GenerateResourceFontDict(doc, font_name, font_dict.Get());
    RetainPtr<CPDF_Dictionary> gs_dict =
        GenerateExtGStateDict(*annot_dict, "Normal");
    RetainPtr<CPDF_Dictionary> resources_dict = GenerateResourcesDict(
-@@ -1646,3 +1678,12 @@ bool CPDF_GenerateAP::GenerateDefaultAppearanceWithColor(
+@@ -1646,3 +1688,14 @@ bool CPDF_GenerateAP::GenerateDefaultAppearanceWithColor(
    // TODO(thestig): Call GenerateAnnotAP();
    return true;
  }
 +
 +// g-lab-bit fork (fork_p8.patch).
-+CPDF_GenerateAP::ScopedRenderOnly::ScopedRenderOnly() : previous_(g_render_only) {
-+  g_render_only = true;
++CPDF_GenerateAP::ScopedRenderOnly::ScopedRenderOnly(
++    CPDF_IndirectObjectHolder* private_objects)
++    : previous_(g_render_objects) {
++  g_render_objects = private_objects;
 +}
 +
 +CPDF_GenerateAP::ScopedRenderOnly::~ScopedRenderOnly() {
-+  g_render_only = previous_;
++  g_render_objects = previous_;
 +}
 diff --git a/core/fpdfdoc/cpdf_generateap.h b/core/fpdfdoc/cpdf_generateap.h
-index 51ff1a1..a35739e 100644
+index 51ff1a1..2355a53 100644
 --- a/core/fpdfdoc/cpdf_generateap.h
 +++ b/core/fpdfdoc/cpdf_generateap.h
-@@ -31,6 +31,23 @@ class CPDF_GenerateAP {
+@@ -11,6 +11,7 @@
+ 
+ class CPDF_Dictionary;
+ class CPDF_Document;
++class CPDF_IndirectObjectHolder;
+ struct CFX_Color;
+ 
+ class CPDF_GenerateAP {
+@@ -31,6 +32,24 @@ class CPDF_GenerateAP {
                                                   CPDF_Dictionary* annot_dict,
                                                   const CFX_Color& color);
  
 +  // g-lab-bit fork (fork_p8.patch): while an instance is alive on this thread,
 +  // GenerateAnnotAP() builds a RENDER-ONLY appearance: the /AP stream and any
-+  // fallback font are direct objects owned by the annotation dictionary passed
-+  // in, nothing is registered in |doc|, and the document's /AcroForm (and its
-+  // /DR fonts) is read but never created or extended. Used when PDFium draws an
-+  // annotation that lacks /AP, so rendering never changes the document.
++  // fallback font are registered in |private_objects| (owned by the caller,
++  // never part of the document) instead of the document, and the document's
++  // /AcroForm (and its /DR fonts) is only read, never created or extended.
++  // Used when PDFium draws an annotation that lacks /AP, so rendering never
++  // changes the document.
 +  class ScopedRenderOnly {
 +   public:
-+    ScopedRenderOnly();
++    explicit ScopedRenderOnly(CPDF_IndirectObjectHolder* private_objects);
 +    ~ScopedRenderOnly();
 +    ScopedRenderOnly(const ScopedRenderOnly&) = delete;
 +    ScopedRenderOnly& operator=(const ScopedRenderOnly&) = delete;
 +
 +   private:
-+    const bool previous_;
++    CPDF_IndirectObjectHolder* const previous_;
 +  };
 +
    CPDF_GenerateAP() = delete;
