@@ -68,6 +68,13 @@ int main(int argc, char** argv) {
   // first snapshot so the check isolates FPDFAnnot_GetNumberArray.
   for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i)
     FPDFPage_CloseAnnot(FPDFPage_GetAnnot(page, i));
+  // Context: the stock getter refuses when /AP exists. (It also loads the
+  // /AP stream into the object map, so it runs before the first snapshot.)
+  FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
+  unsigned int r, g, b, al;
+  printf("{\"case\":\"getcolor_with_ap\",\"ok\":%d}\n",
+         FPDFAnnot_GetColor(a, FPDFANNOT_COLORTYPE_Color, &r, &g, &b, &al));
+  FPDFPage_CloseAnnot(a);
   MemWriter before, after;
   StockSave(doc, &before);
 
@@ -83,12 +90,6 @@ int main(int argc, char** argv) {
   Case(page, "size_query_count0", 0, "C", 1, 0);
   Case(page, "truncated_copy", 0, "C", 1, 2);
   Case(page, "null_key", 0, NULL, 1, 8);
-
-  FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
-  unsigned int r, g, b, al;
-  printf("{\"case\":\"getcolor_with_ap\",\"ok\":%d}\n",
-         FPDFAnnot_GetColor(a, FPDFANNOT_COLORTYPE_Color, &r, &g, &b, &al));
-  FPDFPage_CloseAnnot(a);
 
   StockSave(doc, &after);
   printf("{\"case\":\"nomutate\",\"equal\":%d}\n",
