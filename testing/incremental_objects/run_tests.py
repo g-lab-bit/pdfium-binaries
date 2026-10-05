@@ -56,7 +56,10 @@ def run(exe, fixture, out, *args):
     src = os.path.join(FIX, fixture)
     if not os.path.exists(src):
         return None, {"status": "missing fixture"}
-    r = subprocess.run([exe, src, out, "0", RECT, *args], capture_output=True, text=True)
+    # The driver dumps a stock incremental save (= every object in the
+    # document's map) next to OUT, so tests can check the in-memory state.
+    env = dict(os.environ, INCR_DUMP_STOCK=out + ".stock.pdf")
+    r = subprocess.run([exe, src, out, "0", RECT, *args], capture_output=True, text=True, env=env)
     res = next((json.loads(l[7:]) for l in r.stdout.splitlines() if l.startswith("RESULT ")), {})
     return r.returncode, res
 
@@ -82,6 +85,20 @@ def qpdf_ok(path):
 def verify_checks(res, extra):
     """FPDF_VerifyIncrementalSave result of every save of a case."""
     msgs = []
+    for objnum, pattern in extra.get("memory_has", []):
+        out = res.get("_out")
+        dump = open(out + ".stock.pdf", "rb").read() if out and os.path.exists(out + ".stock.pdf") else b""
+        m = re.search(rb"(?:^|\n)%d 0 obj\r\n(.*?)endobj" % objnum, dump, re.S)
+        if not m or not re.search(pattern, m.group(1)):
+            msgs.append("in-memory object %d lacks %r (tolerance not exercised)" % (objnum, pattern))
+    if extra.get("nomutate"):
+        for sv in res.get("saves", []):
+            if sv.get("map_objects", 0) <= 0:
+                msgs.append("no map objects counted")
+            if sv.get("nomutate_control") != 1:
+                msgs.append("stock saves not comparable (control)")
+            if sv.get("nomutate") != 1:
+                msgs.append("document changed by FPDF_VerifyIncrementalSave")
     want = extra.get("verify", True)
     for i, sv in enumerate(res.get("saves", [])):
         if sv.get("verify") is not want:
@@ -149,6 +166,48 @@ def main():
         ("edit_hybrid", "hybrid_xrefstm.pdf", E, "ok", [0], {"kind": "table"}),
         ("edit_aes256_r6", "enc_aes256_r6.pdf", E, "ok", [0], {}),
         ("edit_rc4_r3", "enc_rc4_r3.pdf", E, "ok", [0], {}),
+        # M4: CPDF_Page adds /Type /Page in memory; the page is NOT listed
+        ("pagetree_page_notype_unlisted", "notype_page_unlisted.pdf", E, "ok", [0],
+         {"memory_has": [(3, rb"/Type/Page\b")]}),
+        # M4/M5 via CountPages (both documents fix on load)
+        ("pagetree_badcount_edit", "badcount_tree.pdf", E, "ok", [0],
+         {"memory_has": [(4, rb"/Type/Pages"), (2, rb"/Count 1")]}),
+        ("pagetree_notype_edit", "notype_tree.pdf", E, "ok", [0], {}),
+        ("pagetree_wrongtype_edit", "wrongtype_tree.pdf", E, "ok", [0], {}),
+        # unlisted edit of a direct dictionary inside an unlisted page
+        ("direct_child_unlisted", "inline_annot.pdf", ["--mode", "direct_child_unlisted"], "ok", None,
+         {"identical": True, "verify": False, "mismatch": 3}),
+        # M3 negative: Flate-normalised stream with different data
+        ("verify_corrupt_apdata", "basic_classic.pdf", E + ["--corrupt", "apdata"], "ok", [0],
+         {"verify": False, "mismatch": 7}),
+        # an update must not define an object PDFium never held
+        ("verify_injected_object", "basic_classic.pdf", E + ["--corrupt", "inject:6"], "ok", [0],
+         {"verify": False, "mismatch": 6}),
+        # /Info changed in the update (no public API edits /Info in memory)
+        ("verify_tampered_info", "with_info.pdf", E + ["--load-info", "--corrupt", "inject:5"], "ok", [0],
+         {"verify": False, "mismatch": 5}),
+        # a real page change that was not listed: verify must report page 3
+        ("pagetree_rotate_unlisted", "notype_tree.pdf", ["--mode", "rotate_unlisted"], "ok", None,
+         {"identical": True, "verify": False, "mismatch": 3}),
+        # M7: form loaded (/FT /Ff copied to field 8, /T of 11 made direct)
+        ("form_fixes_edit", "acroform_fixes.pdf", ["--mode", "form_edit"], "ok", [0],
+         {"memory_has": [(8, rb"/FT/Tx"), (8, rb"/Ff 4096"), (11, rb"/T\(Second\)")]}),
+        # creating the form page view regenerates appearances of widgets
+        # without /AP (new streams referenced from unlisted widgets): refused
+        ("form_ap_regeneration_refused", "acroform_noap.pdf", ["--mode", "form_edit"], "refused", None, {}),
+        # M7 negative: parent has /FT, so nothing is copied; an unlisted /Ff
+        # on the parent equal to the kid's must still fail
+        ("form_parent_flags_unlisted", "acroform_parent_ft.pdf", ["--mode", "form_flags_unlisted"], "ok", [0],
+         {"verify": False, "mismatch": 8, "memory_has": [(8, rb"/Ff 4096")]}),
+        # field value changed but not listed: verify must report field 11
+        ("form_value_unlisted", "acroform_fixes.pdf", ["--mode", "form_value_unlisted"], "ok", [0],
+         {"verify": False, "mismatch": 11}),
+        # verify does not change the open document (map and objects)
+        ("verify_no_mutation_classic", "basic_classic.pdf", ["--mode", "nomutate"], "ok", [0], {"nomutate": True}),
+        ("verify_no_mutation_xrefstm", "basic_xrefstm.pdf", ["--mode", "nomutate"], "ok", [0], {"nomutate": True}),
+        # (RC4, not AES: AES uses random IVs, so two saves never match.)
+        ("verify_no_mutation_rc4", "enc_rc4_r3.pdf", ["--mode", "nomutate"], "ok", [0], {"nomutate": True}),
+        ("verify_no_mutation_form", "acroform_fixes.pdf", ["--mode", "nomutate"], "ok", [0], {"nomutate": True}),
         # FPDF_VerifyIncrementalSave on a corrupted copy of the saved file
         ("verify_corrupt_value_classic", "basic_classic.pdf", E + ["--corrupt", "nm"], "ok", [0],
          {"verify": False, "mismatch": "holder"}),
@@ -224,6 +283,7 @@ def main():
                 msgs.append("refusal wrote %s bytes" % res["saves"][-1].get("bytes_written"))
             if os.path.exists(out):
                 msgs.append("output written on refusal")
+        res["_out"] = out
         if status == "ok" == expect:
             msgs += verify_ok(fx, out, res, new, extra)
             msgs += verify_checks(res, extra)

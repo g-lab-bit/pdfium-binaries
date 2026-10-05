@@ -2,7 +2,8 @@
 """Corpus run for FPDF_SaveIncrementalObjects + FPDF_VerifyIncrementalSave.
 
 usage: run_corpus.py PDFIUM_DIR --corpus DIR [--work DIR]
-For every DIR/*.pdf and every mode (edit, repeat x3, touch, noop) the driver
+For every DIR/*.pdf and every mode (edit, repeat x3, touch, noop, and edit
+after rendering every page) the driver
 saves on page 0 and verifies each save on the same open document. Expected:
 files whose name starts with "damaged_" are refused (rebuilt xref); every
 other file saves and every verify is TRUE. Prints a timing table. The corpus
@@ -21,7 +22,10 @@ FILES = sorted(glob.glob(os.path.join(CORPUS, "*.pdf")))
 if not FILES:
     sys.exit("run_corpus.py: no PDFs in %s" % CORPUS)
 MODES = {"edit": ["--mode", "edit"], "repeat3": ["--mode", "edit", "--repeat", "3"],
-         "touch": ["--mode", "touch"], "noop": ["--mode", "noop"]}
+         "touch": ["--mode", "touch"], "noop": ["--mode", "noop"],
+         # worst case for verify: every page rendered (content streams,
+         # fonts, images loaded into the document) before the edit
+         "edit_render_all": ["--mode", "edit", "--render-all"]}
 
 
 def build():

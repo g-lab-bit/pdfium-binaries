@@ -17,6 +17,23 @@
 //            an unreferenced new object and must not be written.
 //   --list n,..: with mode list, exactly these; with other modes, appended
 //            to the objects the mode lists.
+//   rotate_unlisted: FPDFPage_SetRotation on PAGE, nothing listed (the save
+//            is an exact copy; verify must report the page).
+//   form_edit: init a form-fill environment and load every field of PAGE
+//            (CPDF_InteractiveForm), then "edit".
+//   form_value_unlisted: like form_edit, but also set /V of annotation 1
+//            (a field widget) without listing it; verify must report it.
+//   form_flags_unlisted: like form_edit, but set the field flags of
+//            annotation 0 (stored on its parent field) without listing it.
+//   direct_child_unlisted: recolour annotation 0 (a direct dictionary in
+//            the page's /Annots), nothing listed.
+//   nomutate: "edit", then a stock FPDF_SaveAsCopy(FPDF_INCREMENTAL) (it
+//            writes every object in the document's map) and a full
+//            FPDF_SaveAsCopy(0), each before and after
+//            FPDF_VerifyIncrementalSave, /ID masked: must be identical.
+//   form modes also call FORM_OnAfterLoadPage (FixPageFields).
+//   --load-info: read /Info (FPDF_GetMetaText) after loading.
+//   --render-all: render every page before the edit (worst-case timing).
 //   session: ONE open document, several saves (no reopen); needs >= 3 pages.
 //            Writes OUT.s1.pdf (edit p0, L1), OUT.s2.pdf (edit p1 + /Rotate p2,
 //            L1+L2+L3), tries L2+L3 only (expected refusal) and writes
@@ -27,9 +44,12 @@
 //   --render  : render PAGE with annotations before editing.
 //   Every successful save is checked with FPDF_VerifyIncrementalSave on the
 //   same open document ("verify", "mismatch", "verify_ms" in RESULT).
-//   --corrupt nm|startxref: verify a corrupted copy instead (the update's
-//               first "incr-real-" becomes "incr-REAL-", or the final
-//               startxref value is incremented); OUT stays uncorrupted.
+//   --corrupt nm|startxref|apdata|inject:N: verify a corrupted copy
+//               instead: the update's first "incr-real-" becomes
+//               "incr-REAL-"; the final startxref is incremented; a byte of
+//               the new Form XObject's Flate data is flipped; or a second
+//               update redefining object N is appended (classic originals).
+//               OUT stays uncorrupted.
 //   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
 //               output past N bytes (write-failure tests; PDFium buffers
 //               32 KiB, so small files only write in the final flush).
@@ -44,6 +64,8 @@
 #include "fpdf_annot.h"
 #include "fpdf_dataavail.h"
 #include "fpdf_edit.h"
+#include "fpdf_formfill.h"
+#include "fpdf_doc.h"
 #include "fpdf_save.h"
 #include "fpdfview.h"
 
@@ -182,12 +204,32 @@ static int Save(FPDF_DOCUMENT doc, const uint32_t* l, size_t n, MemWriter* w,
   return ok;
 }
 
+// Stock incremental save (every object in the document map) with the
+// trailer /ID masked, for the nomutate check.
+static void StockSave(FPDF_DOCUMENT doc, MemWriter* w, FPDF_DWORD flags) {
+  memset(w, 0, sizeof *w);
+  w->fw.version = 1;
+  w->fw.WriteBlock = WriteBlockCb;
+  FPDF_SaveAsCopy(doc, &w->fw, flags);
+  for (size_t i = w->len; i-- > 3;) {
+    if (!memcmp(w->data + i - 3, "/ID", 3)) {
+      for (size_t j = i; j < w->len && w->data[j] != ']'; ++j) w->data[j] = '#';
+      break;
+    }
+  }
+}
+
+static int SameBytes(const MemWriter* a, const MemWriter* b) {
+  return a->len == b->len && !memcmp(a->data, b->data, a->len);
+}
+
 static const char* g_corrupt = NULL;
+static int g_load_info = 0, g_render_all = 0;
 
 // FPDF_VerifyIncrementalSave on a copy of `data` (optionally corrupted).
 static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
                   size_t orig_len, uint32_t* mismatch, double* ms) {
-  unsigned char* copy = malloc(len ? len : 1);
+  unsigned char* copy = malloc(len + 1024);
   memcpy(copy, data, len);
   if (g_corrupt && !strcmp(g_corrupt, "nm")) {
     int done = 0;
@@ -222,6 +264,35 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
         break;
       }
     }
+  }
+  if (g_corrupt && !strcmp(g_corrupt, "apdata")) {
+    for (size_t i = orig_len; i + 13 <= len; ++i) {
+      if (memcmp(copy + i, "/Subtype/Form", 13)) continue;
+      for (size_t j = i; j + 8 <= len; ++j) {
+        if (!memcmp(copy + j, "stream\r\n", 8)) { copy[j + 8 + 10] ^= 0x55; break; }
+      }
+      break;
+    }
+  } else if (g_corrupt && !strncmp(g_corrupt, "inject:", 7)) {
+    unsigned n = (unsigned)atoi(g_corrupt + 7), root = 0, size = 0;
+    unsigned long long prev = 0;
+    for (size_t i = len; i-- > 9;) {
+      if (!memcmp(copy + i - 9, "startxref", 9)) { prev = strtoull((char*)copy + i, NULL, 10); break; }
+    }
+    for (size_t i = len; i-- > 5;) {
+      if (!root && !memcmp(copy + i - 5, "/Root", 5)) root = (unsigned)strtoul((char*)copy + i, NULL, 10);
+      if (!size && !memcmp(copy + i - 5, "/Size", 5)) size = (unsigned)strtoul((char*)copy + i, NULL, 10);
+      if (root && size) break;
+    }
+    size_t obj = len + 2;
+    int k = snprintf((char*)copy + len, 1024,
+                     "\r\n%u 0 obj\r\n<</Title (tampered)>>\r\nendobj\r\n", n);
+    size_t xref = len + k;
+    k += snprintf((char*)copy + len + k, 1024 - k,
+                  "xref\r\n%u 1\r\n%010zu 00000 n\r\ntrailer\r\n<</Size %u/Root %u 0 R/Prev %llu>>"
+                  "\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n",
+                  n, obj, size > n ? size : n + 1, root, prev, xref);
+    len += k;
   }
   Buf b = {copy, len};
   FPDF_FILEACCESS acc = {(unsigned long)len, GetBlock, &b};
@@ -291,6 +362,7 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
                    size_t info_cap) {
   int lin = -1;
   FPDF_DOCUMENT doc;
+  snprintf(info, info_cap, "\"error\":\"setup failed\"");
   if (!strcmp(mode, "newdoc")) {
     doc = FPDF_CreateNewDocument();
     FPDF_PAGE p = doc ? FPDFPage_New(doc, 0, 612, 792) : NULL;
@@ -306,11 +378,66 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
   uint32_t objnums[64];
   size_t n = 0;
   uint32_t page_num = 0, annots_num = 0;
+  int form = !strcmp(mode, "form_edit") || !strcmp(mode, "form_value_unlisted") ||
+             !strcmp(mode, "form_flags_unlisted");
   int edit = !strcmp(mode, "edit") || !strcmp(mode, "removed") ||
-             !strcmp(mode, "stdfont") || !strcmp(mode, "apreplaced");
-  if (edit || !strcmp(mode, "touch") || render) {
+             !strcmp(mode, "stdfont") || !strcmp(mode, "apreplaced") ||
+             !strcmp(mode, "nomutate") || form;
+  FPDF_FORMHANDLE hform = NULL;
+  if (form) {
+    static FPDF_FORMFILLINFO ffi;
+    memset(&ffi, 0, sizeof ffi);
+    ffi.version = 1;
+    hform = FPDFDOC_InitFormFillEnvironment(doc, &ffi);
+    if (!hform) { Close(doc); return -1; }
+  }
+  if (g_load_info) {
+    char buf[256];
+    FPDF_GetMetaText(doc, "Title", buf, sizeof buf);
+  }
+  if (g_render_all) {
+    for (int i = 0; i < FPDF_GetPageCount(doc); ++i) {
+      FPDF_PAGE p = FPDF_LoadPage(doc, i);
+      if (!p) continue;
+      FPDF_BITMAP bmp = FPDFBitmap_Create(200, 200, 0);
+      FPDFBitmap_FillRect(bmp, 0, 0, 200, 200, 0xFFFFFFFF);
+      FPDF_RenderPageBitmap(bmp, p, 0, 0, 200, 200, 0, FPDF_ANNOT);
+      FPDFBitmap_Destroy(bmp);
+      FPDF_ClosePage(p);
+    }
+  }
+  int direct_child = !strcmp(mode, "direct_child_unlisted");
+  if (edit || !strcmp(mode, "touch") || !strcmp(mode, "rotate_unlisted") ||
+      direct_child || render) {
     FPDF_PAGE page = FPDF_LoadPage(doc, page_no);
     if (!page) { Close(doc); return -1; }
+    if (!strcmp(mode, "rotate_unlisted")) FPDFPage_SetRotation(page, 1);
+    if (direct_child) {
+      FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
+      if (!a || !FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color, 255, 0, 0, 255)) {
+        if (a) FPDFPage_CloseAnnot(a);
+        FPDF_ClosePage(page);
+        Close(doc);
+        return -1;
+      }
+      FPDFPage_CloseAnnot(a);
+    }
+    if (form) FORM_OnAfterLoadPage(page, hform);  // FixPageFields
+    if (form) {
+      // Loads the interactive form (CPDF_InteractiveForm::LoadField).
+      for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i) {
+        FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, i);
+        FPDFAnnot_GetFormFieldType(hform, a);
+        if (i == 0 && !strcmp(mode, "form_flags_unlisted"))
+          FPDFAnnot_SetFormFieldFlags(hform, a, 4096);
+        if (i == 1 && !strcmp(mode, "form_value_unlisted")) {
+          FPDF_WCHAR v[8];
+          ToWide("new", v, 8);
+          FPDFAnnot_SetStringValue(a, "V", v);
+        }
+        FPDFPage_CloseAnnot(a);
+      }
+    }
     if (render) {
       int bw = 200, bh = 200;
       FPDF_BITMAP bmp = FPDFBitmap_Create(bw, bh, 0);
@@ -346,6 +473,7 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
       if (!holder) { FPDF_ClosePage(page); Close(doc); return -1; }
       objnums[n++] = holder;
     }
+    if (form) FORM_OnBeforeClosePage(page, hform);
     FPDF_ClosePage(page);
   }
   for (size_t i = 0; i < list_n && n < 64; ++i) objnums[n++] = list[i];
@@ -354,15 +482,48 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
   FPDF_BOOL ok = Save(doc, objnums, n, &w, &ms);
   uint32_t mismatch = 0;
   double vms = 0;
+  int nomutate = -1, control = -1, map_objects = -1;
+  MemWriter a0, a1, a2, f0, f1, f2;
+  int nm = ok && !strcmp(mode, "nomutate");
+  if (nm) StockSave(doc, &a0, FPDF_INCREMENTAL), StockSave(doc, &a1, FPDF_INCREMENTAL);
   int verified = ok && Verify(doc, w.data, w.len, in_len, &mismatch, &vms);
+  if (nm) {
+    // The object map: a stock incremental save writes every map object.
+    StockSave(doc, &a2, FPDF_INCREMENTAL);
+    // Object contents: full saves around a second verify. (A stock full
+    // save itself loads objects into the map - GetObjectsWithReferences -
+    // so it must not sit between the map snapshots above.)
+    StockSave(doc, &f0, 0), StockSave(doc, &f1, 0);
+    uint32_t mm2;
+    double vms2;
+    verified = verified && Verify(doc, w.data, w.len, in_len, &mm2, &vms2);
+    StockSave(doc, &f2, 0);
+    // controls: the /ID masking makes two saves comparable
+    control = SameBytes(&a0, &a1) && SameBytes(&f0, &f1);
+    nomutate = SameBytes(&a1, &a2) && SameBytes(&f1, &f2);
+    map_objects = 0;
+    for (size_t i = in_len; i + 6 <= a2.len; ++i)
+      if (!memcmp(a2.data + i, " 0 obj", 6)) ++map_objects;
+    free(a0.data), free(a1.data), free(a2.data);
+    free(f0.data), free(f1.data), free(f2.data);
+  }
+  if (ok && getenv("INCR_DUMP_STOCK")) {  // debugging: the in-memory objects
+    MemWriter d;
+    StockSave(doc, &d, FPDF_INCREMENTAL);
+    WriteAll(getenv("INCR_DUMP_STOCK"), d.data, d.len);
+    free(d.data);
+  }
+  if (hform) FPDFDOC_ExitFormFillEnvironment(hform);
   Close(doc);
   int pos = snprintf(info, info_cap,
                      "\"ok\":%s,\"save_ms\":%.2f,\"page_objnum\":%u,"
                      "\"annots_objnum\":%u,\"avail_linearized\":%d,"
                      "\"bytes_written\":%zu,\"verify\":%s,\"mismatch\":%u,"
-                     "\"verify_ms\":%.2f,\"objnums\":[",
+                     "\"verify_ms\":%.2f,\"nomutate\":%d,\"nomutate_control\":%d,"
+                     "\"map_objects\":%d,\"objnums\":[",
                      ok ? "true" : "false", ms, page_num, annots_num, lin, w.len,
-                     verified ? "true" : "false", mismatch, vms);
+                     verified ? "true" : "false", mismatch, vms, nomutate, control,
+                     map_objects);
   for (size_t i = 0; i < n && pos < (int)info_cap; ++i)
     pos += snprintf(info + pos, info_cap - pos, "%s%u", i ? "," : "", objnums[i]);
   if (pos < (int)info_cap) snprintf(info + pos, info_cap - pos, "]");
@@ -389,6 +550,8 @@ int main(int argc, char** argv) {
   for (int i = 5; i < argc; ++i) {
     if (!strcmp(argv[i], "--avail")) { avail = 1; continue; }
     if (!strcmp(argv[i], "--render")) { render = 1; continue; }
+    if (!strcmp(argv[i], "--load-info")) { g_load_info = 1; continue; }
+    if (!strcmp(argv[i], "--render-all")) { g_render_all = 1; continue; }
     if (i + 1 >= argc) break;
     if (!strcmp(argv[i], "--mode")) mode = argv[++i];
     else if (!strcmp(argv[i], "--repeat")) repeat = atoi(argv[++i]);

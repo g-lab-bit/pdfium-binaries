@@ -21,7 +21,7 @@ os.makedirs(OUT, exist_ok=True)
 ID = b"/ID [<00112233445566778899aabbccddeeff><00112233445566778899aabbccddeeff>]"
 
 
-def classic(objs, root=1, gens=None, tail=b"\n", size=None, prefix=b""):
+def classic(objs, root=1, gens=None, tail=b"\n", size=None, prefix=b"", info=None):
     gens = gens or {}
     out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offs = {}
@@ -33,7 +33,8 @@ def classic(objs, root=1, gens=None, tail=b"\n", size=None, prefix=b""):
     out += b"xref\n0 %d\n0000000000 65535 f\r\n" % nent
     for n in range(1, nent):
         out += (b"%010d %05d n\r\n" % (offs[n], gens.get(n, 0))) if n in offs else b"0000000000 00000 f\r\n"
-    out += b"trailer\n<< /Size %d /Root %d 0 R %s >>\n" % (size or nent, root, ID)
+    out += b"trailer\n<< /Size %d /Root %d 0 R %s%s >>\n" % (
+        size or nent, root, ID, b" /Info %d 0 R" % info if info else b"")
     out += b"startxref\n%d\n%%%%EOF" % x + tail
     return prefix + bytes(out)
 
@@ -152,3 +153,81 @@ random.seed(1)
 big = b"".join(b"%% pad %08x\n" % random.getrandbits(32) for _ in range(9000))
 o = pages3(); o[6] = b"<< /Length %d >>\nstream\n" % (len(CONTENT) + len(big)) + CONTENT + big + b"endstream"
 w("big_classic.pdf", classic(o))
+
+# Page tree: an intermediate /Pages node and the page without /Type (or with
+# a wrong one). PDFium fixes both in memory when the page is loaded (M4).
+def page_tree(node_type, page_type):
+    return classic({
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+        3: b"<< %s/Parent 4 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << >> >>" % page_type,
+        4: b"<< %s/Parent 2 0 R /Kids [3 0 R] /Count 1 >>" % node_type,
+        5: STREAM})
+w("notype_tree.pdf", page_tree(b"", b""))
+# A page with a wrong /Type is not loadable (IsValidPageDictLoose), so the
+# wrong value sits on the intermediate node only; GetNodeType fixes it.
+w("wrongtype_tree.pdf", page_tree(b"/Type /Foo ", b"/Type /Page "))
+
+# AcroForm: field 8 has /T but /FT and /Ff only on its widget kid 10; field
+# 11 (also a widget) has an indirect /T (12). Loading the form copies /FT /Ff
+# to 8 and makes 11's /T direct (M7).
+AP_FORM = b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Length 8 >>\nstream\n0 0 m S\n\nendstream"
+
+
+def with_ap(objs, widgets):
+    """Gives the widgets an existing /AP, so creating the form page view does
+    not regenerate appearances (which would be an unlisted change)."""
+    o = dict(objs)
+    o[13] = AP_FORM
+    for n in widgets:
+        o[n] = o[n].replace(b"/Subtype /Widget", b"/Subtype /Widget /AP << /N 13 0 R >>")
+    return o
+
+
+ACROFORM_FIXES = {
+    1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [8 0 R 11 0 R] >> >>",
+    2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> /Annots [10 0 R 11 0 R] >>",
+    4: STREAM,
+    8: b"<< /T (Parent) /Kids [10 0 R] >>",
+    9: b"<< >>",
+    10: b"<< /Type /Annot /Subtype /Widget /FT /Tx /Ff 4096 /Parent 8 0 R /Rect [300 600 400 620] /P 3 0 R >>",
+    11: b"<< /Type /Annot /Subtype /Widget /FT /Tx /T 12 0 R /V (old) /Rect [300 500 400 520] /P 3 0 R >>",
+    12: b"(Second)"}
+# Widgets without /AP: the page view regenerates them (refusal case).
+w("acroform_noap.pdf", classic(ACROFORM_FIXES))
+w("acroform_fixes.pdf", classic(with_ap(ACROFORM_FIXES, (10, 11))))
+
+# M4 via CPDF_Page's constructor: the page has no /Type and is NOT listed
+# (its /Annots array is an indirect object, which the edit lists instead).
+w("notype_page_unlisted.pdf", classic({
+    1: b"<< /Type /Catalog /Pages 2 0 R >>",
+    2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    3: b"<< /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> /Annots 5 0 R >>",
+    4: STREAM,
+    5: b"[]"}))
+# M4/M5 via CountPages(): invalid root /Count over an untyped node (both
+# documents apply this fix on load).
+w("badcount_tree.pdf", classic({
+    1: b"<< /Type /Catalog /Pages 2 0 R >>",
+    2: b"<< /Type /Pages /Kids [4 0 R] /Count 0 >>",
+    3: b"<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << >> >>",
+    4: b"<< /Parent 2 0 R /Kids [3 0 R] /Count -1 >>",
+    5: STREAM}))
+# M7 negative: the parent field HAS /FT, so LoadField copies nothing; an
+# unlisted /Ff set on the parent that happens to equal the kid's must fail.
+w("acroform_parent_ft.pdf", classic(with_ap({
+    1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [8 0 R] >> >>",
+    2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> /Annots [10 0 R] >>",
+    4: STREAM,
+    8: b"<< /T (Parent) /FT /Tx /Kids [10 0 R] >>",
+    10: b"<< /Type /Annot /Subtype /Widget /Ff 4096 /Parent 8 0 R /Rect [300 600 400 620] /P 3 0 R >>"}, (10,))))
+# /Info for the tampered-/Info case.
+o = page1(); o[5] = b"<< /Title (original) >>"
+w("with_info.pdf", classic(o, info=5))
+# A direct (inline) annotation dictionary inside the page's /Annots.
+o = page1()
+o[3] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> "
+        b"/Annots [<< /Type /Annot /Subtype /Square /Rect [50 50 90 90] /C [0 0 1] >>] >>")
+w("inline_annot.pdf", classic(o))
