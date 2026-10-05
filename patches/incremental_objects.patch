@@ -586,26 +586,45 @@ index 76cfa70..91919cc 100644
      return cross_ref_table_.get();
    }
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 8aa49ee..5bd2fbf 100644
+index 8aa49ee..0eec3b2 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
-@@ -15,12 +15,15 @@
+@@ -8,6 +8,8 @@
+ 
+ #include <stdint.h>
+ 
++#include <algorithm>
++#include <map>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+@@ -15,15 +17,25 @@
  #include "build/build_config.h"
  #include "constants/catalog.h"
  #include "core/fpdfapi/edit/cpdf_creator.h"
 +#include "core/fpdfapi/page/cpdf_annotcontext.h"
++#include "core/fpdfapi/page/cpdf_docpagedata.h"
 +#include "core/fpdfapi/page/cpdf_page.h"
  #include "core/fpdfapi/parser/cpdf_array.h"
  #include "core/fpdfapi/parser/cpdf_dictionary.h"
  #include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdfapi/parser/cpdf_object_walker.h"
++#include "core/fpdfapi/parser/cpdf_parser.h"
  #include "core/fpdfapi/parser/cpdf_reference.h"
++#include "core/fpdfapi/parser/cpdf_stream.h"
  #include "core/fpdfapi/parser/cpdf_stream_acc.h"
  #include "core/fpdfapi/parser/cpdf_string.h"
++#include "core/fpdfapi/render/cpdf_docrenderdata.h"
 +#include "core/fxcrt/compiler_specific.h"
++#include "core/fxcrt/containers/contains.h"
  #include "core/fxcrt/fx_extension.h"
  #include "core/fxcrt/mask.h"
  #include "core/fxcrt/stl_util.h"
-@@ -222,3 +225,50 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
++#include "fpdfsdk/cpdfsdk_customaccess.h"
+ #include "fpdfsdk/cpdfsdk_filewriteadapter.h"
+ #include "fpdfsdk/cpdfsdk_helpers.h"
+ #include "public/fpdf_edit.h"
+@@ -222,3 +234,377 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       int fileVersion) {
    return DoDocSave(document, file_write, flags, fileVersion);
  }
@@ -656,8 +675,335 @@ index 8aa49ee..5bd2fbf 100644
 +  }
 +  return context->GetAnnotDict()->GetObjNum();
 +}
++
++namespace {
++
++// g-lab-bit fork (incremental_objects.patch): FPDF_VerifyIncrementalSave().
++//
++// Compares objects of the in-memory document ("memory") with the same object
++// numbers in an independently parsed saved file ("saved"). The memory side
++// is only read: references are never resolved through the memory document's
++// parser (that would load objects into its map), only through
++// GetIndirectObject(), which does not parse.
++//
++// PDFium changes objects after load without a user edit. Each such change
++// is handled here explicitly:
++//  M1 Stream /Length is replaced by a direct number when a stream is loaded
++//     (CPDF_Stream::SetLengthInDict), on both sides: /Length is skipped and
++//     the data is compared instead.
++//  M2 Encrypted strings/streams are decrypted on load
++//     (CPDF_CryptoHandler::DecryptObjectTree), on both sides: decrypted
++//     values are compared.
++//  M3 The writer Flate-encodes unfiltered streams and drops their
++//     /DecodeParms (CPDF_FlateEncoder): memory without /Filter vs. saved
++//     /Filter /FlateDecode compares memory data with decoded saved data.
++//  M4 Page tree nodes without a valid /Type get /Type /Pages or /Page
++//     (GetNodeType() in cpdf_document.cpp, CPDF_Page's constructor): a
++//     memory /Type equal to that fix is accepted against a saved /Type that
++//     is missing or not Page/Pages.
++//  M5 An invalid page tree /Count is recomputed (CountPages()): a memory
++//     /Count is accepted against a saved /Count PDFium would also replace
++//     (not in 1..kPageMaxNum-1).
++//  M6 Direct page dictionaries in /Kids become indirect objects when a page
++//     is loaded (TraversePDFPages): NOT tolerated. FPDF_SaveIncrementalObjects
++//     refuses such a document unless the /Pages node is listed, so a
++//     mismatch here is real.
++//  M7 With an interactive form (form-fill environment, form field APIs),
++//     CPDF_InteractiveForm::LoadField copies /FT and /Ff from a widget to a
++//     parent field lacking /FT, and replaces an indirect /T with a direct
++//     copy: an extra memory /FT or /Ff equal to one of the dict's /Kids'
++//     values, and a direct memory /T equal to the saved indirect /T, are
++//     accepted.
++//  Rendering writes nothing to the document map: fork_p8 generates
++//  appearances (incl. the /AS fix) into private CPDF_IndirectObjectHolders
++//  and creates popups as direct dictionaries outside /Annots, and inline
++//  image dictionaries belong to the content parser.
++//  Anything else that differs (e.g. /AcroForm /DR fonts added while editing
++//  a text field) is an edit and must have been saved.
++constexpr int kMaxCompareDepth = 64;
++
++template <typename Fn>
++void ForEachRef(RetainPtr<const CPDF_Object> obj, Fn fn) {
++  CPDF_ObjectWalker walker(std::move(obj));
++  while (RetainPtr<const CPDF_Object> sub = walker.GetNext()) {
++    if (const CPDF_Reference* ref = sub->AsReference()) {
++      fn(ref->GetRefObjNum());
++    }
++  }
++}
++
++bool IsXMLMetadata(const CPDF_Dictionary* dict) {
++  return dict->GetNameFor("Type") == "Metadata" &&
++         dict->GetNameFor("Subtype") == "XML";
++}
++
++class SaveVerifier {
++ public:
++  SaveVerifier(CPDF_Document* memory_doc, CPDF_Document* saved_doc)
++      : memory_doc_(memory_doc), saved_doc_(saved_doc) {}
++
++  bool ObjectsEqual(const CPDF_Object* mem,
++                    const CPDF_Object* saved,
++                    int depth) {
++    if (!mem || !saved || depth > kMaxCompareDepth ||
++        mem->GetType() != saved->GetType()) {
++      return false;
++    }
++    switch (mem->GetType()) {
++      case CPDF_Object::kBoolean:
++      case CPDF_Object::kNumber:  // Compared as PDFium serialises them.
++      case CPDF_Object::kString:  // Decoded bytes (M2).
++      case CPDF_Object::kName:    // Decoded name.
++        return mem->GetString() == saved->GetString();
++      case CPDF_Object::kNullobj:
++        return true;
++      case CPDF_Object::kReference:
++        return mem->AsReference()->GetRefObjNum() ==
++               saved->AsReference()->GetRefObjNum();
++      case CPDF_Object::kArray: {
++        const CPDF_Array* m = mem->AsArray();
++        const CPDF_Array* s = saved->AsArray();
++        if (m->size() != s->size()) {
++          return false;
++        }
++        for (size_t i = 0; i < m->size(); ++i) {
++          if (!ObjectsEqual(m->GetObjectAt(i).Get(), s->GetObjectAt(i).Get(),
++                            depth + 1)) {
++            return false;
++          }
++        }
++        return true;
++      }
++      case CPDF_Object::kDictionary:
++        return DictsEqual(mem->AsDictionary(), saved->AsDictionary(),
++                          /*stream_dict=*/false, /*flate_normalised=*/false,
++                          depth);
++      case CPDF_Object::kStream:
++        return StreamsEqual(mem->AsStream(), saved->AsStream(), depth);
++    }
++    return false;
++  }
++
++ private:
++  // Memory-side resolution without parsing (see class comment).
++  RetainPtr<const CPDF_Object> MemoryDirect(RetainPtr<const CPDF_Object> obj) {
++    if (const CPDF_Reference* ref = ToReference(obj.Get())) {
++      return memory_doc_->GetIndirectObject(ref->GetRefObjNum());
++    }
++    return obj;
++  }
++
++  bool StreamsEqual(const CPDF_Stream* mem,
++                    const CPDF_Stream* saved,
++                    int depth) {
++    RetainPtr<const CPDF_Dictionary> mem_dict = mem->GetDict();
++    RetainPtr<const CPDF_Dictionary> saved_dict = saved->GetDict();
++    // M3: an unfiltered stream (not XML metadata) is written Flate-encoded.
++    bool flate_normalised = false;
++    if (!mem->HasFilter() && saved->HasFilter() &&
++        !IsXMLMetadata(mem_dict.Get())) {
++      RetainPtr<const CPDF_Object> filter =
++          saved_dict->GetDirectObjectFor("Filter");
++      const CPDF_Array* filter_array = filter ? filter->AsArray() : nullptr;
++      if (filter_array && filter_array->size() == 1) {
++        filter = filter_array->GetDirectObjectAt(0);
++      }
++      flate_normalised = filter && filter->IsName() &&
++                         filter->GetString() == "FlateDecode" &&
++                         !saved_dict->KeyExist("DecodeParms");
++    }
++    if (!DictsEqual(mem_dict.Get(), saved_dict.Get(), /*stream_dict=*/true,
++                    flate_normalised, depth)) {
++      return false;
++    }
++    auto mem_acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(mem));
++    mem_acc->LoadAllDataRaw();
++    auto saved_acc =
++        pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(saved));
++    if (flate_normalised) {
++      saved_acc->LoadAllDataFiltered();
++    } else {
++      saved_acc->LoadAllDataRaw();
++    }
++    pdfium::span<const uint8_t> a = mem_acc->GetSpan();
++    pdfium::span<const uint8_t> b = saved_acc->GetSpan();
++    return a.size() == b.size() && std::ranges::equal(a, b);
++  }
++
++  bool DictsEqual(const CPDF_Dictionary* mem,
++                  const CPDF_Dictionary* saved,
++                  bool stream_dict,
++                  bool flate_normalised,
++                  int depth) {
++    auto skipped = [&](const ByteString& key) {
++      if (stream_dict && key == "Length") {
++        return true;  // M1
++      }
++      return flate_normalised && (key == "Filter" || key == "DecodeParms");
++    };
++    CPDF_DictionaryLocker mem_locker(mem);
++    for (const auto& [key, mem_value] : mem_locker) {
++      if (skipped(key)) {
++        continue;
++      }
++      RetainPtr<const CPDF_Object> saved_value =
++          saved->GetObjectFor(key.AsStringView());
++      if (saved_value &&
++          ObjectsEqual(mem_value.Get(), saved_value.Get(), depth + 1)) {
++        continue;
++      }
++      if (!IsToleratedDifference(mem, key, mem_value.Get(),
++                                 saved_value.Get())) {
++        return false;
++      }
++    }
++    CPDF_DictionaryLocker saved_locker(saved);
++    for (const auto& [key, saved_value] : saved_locker) {
++      if (!skipped(key) && !mem->KeyExist(key.AsStringView())) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  // `saved_value` is null when the saved dictionary lacks `key`.
++  bool IsToleratedDifference(const CPDF_Dictionary* mem,
++                             const ByteString& key,
++                             const CPDF_Object* mem_value,
++                             const CPDF_Object* saved_value) {
++    if (key == "Type") {  // M4
++      const ByteString fixed = mem->KeyExist("Kids") ? "Pages" : "Page";
++      const bool saved_valid = saved_value && saved_value->IsName() &&
++                               (saved_value->GetString() == "Page" ||
++                                saved_value->GetString() == "Pages");
++      return mem_value->IsName() && mem_value->GetString() == fixed &&
++             !saved_valid;
++    }
++    if (key == "Count" && mem->KeyExist("Kids")) {  // M5
++      const int saved_count = saved_value && saved_value->IsNumber()
++                                  ? saved_value->GetInteger()
++                                  : 0;
++      return mem_value->IsNumber() &&
++             (saved_count <= 0 || saved_count >= CPDF_Document::kPageMaxNum);
++    }
++    if (key == "T" && mem_value->IsString() && saved_value &&
++        saved_value->IsReference()) {  // M7, indirect /T made direct
++      RetainPtr<const CPDF_Object> target =
++          saved_doc_->GetOrParseIndirectObject(
++              saved_value->AsReference()->GetRefObjNum());
++      return target && target->IsString() &&
++             target->GetString() == mem_value->GetString();
++    }
++    if ((key == "FT" || key == "Ff") && !saved_value) {  // M7, inherited
++      RetainPtr<const CPDF_Object> kids =
++          MemoryDirect(mem->GetObjectFor("Kids"));
++      const CPDF_Array* kids_array = kids ? kids->AsArray() : nullptr;
++      if (!kids_array) {
++        return false;
++      }
++      for (size_t i = 0; i < kids_array->size(); ++i) {
++        RetainPtr<const CPDF_Object> kid =
++            MemoryDirect(kids_array->GetObjectAt(i));
++        const CPDF_Dictionary* kid_dict = kid ? kid->AsDictionary() : nullptr;
++        RetainPtr<const CPDF_Object> kid_value =
++            kid_dict ? kid_dict->GetObjectFor(key.AsStringView()) : nullptr;
++        if (kid_value && kid_value->GetType() == mem_value->GetType() &&
++            kid_value->GetString() == mem_value->GetString()) {
++          return true;
++        }
++      }
++      return false;
++    }
++    return false;
++  }
++
++  UnownedPtr<CPDF_Document> const memory_doc_;
++  UnownedPtr<CPDF_Document> const saved_doc_;
++};
++
++}  // namespace
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDF_VerifyIncrementalSave(FPDF_DOCUMENT document,
++                           FPDF_FILEACCESS* saved,
++                           uint32_t* first_mismatch_objnum) {
++  if (first_mismatch_objnum) {
++    *first_mismatch_objnum = 0;
++  }
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || !saved || !doc->GetParser()) {
++    return false;
++  }
++  CPDF_Parser* parser = doc->GetParser();
++
++  // The saved file is opened as an independent document with the password
++  // the original was opened with: the update keeps /Encrypt and /ID[0], so
++  // the same password yields the same file key.
++  auto saved_doc =
++      std::make_unique<CPDF_Document>(std::make_unique<CPDF_DocRenderData>(),
++                                      std::make_unique<CPDF_DocPageData>());
++  if (saved_doc->LoadDoc(pdfium::MakeRetain<CPDFSDK_CustomAccess>(saved),
++                         parser->GetPassword()) != CPDF_Parser::SUCCESS) {
++    return false;
++  }
++  CPDF_Parser* saved_parser = saved_doc->GetParser();
++  if (saved_parser->xref_table_rebuilt() ||
++      saved_parser->GetLastXRefOffset() <= 0 ||
++      saved_parser->GetRootObjNum() != parser->GetRootObjNum()) {
++    return false;  // Structural: *first_mismatch_objnum stays 0.
++  }
++
++  // Only objects held in memory can have been changed: every loaded object
++  // from the original, plus the new objects reachable from them (or from
++  // the trailer's /Root and /Info) through new objects, as the save writes.
++  const uint32_t last_obj_num = parser->GetLastObjNum();
++  std::map<uint32_t, RetainPtr<const CPDF_Object>> objects;
++  std::vector<RetainPtr<const CPDF_Object>> pending;
++  for (const auto& [objnum, obj] : *doc) {
++    if (objnum <= last_obj_num && obj && obj->GetObjNum() == objnum) {
++      objects[objnum] = obj;
++      pending.push_back(obj);
++    }
++  }
++  auto add_new = [&](uint32_t objnum) {
++    if (objnum <= last_obj_num || pdfium::Contains(objects, objnum)) {
++      return;
++    }
++    RetainPtr<const CPDF_Object> obj = doc->GetIndirectObject(objnum);
++    if (obj && obj->GetObjNum() == objnum) {
++      objects[objnum] = obj;
++      pending.push_back(std::move(obj));
++    }
++  };
++  for (const char* key : {"Root", "Info"}) {
++    RetainPtr<const CPDF_Dictionary> trailer = parser->GetCombinedTrailer();
++    const CPDF_Reference* ref =
++        trailer ? ToReference(trailer->GetObjectFor(key).Get()) : nullptr;
++    if (ref) {
++      add_new(ref->GetRefObjNum());
++    }
++  }
++  while (!pending.empty()) {
++    RetainPtr<const CPDF_Object> obj = std::move(pending.back());
++    pending.pop_back();
++    ForEachRef(std::move(obj), add_new);
++  }
++
++  SaveVerifier verifier(doc, saved_doc.get());
++  for (const auto& [objnum, obj] : objects) {
++    RetainPtr<const CPDF_Object> saved_obj =
++        saved_doc->GetOrParseIndirectObject(objnum);
++    if (!verifier.ObjectsEqual(obj.Get(), saved_obj.Get(), 0)) {
++      if (first_mismatch_objnum) {
++        *first_mismatch_objnum = objnum;
++      }
++      return false;
++    }
++  }
++  return true;
++}
 diff --git a/public/fpdf_save.h b/public/fpdf_save.h
-index 093b889..fb57e03 100644
+index 093b889..52fec69 100644
 --- a/public/fpdf_save.h
 +++ b/public/fpdf_save.h
 @@ -7,6 +7,8 @@
@@ -669,7 +1015,7 @@ index 093b889..fb57e03 100644
  // clang-format off
  // NOLINTNEXTLINE(build/include)
  #include "fpdfview.h"
-@@ -86,6 +88,111 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -86,6 +88,145 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       FPDF_DWORD flags,
                       int file_version);
  
@@ -752,6 +1098,40 @@ index 093b889..fb57e03 100644
 +                            FPDF_FILEWRITE* file_write,
 +                            const uint32_t* objnums,
 +                            size_t count);
++
++// g-lab-bit fork (incremental_objects.patch)
++// Experimental API.
++// Function: FPDF_VerifyIncrementalSave
++//          Checks that a file written by FPDF_SaveIncrementalObjects() holds
++//          the document's current in-memory state. |saved| is parsed as an
++//          independent document, with the password |document| was opened
++//          with. Every object |document| currently holds in memory (only
++//          loaded objects can have changed) and every new object reachable
++//          from them is compared with the saved file's object of the same
++//          number: dictionaries, arrays, names, strings (decrypted bytes),
++//          numbers (as PDFium serialises them), booleans, null, references
++//          (by object number), and streams by dictionary (ignoring /Length)
++//          and data (decoded where PDFium's writer Flate-encoded an
++//          unfiltered stream). Changes PDFium makes to objects by itself
++//          after load (page tree /Type and /Count fixes, form field /FT /Ff
++//          /T normalisation) are accepted explicitly; see fpdf_save.cpp.
++//          |document| is not modified. The cost grows with the number of
++//          loaded objects (and the size of loaded streams), plus parsing the
++//          saved file's cross-reference sections.
++// Parameters:
++//          document              - The document that was saved.
++//          saved                 - Access to the saved file.
++//          first_mismatch_objnum - Optional. Receives the first object number
++//                                  that differs, or 0 if the saved file
++//                                  itself is the problem.
++// Return value:
++//          TRUE if every compared object is equal. FALSE if one differs, or
++//          if the saved file cannot be parsed, needed a cross-reference
++//          rebuild, or has a different /Root (*first_mismatch_objnum = 0).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDF_VerifyIncrementalSave(FPDF_DOCUMENT document,
++                           FPDF_FILEACCESS* saved,
++                           uint32_t* first_mismatch_objnum);
 +
 +// g-lab-bit fork (incremental_objects.patch)
 +// Experimental API.
