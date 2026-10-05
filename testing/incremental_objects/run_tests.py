@@ -194,6 +194,9 @@ def main():
          {"verify": False, "mismatch": 6}),
         ("verify_update_frees_loaded", "basic_classic.pdf", E + ["--corrupt", "free:3"], "ok", [0],
          {"verify": False, "mismatch": 3}),
+        # an update entry pointing a never-loaded object at original bytes
+        ("verify_update_remaps_into_original", "basic_classic.pdf", E + ["--corrupt", "remap:6"], "ok", [0],
+         {"verify": False, "mismatch": 6}),
         # /Info changed in the update (no public API edits /Info in memory)
         ("verify_tampered_info", "with_info.pdf", E + ["--load-info", "--corrupt", "inject:5"], "ok", [0],
          {"verify": False, "mismatch": 5}),

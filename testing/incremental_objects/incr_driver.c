@@ -51,7 +51,9 @@
 //               update redefining object N is appended (classic originals);
 //               "origbyte" flips a byte in the middle of the original part,
 //               "firstbyte" flips byte 0 (e.g. inside bytes before %PDF-),
-//               "free:N" appends an update whose xref frees object N.
+//               "free:N" appends an update whose xref frees object N,
+//               "remap:N" one whose xref points N at object 4's original
+//               bytes (no new object written).
 //               OUT stays uncorrupted.
 //   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
 //               output past N bytes (write-failure tests; PDFium buffers
@@ -281,9 +283,12 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
   } else if (g_corrupt && !strcmp(g_corrupt, "firstbyte")) {
     copy[0] ^= 0x01;
   } else if (g_corrupt && (!strncmp(g_corrupt, "inject:", 7) ||
-                           !strncmp(g_corrupt, "free:", 5))) {
+                           !strncmp(g_corrupt, "free:", 5) ||
+                           !strncmp(g_corrupt, "remap:", 6))) {
     const int is_free = !strncmp(g_corrupt, "free:", 5);
-    unsigned n = (unsigned)atoi(g_corrupt + (is_free ? 5 : 7)), root = 0, size = 0;
+    const int is_remap = !strncmp(g_corrupt, "remap:", 6);
+    unsigned n = (unsigned)atoi(g_corrupt + (is_free ? 5 : is_remap ? 6 : 7)), root = 0,
+             size = 0;
     unsigned long long prev = 0;
     for (size_t i = len; i-- > 9;) {
       if (!memcmp(copy + i - 9, "startxref", 9)) { prev = strtoull((char*)copy + i, NULL, 10); break; }
@@ -294,7 +299,12 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
       if (root && size) break;
     }
     size_t obj = len + 2;
-    int k = is_free ? snprintf((char*)copy + len, 1024, "\r\n")
+    if (is_remap) {
+      for (size_t i = 0; i + 8 <= orig_len; ++i) {
+        if (!memcmp(copy + i, "\n4 0 obj", 8)) { obj = i + 1; break; }
+      }
+    }
+    int k = (is_free || is_remap) ? snprintf((char*)copy + len, 1024, "\r\n")
                     : snprintf((char*)copy + len, 1024,
                                "\r\n%u 0 obj\r\n<</Title (tampered)>>\r\nendobj\r\n", n);
     size_t xref = len + k;

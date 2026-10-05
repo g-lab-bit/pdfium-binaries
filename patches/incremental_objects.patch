@@ -586,7 +586,7 @@ index 76cfa70..91919cc 100644
      return cross_ref_table_.get();
    }
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 8aa49ee..fdf0a7d 100644
+index 8aa49ee..ee344be 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
 @@ -8,22 +8,41 @@
@@ -631,7 +631,7 @@ index 8aa49ee..fdf0a7d 100644
  #include "fpdfsdk/cpdfsdk_filewriteadapter.h"
  #include "fpdfsdk/cpdfsdk_helpers.h"
  #include "public/fpdf_edit.h"
-@@ -222,3 +241,699 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -222,3 +241,708 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       int fileVersion) {
    return DoDocSave(document, file_write, flags, fileVersion);
  }
@@ -784,8 +784,9 @@ index 8aa49ee..fdf0a7d 100644
 +// Reads the cross-reference sections located after the original file (the
 +// update) by following the saved file's startxref/Prev chain, and records
 +// every object number they define (classic table entries, free or in use;
-+// xref stream entries of any type). Returns false if the chain cannot be
-+// read or uses /XRefStm. Positions are relative to the "%PDF-" header.
++// xref stream entries of any type), and whether any of them frees it. Returns
++// false if the chain cannot be read or uses /XRefStm. Positions are relative to
++// the "%PDF-" header.
 +bool CollectUpdateEntries(RetainPtr<IFX_SeekableReadStream> file,
 +                          FX_FILESIZE header_offset,
 +                          FX_FILESIZE original_size,
@@ -829,6 +830,14 @@ index 8aa49ee..fdf0a7d 100644
 +                              word.unsigned_span());
 +  };
 +
++  // Sections are read newest first; an object freed by ANY update section
++  // stays recorded as freed.
++  auto record = [defined](uint32_t objnum, bool freed) {
++    auto [it, inserted] = defined->emplace(objnum, freed);
++    if (!inserted) {
++      it->second = it->second || freed;
++    }
++  };
 +  std::set<FX_FILESIZE> visited;
 +  FX_FILESIZE pos = last_xref;
 +  while (pos >= original_size) {
@@ -864,7 +873,7 @@ index 8aa49ee..fdf0a7d 100644
 +          if (i >= bytes.size() || (bytes[i] != 'n' && bytes[i] != 'f')) {
 +            return false;
 +          }
-+          (*defined)[static_cast<uint32_t>(start + k)] = bytes[i++] == 'f';
++          record(static_cast<uint32_t>(start + k), bytes[i++] == 'f');
 +        }
 +      }
 +      // The trailer dictionary ends before the next "startxref".
@@ -943,7 +952,7 @@ index 8aa49ee..fdf0a7d 100644
 +          for (uint32_t b = 0; b < widths[0]; ++b) {
 +            type = (type << 8) | data[at + b];
 +          }
-+          (*defined)[first + k] = type == 0;
++          record(first + k, type == 0);
 +          at += row;
 +        }
 +      }
