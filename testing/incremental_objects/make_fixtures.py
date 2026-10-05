@@ -234,9 +234,9 @@ w("inline_annot.pdf", classic(o))
 
 # Encrypted originals whose last section is an xref stream (qpdf, PDF 1.5+
 # with object streams): AES-256 and RC4-128.
-for name, args in (("enc_aes256_xrefstm.pdf", ["256"]),
-                   ("enc_rc4_xrefstm.pdf", ["128", "--use-aes=n", "--allow-weak-crypto"])):
-    subprocess.run([QPDF, "--object-streams=generate", "--encrypt", "", "owner", *args, "--",
+for name, pre, args in (("enc_aes256_xrefstm.pdf", [], ["256"]),
+                        ("enc_rc4_xrefstm.pdf", ["--allow-weak-crypto"], ["128", "--use-aes=n"])):
+    subprocess.run([QPDF, *pre, "--object-streams=generate", "--encrypt", "", "owner", *args, "--",
                     os.path.join(OUT, "basic_classic.pdf"), os.path.join(OUT, name)], check=True)
     p = pikepdf.open(os.path.join(OUT, name))
     open(os.path.join(OUT, name[:-4] + ".nums"), "w").write(
