@@ -1,8 +1,12 @@
 diff --git a/core/fpdfapi/edit/cpdf_creator.cpp b/core/fpdfapi/edit/cpdf_creator.cpp
-index 31e004f..142499d 100644
+index 31e004f..2bba734 100644
 --- a/core/fpdfapi/edit/cpdf_creator.cpp
 +++ b/core/fpdfapi/edit/cpdf_creator.cpp
-@@ -16,20 +16,25 @@
+@@ -13,23 +13,29 @@
+ #include <map>
+ #include <set>
+ #include <utility>
++#include <vector>
  
  #include "core/fpdfapi/edit/cpdf_fontsubsetter.h"
  #include "core/fpdfapi/parser/cpdf_array.h"
@@ -28,27 +32,35 @@ index 31e004f..142499d 100644
  #include "core/fxcrt/fixed_size_data_vector.h"
  #include "core/fxcrt/fx_extension.h"
  #include "core/fxcrt/fx_random.h"
-@@ -119,6 +124,55 @@ bool OutputIndex(IFX_ArchiveStream* archive, FX_FILESIZE offset) {
+@@ -60,9 +66,12 @@ class FileBufferArchive final : public IFX_ArchiveStream {
+   bool WriteBlock(pdfium::span<const uint8_t> buffer) override;
+   FX_FILESIZE CurrentOffset() const override { return offset_; }
+ 
+- private:
++  // Public for CPDF_Creator::CreateIncrementalObjects() (g-lab-bit fork),
++  // which needs the result of the final flush.
+   bool Flush();
+ 
++ private:
++
+   FX_FILESIZE offset_ = 0;
+   FixedSizeDataVector<uint8_t> buffer_;
+   pdfium::raw_span<uint8_t> available_;
+@@ -119,6 +128,60 @@ bool OutputIndex(IFX_ArchiveStream* archive, FX_FILESIZE offset) {
           archive->WriteByte(0);
  }
  
 +// g-lab-bit fork (incremental_objects.patch) helpers.
-+struct IncrementalXRefEntry {
-+  FX_FILESIZE pos;
-+  uint16_t gen;
-+  bool in_use;
-+};
 +
 +// Classic cross-reference subsections: "start count" headers, then fixed
-+// 20-byte entries (ISO 32000-1:2008, 7.5.4).
-+bool WriteClassicXRefEntries(
-+    IFX_ArchiveStream* archive,
-+    const std::map<uint32_t, IncrementalXRefEntry>& entries) {
-+  auto it = entries.begin();
-+  while (it != entries.end()) {
++// 20-byte in-use entries (ISO 32000-1:2008, 7.5.4). Offsets must be < 10^10.
++bool WriteClassicXRefEntries(IFX_ArchiveStream* archive,
++                             const std::map<uint32_t, FX_FILESIZE>& offsets) {
++  auto it = offsets.begin();
++  while (it != offsets.end()) {
 +    auto run_end = it;
 +    uint32_t count = 0;
-+    while (run_end != entries.end() && run_end->first == it->first + count) {
++    while (run_end != offsets.end() && run_end->first == it->first + count) {
 +      ++run_end;
 +      ++count;
 +    }
@@ -57,12 +69,9 @@ index 31e004f..142499d 100644
 +      return false;
 +    }
 +    for (; it != run_end; ++it) {
-+      const IncrementalXRefEntry& entry = it->second;
 +      if (!archive->WriteString(
-+              ByteString::Format("%010lld %05u %c\r\n",
-+                                 static_cast<long long>(entry.pos),
-+                                 static_cast<unsigned>(entry.gen),
-+                                 entry.in_use ? 'n' : 'f')
++              ByteString::Format("%010lld 00000 n\r\n",
++                                 static_cast<long long>(it->second))
 +                  .AsStringView())) {
 +        return false;
 +      }
@@ -81,26 +90,46 @@ index 31e004f..142499d 100644
 +         dict->GetNameFor("Subtype") == "XML";
 +}
 +
++// Calls `fn(objnum)` for every reference inside `obj` (not following them).
++// Stops and returns false as soon as `fn` returns false.
++template <typename Fn>
++bool ForEachReference(RetainPtr<const CPDF_Object> obj, Fn fn) {
++  CPDF_ObjectWalker walker(std::move(obj));
++  while (RetainPtr<const CPDF_Object> sub = walker.GetNext()) {
++    const CPDF_Reference* ref = sub->AsReference();
++    if (ref && !fn(ref->GetRefObjNum())) {
++      return false;
++    }
++  }
++  return true;
++}
++
  }  // namespace
  
  CPDF_Creator::CPDF_Creator(CPDF_Document* doc,
-@@ -709,6 +763,259 @@ bool CPDF_Creator::Continue() {
+@@ -709,6 +772,297 @@ bool CPDF_Creator::Continue() {
    return stage_ > Stage::kInvalid;
  }
  
 +// g-lab-bit fork (incremental_objects.patch).
 +//
-+// The update layout (which objects go in, xref table vs. xref stream chosen
-+// from the original's last section, the stream listing itself with /Type/XRef
-+// and a sized /W, trailer = /Root /Info /Encrypt /ID /Size /Prev) is ported
-+// from pdf.js src/core/writer.js (incrementalUpdate, getXRefTable,
-+// getXRefStreamTable, getTrailerDict, computeIDs), Copyright 2020 Mozilla
-+// Foundation, Apache License 2.0. The damaged-original fallback (full table,
-+// no /Prev) mirrors PDFium's own FPDF_INCREMENTAL path above.
++// The update layout (xref table vs. xref stream chosen from the original's
++// last section, the stream listing itself with /Type/XRef and a sized /W,
++// trailer = /Root /Info /Encrypt /ID /Size /Prev) is ported from pdf.js
++// src/core/writer.js (incrementalUpdate, getXRefTable, getXRefStreamTable,
++// getTrailerDict, computeIDs), Copyright 2020 Mozilla Foundation, Apache
++// License 2.0.
 +bool CPDF_Creator::CreateIncrementalObjects(
 +    pdfium::span<const uint32_t> objnums) {
 +  if (!parser_) {
 +    return false;  // New document: nothing to append to.
++  }
++  // Refused: a rebuilt (damaged) xref cannot be continued with /Prev, and a
++  // document parsed through the linearized (FPDFAvail) path may not have
++  // loaded its main xref yet, so its last object number is not reliable.
++  if (parser_->xref_table_rebuilt() || parser_->GetLastXRefOffset() <= 0 ||
++      parser_->GetLinearizedHeader()) {
++    return false;
 +  }
 +  const CPDF_CrossRefTable* xref_table = parser_->GetCrossRefTable();
 +  RetainPtr<const CPDF_Dictionary> trailer = parser_->GetCombinedTrailer();
@@ -109,14 +138,14 @@ index 31e004f..142499d 100644
 +  }
 +
 +  const uint32_t parser_last_obj_num = parser_->GetLastObjNum();
-+  // Rebuilt xref: the original chain cannot be referenced with /Prev.
-+  const bool damaged =
-+      parser_->xref_table_rebuilt() || parser_->GetLastXRefOffset() <= 0;
 +  const uint32_t encrypt_obj_num = encrypt_dict_ ? encrypt_dict_->GetObjNum() : 0;
++  auto is_new = [parser_last_obj_num](uint32_t objnum) {
++    return objnum > parser_last_obj_num;
++  };
 +
-+  // 1. The object set: listed objects (latest in-memory version) plus every
-+  //    object created after load (numbered above the parser's last number).
++  // 1. The object set: the listed objects (latest in-memory version) ...
 +  std::map<uint32_t, RetainPtr<const CPDF_Object>> objects;
++  std::set<uint32_t> listed;
 +  for (uint32_t objnum : objnums) {
 +    // The /Encrypt dictionary is never rewritten.
 +    if (objnum == 0 || objnum == CPDF_Object::kInvalidObjNum ||
@@ -129,59 +158,109 @@ index 31e004f..142499d 100644
 +      return false;
 +    }
 +    objects[objnum] = std::move(obj);
++    listed.insert(objnum);
 +  }
-+  for (const auto& [objnum, obj] : *document_) {
-+    if (objnum > parser_last_obj_num && obj && obj->GetObjNum() == objnum) {
-+      objects[objnum] = obj;
++  // ... plus the objects created since load that are reachable from them (or
++  // from the trailer's /Root and /Info), following references through new
++  // objects only. Unreachable new objects (unused fonts, removed
++  // annotations' appearance streams, ...) are not written.
++  std::vector<RetainPtr<const CPDF_Object>> pending;
++  for (const auto& entry : objects) {
++    pending.push_back(entry.second);
++  }
++  auto add_new = [&](uint32_t objnum) {
++    if (!is_new(objnum) || pdfium::Contains(objects, objnum)) {
++      return true;
 +    }
++    RetainPtr<const CPDF_Object> obj = document_->GetIndirectObject(objnum);
++    if (obj && obj->GetObjNum() == objnum) {
++      objects[objnum] = obj;
++      pending.push_back(std::move(obj));
++    }
++    return true;
++  };
++  for (const char* key : {"Root", "Info"}) {
++    const CPDF_Reference* ref = ToReference(trailer->GetObjectFor(key).Get());
++    if (ref) {
++      add_new(ref->GetRefObjNum());
++    }
++  }
++  while (!pending.empty()) {
++    RetainPtr<const CPDF_Object> obj = std::move(pending.back());
++    pending.pop_back();
++    ForEachReference(std::move(obj), add_new);
 +  }
 +
 +  // 2. Validate everything before the first byte is written.
++  //    A loaded existing object that is not listed but references a new
++  //    object was changed after load and would be lost (e.g. a /Kids array
++  //    whose direct page dictionary PDFium made indirect): refuse.
++  for (const auto& [objnum, obj] : *document_) {
++    if (is_new(objnum) || !obj || obj->GetObjNum() != objnum ||
++        pdfium::Contains(listed, objnum)) {
++      continue;
++    }
++    if (!ForEachReference(obj, [&](uint32_t ref) { return !is_new(ref); })) {
++      return false;
++    }
++  }
 +  //    WriteIndirectObj(), CPDF_Reference::WriteTo() and CPDF_Encryptor all
 +  //    assume generation 0, so refuse any other generation.
-+  auto has_nonzero_gen = [&](uint32_t objnum) {
++  auto gen_is_zero = [&](uint32_t objnum) {
 +    const CPDF_CrossRefTable::ObjectInfo* info =
 +        xref_table->GetObjectInfo(objnum);
 +    if (info && info->type == CPDF_CrossRefTable::ObjectType::kNormal &&
 +        info->gennum != 0) {
-+      return true;
++      return false;
 +    }
 +    RetainPtr<const CPDF_Object> loaded = document_->GetIndirectObject(objnum);
-+    return loaded && loaded->GetGenNum() != 0;
++    return !loaded || loaded->GetGenNum() == 0;
 +  };
-+  // CPDF_Stream::WriteTo() never encrypts XML metadata; refuse to write it
-+  // in plain text into a file whose readers expect it encrypted.
++  //    CPDF_Stream::WriteTo() never encrypts XML metadata; refuse to write it
++  //    in plain text into a file whose readers expect it encrypted.
 +  const bool metadata_encrypted =
 +      GetCryptoHandler() && security_handler_->IsMetadataEncrypted();
 +  for (const auto& [objnum, obj] : objects) {
-+    if (obj->GetGenNum() != 0 || has_nonzero_gen(objnum)) {
++    if (obj->GetGenNum() != 0 || !gen_is_zero(objnum)) {
 +      return false;
 +    }
 +    if (metadata_encrypted && IsXMLMetadataStream(obj.Get())) {
 +      return false;
 +    }
-+    CPDF_ObjectWalker walker(obj);
-+    while (RetainPtr<const CPDF_Object> sub = walker.GetNext()) {
-+      const CPDF_Reference* ref = sub->AsReference();
-+      if (ref && has_nonzero_gen(ref->GetRefObjNum())) {
-+        return false;
-+      }
++    if (!ForEachReference(obj, gen_is_zero)) {
++      return false;
 +    }
 +  }
 +  for (const char* key : {"Root", "Info", "Encrypt"}) {
 +    const CPDF_Reference* ref = ToReference(trailer->GetObjectFor(key).Get());
-+    if (ref && has_nonzero_gen(ref->GetRefObjNum())) {
++    if (ref && !gen_is_zero(ref->GetRefObjNum())) {
 +      return false;
 +    }
 +  }
-+  if (damaged) {
-+    // A full table cannot express compressed (object stream) entries; the
-+    // stock path would write offset 0 for them.
-+    for (const auto& [num, info] : xref_table->objects_info()) {
-+      if (info.type == CPDF_CrossRefTable::ObjectType::kCompressed) {
-+        return false;
-+      }
++
++  //    /Size and the xref stream's object number must stay valid object
++  //    numbers (a bogus huge original /Size is refused).
++  uint32_t size = parser_last_obj_num + 1;
++  if (!objects.empty()) {
++    size = std::max(size, objects.rbegin()->first + 1);
++  }
++  const int orig_size = trailer->GetIntegerFor("Size");
++  if (orig_size > 0) {
++    if (static_cast<uint32_t>(orig_size) > CPDF_Parser::kMaxObjectNumber + 1) {
++      return false;
 +    }
++    size = std::max(size, static_cast<uint32_t>(orig_size));
++  }
++  const bool use_xref_stream = parser_->IsXRefStream();
++  uint32_t xref_obj_num = 0;
++  if (use_xref_stream) {
++    xref_obj_num = std::max(size, document_->GetLastObjNum() + 1);
++    if (xref_obj_num > CPDF_Parser::kMaxObjectNumber) {
++      return false;
++    }
++    size = xref_obj_num + 1;
++  } else if (size - 1 > CPDF_Parser::kMaxObjectNumber) {
++    return false;
 +  }
 +
 +  // /ID: keep the original first element (it keys RC4/AESV2 encryption).
@@ -212,21 +291,17 @@ index 31e004f..142499d 100644
 +    id_array->Append(id_array->GetObjectAt(0)->Clone());
 +  }
 +
-+  uint32_t size = parser_last_obj_num + 1;
-+  if (!objects.empty()) {
-+    size = std::max(size, objects.rbegin()->first + 1);
-+  }
-+  const int orig_size = trailer->GetIntegerFor("Size");
-+  if (orig_size > 0) {
-+    size = std::max(size, static_cast<uint32_t>(orig_size));
-+  }
-+
-+  // 3. Original bytes, unchanged.
-+  if (!parser_->WriteToArchive(archive_.get(), parser_->GetDocumentSize())) {
++  // From here on a FALSE return leaves partial output (documented).
++  // 3. The whole original file, verbatim, including any bytes before
++  //    "%PDF-". Positions are written relative to the header, the
++  //    convention under which PDFium parsed the original without a rebuild.
++  const FX_FILESIZE header_offset = parser_->GetHeaderOffsetInFile();
++  auto* file_archive = static_cast<FileBufferArchive*>(archive_.get());
++  if (!parser_->WriteWholeFileToArchive(archive_.get())) {
 +    return false;
 +  }
 +  if (objects.empty()) {
-+    return true;  // Documented: nothing to update, output == original.
++    return file_archive->Flush();  // Nothing to update: output == original.
 +  }
 +  // The original may not end with an EOL; never glue "N 0 obj" to "%%EOF".
 +  if (!archive_->WriteString("\r\n")) {
@@ -236,42 +311,31 @@ index 31e004f..142499d 100644
 +  // 4. Objects, ascending, encrypted per object by WriteIndirectObj().
 +  std::map<uint32_t, FX_FILESIZE> offsets;
 +  for (const auto& [objnum, obj] : objects) {
-+    offsets[objnum] = archive_->CurrentOffset();
++    offsets[objnum] = archive_->CurrentOffset() - header_offset;
 +    if (!WriteIndirectObj(objnum, obj.Get())) {
 +      return false;
 +    }
 +  }
 +
 +  // 5. Cross-reference section + trailer.
-+  xref_start_ = archive_->CurrentOffset();
-+  if (damaged || !parser_->IsXRefStream()) {
-+    std::map<uint32_t, IncrementalXRefEntry> entries;
-+    if (damaged) {
-+      entries[0] = {0, 65535, false};
-+      for (const auto& [num, info] : xref_table->objects_info()) {
-+        if (num != 0 && info.type == CPDF_CrossRefTable::ObjectType::kNormal) {
-+          entries[num] = {info.pos, info.gennum, true};
-+        }
-+      }
-+    }
-+    for (const auto& [num, pos] : offsets) {
-+      entries[num] = {pos, 0, true};
++  xref_start_ = archive_->CurrentOffset() - header_offset;
++  if (!use_xref_stream) {
++    static constexpr FX_FILESIZE kMaxClassicOffset = 9999999999LL;
++    if (xref_start_ > kMaxClassicOffset) {
++      return false;  // 10-digit entries cannot express the offsets.
 +    }
 +    return archive_->WriteString("xref\r\n") &&
-+           WriteClassicXRefEntries(archive_.get(), entries) &&
++           WriteClassicXRefEntries(archive_.get(), offsets) &&
 +           archive_->WriteString("trailer\r\n<<") &&
-+           WriteIncrementalTrailerEntries(trailer.Get(), id_array.Get(), size,
-+                                          /*write_prev=*/!damaged) &&
++           WriteIncrementalTrailerEntries(trailer.Get(), id_array.Get(),
++                                          size) &&
 +           archive_->WriteString(">>\r\nstartxref\r\n") &&
 +           archive_->WriteFilesize(xref_start_) &&
-+           archive_->WriteString("\r\n%%EOF\r\n");
++           archive_->WriteString("\r\n%%EOF\r\n") && file_archive->Flush();
 +  }
 +
 +  // Cross-reference stream that lists itself.
-+  const uint32_t xref_obj_num =
-+      std::max(size, document_->GetLastObjNum() + 1);
 +  offsets[xref_obj_num] = xref_start_;
-+  size = xref_obj_num + 1;
 +  int offset_width = 1;
 +  while (offset_width < 8 &&
 +         (static_cast<uint64_t>(xref_start_) >> (8 * offset_width)) != 0) {
@@ -298,8 +362,7 @@ index 31e004f..142499d 100644
 +  }
 +  return archive_->WriteDWord(xref_obj_num) &&
 +         archive_->WriteString(" 0 obj\r\n<</Type/XRef") &&
-+         WriteIncrementalTrailerEntries(trailer.Get(), id_array.Get(), size,
-+                                        /*write_prev=*/true) &&
++         WriteIncrementalTrailerEntries(trailer.Get(), id_array.Get(), size) &&
 +         archive_->WriteString(
 +             ByteString::Format("/W[1 %d 1]/Index[", offset_width)
 +                 .AsStringView()) &&
@@ -310,14 +373,13 @@ index 31e004f..142499d 100644
 +         archive_->WriteBlock(data) &&
 +         archive_->WriteString("\r\nendstream\r\nendobj\r\nstartxref\r\n") &&
 +         archive_->WriteFilesize(xref_start_) &&
-+         archive_->WriteString("\r\n%%EOF\r\n");
++         archive_->WriteString("\r\n%%EOF\r\n") && file_archive->Flush();
 +}
 +
 +bool CPDF_Creator::WriteIncrementalTrailerEntries(
 +    const CPDF_Dictionary* trailer,
 +    const CPDF_Array* id_array,
-+    uint32_t size,
-+    bool write_prev) {
++    uint32_t size) {
 +  for (const char* key : {"Root", "Info", "Encrypt"}) {
 +    RetainPtr<const CPDF_Object> value = trailer->GetObjectFor(key);
 +    if (!value) {
@@ -336,16 +398,15 @@ index 31e004f..142499d 100644
 +  if (!archive_->WriteString("/Size ") || !archive_->WriteDWord(size)) {
 +    return false;
 +  }
-+  return !write_prev ||
-+         (archive_->WriteString("/Prev ") &&
-+          archive_->WriteFilesize(parser_->GetLastXRefOffset()));
++  return archive_->WriteString("/Prev ") &&
++         archive_->WriteFilesize(parser_->GetLastXRefOffset());
 +}
 +
  void CPDF_Creator::RemoveSecurity() {
    security_handler_.Reset();
    security_changed_ = true;
 diff --git a/core/fpdfapi/edit/cpdf_creator.h b/core/fpdfapi/edit/cpdf_creator.h
-index 55f9524..3d15bd4 100644
+index 55f9524..611b023 100644
 --- a/core/fpdfapi/edit/cpdf_creator.h
 +++ b/core/fpdfapi/edit/cpdf_creator.h
 @@ -16,6 +16,7 @@
@@ -356,52 +417,89 @@ index 55f9524..3d15bd4 100644
  #include "core/fxcrt/unowned_ptr.h"
  
  class CPDF_Array;
-@@ -43,6 +44,14 @@ class CPDF_Creator {
+@@ -43,6 +44,13 @@ class CPDF_Creator {
  
    bool Create(Mask<CreateFlags> flags, int32_t file_version);
  
 +  // g-lab-bit fork (incremental_objects.patch). Writes the original file
-+  // bytes followed by ONE incremental update holding exactly `objnums` plus
-+  // every object numbered above the parser's last object number. Validates
-+  // everything before writing; returns false (refusal) without writing any
-+  // byte when the update cannot be written correctly. See
-+  // FPDF_SaveIncrementalObjects() in public/fpdf_save.h.
++  // bytes followed by ONE incremental update holding `objnums` plus the
++  // objects created since load that are reachable from them. Refusals are
++  // decided before any byte is written. See FPDF_SaveIncrementalObjects()
++  // in public/fpdf_save.h.
 +  bool CreateIncrementalObjects(pdfium::span<const uint32_t> objnums);
 +
   private:
    enum class Stage {
      kInvalid = -1,
-@@ -81,6 +90,11 @@ class CPDF_Creator {
+@@ -81,6 +89,10 @@ class CPDF_Creator {
  
    CPDF_CryptoHandler* GetCryptoHandler();
  
 +  bool WriteIncrementalTrailerEntries(const CPDF_Dictionary* trailer,
 +                                      const CPDF_Array* id_array,
-+                                      uint32_t size,
-+                                      bool write_prev);
++                                      uint32_t size);
 +
    UnownedPtr<CPDF_Document> const document_;
    UnownedPtr<CPDF_Parser> const parser_;
    RetainPtr<const CPDF_Dictionary> encrypt_dict_;
+diff --git a/core/fpdfapi/parser/cpdf_parser.cpp b/core/fpdfapi/parser/cpdf_parser.cpp
+index 6f89380..c6622ec 100644
+--- a/core/fpdfapi/parser/cpdf_parser.cpp
++++ b/core/fpdfapi/parser/cpdf_parser.cpp
+@@ -1395,6 +1395,30 @@ std::vector<unsigned int> CPDF_Parser::GetTrailerEnds() {
+   return trailer_ends;
+ }
+ 
++// g-lab-bit fork (incremental_objects.patch).
++FX_FILESIZE CPDF_Parser::GetHeaderOffsetInFile() const {
++  return syntax_->GetValidator()->GetSize() - syntax_->GetDocumentSize();
++}
++
++// g-lab-bit fork (incremental_objects.patch).
++bool CPDF_Parser::WriteWholeFileToArchive(IFX_ArchiveStream* archive) {
++  static constexpr FX_FILESIZE kBufferSize = 4096;
++  RetainPtr<CPDF_ReadValidator> validator = syntax_->GetValidator();
++  const FX_FILESIZE file_size = validator->GetSize();
++  DataVector<uint8_t> buffer(kBufferSize);
++  for (FX_FILESIZE pos = 0; pos < file_size;) {
++    const size_t block_size =
++        static_cast<size_t>(std::min(kBufferSize, file_size - pos));
++    auto block_span = pdfium::span(buffer).first(block_size);
++    if (!validator->ReadBlockAtOffset(block_span, pos) ||
++        !archive->WriteBlock(block_span)) {
++      return false;
++    }
++    pos += block_size;
++  }
++  return true;
++}
++
+ bool CPDF_Parser::WriteToArchive(IFX_ArchiveStream* archive,
+                                  FX_FILESIZE src_size) {
+   static constexpr FX_FILESIZE kBufferSize = 4096;
 diff --git a/core/fpdfapi/parser/cpdf_parser.h b/core/fpdfapi/parser/cpdf_parser.h
-index 76cfa70..ee71b38 100644
+index 76cfa70..91919cc 100644
 --- a/core/fpdfapi/parser/cpdf_parser.h
 +++ b/core/fpdfapi/parser/cpdf_parser.h
-@@ -119,6 +119,12 @@ class CPDF_Parser {
+@@ -119,6 +119,16 @@ class CPDF_Parser {
    std::vector<unsigned int> GetTrailerEnds();
    bool WriteToArchive(IFX_ArchiveStream* archive, FX_FILESIZE src_size);
  
-+  // g-lab-bit fork (incremental_objects.patch): read-only xref access for
-+  // CPDF_Creator::CreateIncrementalObjects().
++  // g-lab-bit fork (incremental_objects.patch), for
++  // CPDF_Creator::CreateIncrementalObjects(): read-only xref access, the
++  // number of bytes before "%PDF-" (positions are relative to it), and a
++  // verbatim copy of the whole file including those bytes.
 +  const CPDF_CrossRefTable* GetCrossRefTable() const {
 +    return cross_ref_table_.get();
 +  }
++  FX_FILESIZE GetHeaderOffsetInFile() const;
++  bool WriteWholeFileToArchive(IFX_ArchiveStream* archive);
 +
    const CPDF_CrossRefTable* GetCrossRefTableForTesting() const {
      return cross_ref_table_.get();
    }
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 8aa49ee..05b75af 100644
+index 8aa49ee..5f19ac0 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
 @@ -15,12 +15,15 @@
@@ -444,7 +542,7 @@ index 8aa49ee..05b75af 100644
 +  return file_maker.CreateIncrementalObjects(objnum_span);
 +}
 +
-+FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDF_EXPORT uint32_t FPDF_CALLCONV
 +FPDFPage_GetObjectNumber(FPDF_PAGE page) {
 +  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
 +  if (!pdf_page || !pdf_page->GetDict()) {
@@ -453,7 +551,7 @@ index 8aa49ee..05b75af 100644
 +  return pdf_page->GetDict()->GetObjNum();
 +}
 +
-+FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDF_EXPORT uint32_t FPDF_CALLCONV
 +FPDFPage_GetAnnotsObjectNumber(FPDF_PAGE page) {
 +  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
 +  if (!pdf_page || !pdf_page->GetDict()) {
@@ -464,7 +562,7 @@ index 8aa49ee..05b75af 100644
 +  return ref ? ref->GetRefObjNum() : 0;
 +}
 +
-+FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDF_EXPORT uint32_t FPDF_CALLCONV
 +FPDFAnnot_GetObjectNumber(FPDF_ANNOTATION annot) {
 +  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
 +  if (!context || !context->GetAnnotDict()) {
@@ -473,7 +571,7 @@ index 8aa49ee..05b75af 100644
 +  return context->GetAnnotDict()->GetObjNum();
 +}
 diff --git a/public/fpdf_save.h b/public/fpdf_save.h
-index 093b889..630ce25 100644
+index 093b889..729986b 100644
 --- a/public/fpdf_save.h
 +++ b/public/fpdf_save.h
 @@ -7,6 +7,8 @@
@@ -485,57 +583,77 @@ index 093b889..630ce25 100644
  // clang-format off
  // NOLINTNEXTLINE(build/include)
  #include "fpdfview.h"
-@@ -86,6 +88,81 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -86,6 +88,104 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       FPDF_DWORD flags,
                       int file_version);
  
 +// g-lab-bit fork (incremental_objects.patch)
 +// Experimental API.
 +// Function: FPDF_SaveIncrementalObjects
-+//          Writes the original file bytes, unchanged, followed by ONE
-+//          incremental update that contains exactly:
++//          Writes the original file, verbatim (including any bytes before
++//          "%PDF-"), followed by ONE incremental update that contains:
 +//            - the objects listed in |objnums|, in their current in-memory
 +//              state (re-encrypted per object for encrypted documents), and
-+//            - every object created since the document was loaded (object
-+//              number above the original's last object number), so callers
-+//              only need to track the EXISTING objects they changed.
-+//          Nothing else is rewritten; in particular the /Encrypt dictionary
-+//          is never written. The new cross-reference section has the type of
-+//          the original's last section (xref stream -> xref stream with
-+//          /Type /XRef, a self entry and /W sized for the offsets; table or
-+//          hybrid -> classic table) and its trailer has /Prev, /Root, /Info,
-+//          /Encrypt (same reference), /Size and /ID (original first element;
-+//          second element kept for encrypted files, new otherwise).
-+//          If PDFium had to rebuild the cross-reference table on load
-+//          (damaged file), the update carries a full classic table and no
-+//          /Prev, like FPDF_SaveAsCopy(FPDF_INCREMENTAL).
-+//          The output is always "original + one update", also when called
-+//          repeatedly on the same FPDF_DOCUMENT; to stack updates, load the
-+//          saved file and save from that document.
++//            - the objects created since the document was loaded (number
++//              above the original's last object number) that are reachable
++//              from the listed objects (or from the trailer's /Root, /Info)
++//              by following references through new objects only. Other new
++//              objects (unused fonts, appearance streams of removed
++//              annotations, ...) are not written.
++//          Nothing else is written; the /Encrypt dictionary never is. The
++//          new cross-reference section has the type of the original's last
++//          section (xref stream -> xref stream with /Type /XRef, a self entry
++//          and /W sized for the offsets; table or hybrid -> classic table)
++//          and its trailer has /Prev, /Root, /Info, /Encrypt (same value),
++//          /Size and /ID (original first element; the second is kept for
++//          encrypted files and new otherwise). Positions are relative to the
++//          "%PDF-" header, as PDFium read the original.
++//
++//          The caller MUST list every EXISTING object it modified since the
++//          document was loaded. Each call writes "original + one update"
++//          built from the in-memory state; calls on the same document do not
++//          stack. So after a first save, a second save on the same open
++//          document must list the objects of BOTH edits (cumulative since
++//          load), or the first edit is missing from the second output.
++//          Saved files are stacked by loading the saved file and saving from
++//          that document instead.
++//
++//          |file_write| must not write to the file the document was loaded
++//          from while the document is open: the original bytes are read from
++//          it during the save.
 +// Parameters:
-+//          document   -   Handle to a document loaded from a file.
++//          document   -   Handle to a document loaded from a file or memory.
 +//          file_write -   A pointer to a custom file write structure.
 +//          objnums    -   Object numbers of the existing objects that
 +//                         changed. Duplicates are allowed. May be NULL if
 +//                         |count| is 0.
 +//          count      -   Number of entries in |objnums|.
 +// Return value:
-+//          TRUE on success. If nothing needs writing (|count| is 0 and no
-+//          object was created), the output is an exact copy of the original
-+//          and TRUE is returned.
-+//          FALSE (refusal) if |document| was not loaded from a file (no
-+//          parser), a listed object does not exist, a listed object is the
-+//          /Encrypt dictionary, a written object has a generation number
-+//          other than 0 or references an object with one, an XML metadata
-+//          stream would be written unencrypted into a file whose metadata is
-+//          encrypted, or the cross-reference table was rebuilt and the
-+//          original has objects in object streams. These checks run before
-+//          any byte is written, so on refusal nothing has been written.
-+//          FALSE is also returned when |file_write| fails; the partial
-+//          output must then be discarded. On FALSE, fall back to a full save.
-+// Notes:
-+//          If the original has bytes before "%PDF-", those are not copied
-+//          (PDFium positions are relative to the header).
++//          TRUE on success. If there is nothing to write (no objects listed
++//          and no reachable new objects), the output is an exact copy of the
++//          original and TRUE is returned.
++//          FALSE if the update cannot be written correctly. The output is
++//          then undefined (possibly partial) and must be discarded; fall back
++//          to a full save. FALSE is returned, before anything is written,
++//          when:
++//            - the document was not loaded from a file (no parser), was
++//              opened through the linearized FPDFAvail path, or PDFium had to
++//              rebuild its cross-reference table (damaged file);
++//            - a listed object does not exist, is 0, or is the /Encrypt
++//              dictionary;
++//            - a loaded existing object that is NOT listed references a new
++//              object (it was modified and its change would be lost, e.g. a
++//              /Kids array whose direct page dictionary PDFium converted to
++//              an indirect object);
++//            - an object to write has a generation number other than 0 or
++//              references an object that has one;
++//            - an XML metadata stream would be written unencrypted into a
++//              file whose metadata is encrypted;
++//            - the original /Size or the new xref stream's object number would
++//              exceed PDFium's maximum object number.
++//          It is also returned, after writing started, on any read or write
++//          failure (including the final flush) and when a classic-table
++//          offset would not fit in 10 digits (>= 10^10 bytes).
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDF_SaveIncrementalObjects(FPDF_DOCUMENT document,
 +                            FPDF_FILEWRITE* file_write,
@@ -544,24 +662,27 @@ index 093b889..630ce25 100644
 +
 +// g-lab-bit fork (incremental_objects.patch)
 +// Experimental API.
-+// Object-number accessors for building the |objnums| list above.
++// Object-number accessors for building the |objnums| list above. They use
++// uint32_t, PDFium's object number type (CPDF_Object::GetObjNum()), so the
++// values pass to FPDF_SaveIncrementalObjects() unchanged on every platform
++// (unsigned long is 32-bit on Windows but 64-bit on macOS/Linux).
 +//
 +// FPDFPage_GetObjectNumber: object number of the page dictionary, or 0 if
 +// it is not an indirect object (or on error).
-+FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDF_EXPORT uint32_t FPDF_CALLCONV
 +FPDFPage_GetObjectNumber(FPDF_PAGE page);
 +
 +// FPDFPage_GetAnnotsObjectNumber: object number of the page's /Annots array
 +// if /Annots is an indirect reference, else 0 (direct array, absent, or
 +// error). Adding or removing an annotation changes this array: list it when
 +// non-zero, otherwise list the page dictionary.
-+FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDF_EXPORT uint32_t FPDF_CALLCONV
 +FPDFPage_GetAnnotsObjectNumber(FPDF_PAGE page);
 +
 +// FPDFAnnot_GetObjectNumber: object number of the annotation dictionary, or
 +// 0 if it is a direct object inside /Annots (as FPDFPage_CreateAnnot makes
 +// it), in which case its changes belong to the /Annots holder above.
-+FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDF_EXPORT uint32_t FPDF_CALLCONV
 +FPDFAnnot_GetObjectNumber(FPDF_ANNOTATION annot);
 +
  #ifdef __cplusplus
