@@ -1,0 +1,126 @@
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index c494ace..7ee8a63 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "public/fpdf_annot.h"
+ 
++#include <limits.h>
++
++#include <algorithm>
+ #include <array>
+ #include <cmath>
+ #include <memory>
+@@ -24,6 +27,7 @@
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_name.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
++#include "core/fpdfapi/parser/cpdf_parser.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_stream.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+@@ -2059,3 +2063,70 @@ FPDFAnnot_AddFileAttachment(FPDF_ANNOTATION annot, FPDF_WIDESTRING name) {
+       "FS", doc, fs_obj->GetObjNum());
+   return FPDFAttachmentFromCPDFObject(fs_obj);
+ }
++
++// g-lab-bit fork (annot_number_array.patch).
++namespace {
++
++// Resolves `obj` without adding anything to the document's object map: an
++// already loaded object is used as is, otherwise the parser returns a copy
++// that is not stored.
++RetainPtr<const CPDF_Object> ResolveWithoutLoading(
++    CPDF_Document* doc,
++    RetainPtr<const CPDF_Object> obj) {
++  const CPDF_Reference* ref = ToReference(obj.Get());
++  if (!ref) {
++    return obj;
++  }
++  if (!doc) {
++    return nullptr;
++  }
++  RetainPtr<const CPDF_Object> loaded =
++      doc->GetIndirectObject(ref->GetRefObjNum());
++  if (loaded) {
++    return loaded;
++  }
++  CPDF_Parser* parser = doc->GetParser();
++  return parser ? parser->ParseIndirectObject(ref->GetRefObjNum()) : nullptr;
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
++                                                       FPDF_BYTESTRING key,
++                                                       float* values,
++                                                       unsigned long count) {
++  const CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  const CPDF_Dictionary* annot_dict =
++      context ? context->GetAnnotDict() : nullptr;
++  if (!annot_dict || !key) {
++    return -1;
++  }
++  // Read-only, and /AP is not consulted.
++  CPDF_Document* doc =
++      context->GetPage() ? context->GetPage()->GetDocument() : nullptr;
++  RetainPtr<const CPDF_Object> value =
++      ResolveWithoutLoading(doc, annot_dict->GetObjectFor(key));
++  const CPDF_Array* array = value ? value->AsArray() : nullptr;
++  if (!array || array->size() > static_cast<size_t>(INT_MAX)) {
++    return -1;
++  }
++  std::vector<float> numbers;
++  numbers.reserve(array->size());
++  for (size_t i = 0; i < array->size(); ++i) {
++    RetainPtr<const CPDF_Object> element =
++        ResolveWithoutLoading(doc, array->GetObjectAt(i));
++    if (!element || !element->IsNumber()) {
++      return -1;
++    }
++    numbers.push_back(element->GetNumber());
++  }
++  if (values && count) {
++    // SAFETY: required from caller.
++    auto out = UNSAFE_BUFFERS(pdfium::span(values, count));
++    const size_t n = std::min<size_t>(numbers.size(), out.size());
++    for (size_t i = 0; i < n; ++i) {
++      out[i] = numbers[i];
++    }
++  }
++  return static_cast<int>(numbers.size());
++}
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index bb4ea2b..1b9f81d 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -325,6 +325,28 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_GetColor(FPDF_ANNOTATION annot,
+                                                        unsigned int* B,
+                                                        unsigned int* A);
+ 
++// g-lab-bit fork (annot_number_array.patch)
++// Experimental API.
++// Read an array of numbers from the annotation dictionary, e.g. /C or /IC
++// (colour components), regardless of whether the annotation has an
++// appearance stream (FPDFAnnot_GetColor() fails when /AP exists). Nothing is
++// modified and no object is added to the document's object map (an indirect
++// array or element that is not loaded yet is read without being stored).
++//
++//   annot   - handle to an annotation.
++//   key     - the dictionary key, e.g. "C" or "IC".
++//   values  - buffer receiving the first min(n, count) numbers; may be NULL.
++//   count   - number of floats |values| can hold; 0 (or NULL |values|)
++//             queries the size only.
++//
++// Returns the number of elements n if |key| holds a (direct or indirect)
++// array whose elements are all numbers (n may be 0), or -1 if the key is
++// absent, is not an array, or holds a non-numeric element.
++FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
++                                                       FPDF_BYTESTRING key,
++                                                       float* values,
++                                                       unsigned long count);
++
+ // Experimental API.
+ // Check if the annotation is of a type that has attachment points
+ // (i.e. quadpoints). Quadpoints are the vertices of the rectangle that

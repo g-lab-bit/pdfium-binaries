@@ -302,3 +302,24 @@ mandatory and no case is skipped:
   exercised), corruptions and update-section attacks.
 - `run_corpus.py PDFIUM_DIR --corpus DIR`: edit, repeat, touch, noop and
   render-all, with verify, over a PDF corpus; prints timings.
+
+---
+
+## 12. `annot_number_array.patch` (fork-p9): `FPDFAnnot_GetNumberArray`
+
+Applied by `steps/03-patch.sh` after `incremental_objects.patch`. It touches
+`fpdfsdk/fpdf_annot.cpp` and `public/fpdf_annot.h`.
+
+`FPDFAnnot_GetNumberArray(annot, key, float* values, unsigned long count)` reads an
+all-numeric array (direct or indirect, elements possibly indirect) from the
+annotation dictionary, e.g. /C or /IC, whether or not /AP exists. Upstream
+`FPDFAnnot_GetColor` refuses when /AP exists, so markup colours read back as black.
+
+- It returns the element count n, or -1 if the key is absent, isn't an array, or has
+  a non-numeric element.
+- It copies min(n, count) values; a NULL `values` or `count == 0` queries the size.
+- It modifies nothing and adds nothing to the document's object map. References
+  are resolved through already-loaded objects or a parser copy that isn't stored.
+
+Tests: `testing/annot_number_array/run_tests.py PDFIUM_DIR` (14 cases, including
+non-mutation).
