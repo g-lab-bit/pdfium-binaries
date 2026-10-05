@@ -34,6 +34,7 @@ apply_patch "$PATCHES/lod_progressive.patch"
 apply_patch "$PATCHES/doc_read_api.patch"
 apply_patch "$PATCHES/ocg_write_api.patch"
 apply_patch "$PATCHES/fork_p8.patch"
+apply_patch "$PATCHES/incremental_objects.patch"
 apply_patch "$PATCHES/clang_rt.patch" build
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
