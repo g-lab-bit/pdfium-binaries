@@ -586,7 +586,7 @@ index 76cfa70..91919cc 100644
      return cross_ref_table_.get();
    }
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 8aa49ee..b2dff67 100644
+index 8aa49ee..640968f 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
 @@ -8,22 +8,43 @@
@@ -633,7 +633,7 @@ index 8aa49ee..b2dff67 100644
  #include "fpdfsdk/cpdfsdk_filewriteadapter.h"
  #include "fpdfsdk/cpdfsdk_helpers.h"
  #include "public/fpdf_edit.h"
-@@ -222,3 +243,731 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -222,3 +243,734 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       int fileVersion) {
    return DoDocSave(document, file_write, flags, fileVersion);
  }
@@ -784,7 +784,8 @@ index 8aa49ee..b2dff67 100644
 +};
 +
 +// Walks a dictionary at the parser's position ("<<" next) key by key,
-+// skipping values with GetObjectBody() so strings cannot fake a key. Returns
++// skipping values with GetObjectBody() so strings cannot fake a key; keys
++// are name-decoded before comparison. Returns
 +// the raw /Prev token as a 64-bit value (CPDF_Number cannot hold offsets of
 +// 4 GB or more) and fails on /XRefStm.
 +bool ReadSectionDict(CPDF_SyntaxParser* syntax,
@@ -800,10 +801,12 @@ index 8aa49ee..b2dff67 100644
 +    if (key.word.GetLength() < 2 || key.word[0] != '/') {
 +      return false;
 +    }
-+    if (key.word == "/XRefStm") {
++    // Keys are compared decoded (e.g. /P#72ev is /Prev), as PDFium reads them.
++    const ByteString name = PDF_NameDecode(key.word.AsStringView().Substr(1));
++    if (name == "XRefStm") {
 +      return false;
 +    }
-+    if (key.word == "/Prev") {
++    if (name == "Prev") {
 +      const CPDF_SyntaxParser::WordResult value = syntax->GetNextWord();
 +      if (!value.is_number || value.word.IsEmpty() ||
 +          !FXSYS_IsDecimalDigit(value.word[0]) || value.word.GetLength() > 18) {

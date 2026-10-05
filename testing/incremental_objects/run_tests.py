@@ -217,6 +217,13 @@ def main():
          {"verify": False, "mismatch": 0}),
         ("verify_update_with_xrefstm", "basic_classic.pdf", E + ["--corrupt", "xrefstm"], "ok", [0],
          {"verify": False, "mismatch": 0}),
+        # section-dict keys are name-decoded: an escaped /Prev is followed,
+        # an escaped /XRefStm is refused; a /Prev beyond 4 GB (beyond EOF)
+        ("verify_escaped_prev_followed", "basic_classic.pdf", E + ["--corrupt", "rep:/Prev=/P#72ev"], "ok", [0], {}),
+        ("verify_escaped_xrefstm", "basic_classic.pdf", E + ["--corrupt", "rep:/Prev=/XRef#53tm 0/Prev"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        ("verify_prev_beyond_4gb", "basic_classic.pdf", E + ["--corrupt", "rep:/Prev=/Prev 5000000000/Foo"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
         # the update's /Prev skips the original's latest revision
         ("edit_multirev", "multirev_classic.pdf", E, "ok", [0], {}),
         ("verify_prev_skips_revision", "multirev_classic.pdf", E + ["--corrupt", "prevskip"], "ok", [0],

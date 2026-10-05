@@ -57,7 +57,8 @@
 //               with /XRefStm, "prevskip" sets the update's /Prev to the
 //               original's previous revision; "xs:V:N" appends an xref
 //               stream update (V = free: frees N; oddindex, trailing,
-//               wtype5: malformed).
+//               wtype5: malformed); "rep:FROM=TO" replaces the last
+//               occurrence of FROM in the update (trailer) with TO.
 //               OUT stays uncorrupted.
 //   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
 //               output past N bytes (write-failure tests; PDFium buffers
@@ -380,6 +381,18 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
                     "\r\nendstream\r\nendobj\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n", at);
     }
     len += k;
+  } else if (g_corrupt && !strncmp(g_corrupt, "rep:", 4) && strchr(g_corrupt, '=')) {
+    const char* from = g_corrupt + 4;
+    const char* eq = strchr(from, '=');
+    size_t fl = (size_t)(eq - from), tl = strlen(eq + 1);
+    for (size_t i = len - fl + 1; i-- > orig_len;) {
+      if (memcmp(copy + i, from, fl)) continue;
+      if (len - fl + tl > len + 1000) break;
+      memmove(copy + i + tl, copy + i + fl, len - i - fl);
+      memcpy(copy + i, eq + 1, tl);
+      len = len - fl + tl;
+      break;
+    }
   } else if (g_corrupt && !strcmp(g_corrupt, "prevskip")) {
     // the original's own /Prev (its previous revision)
     unsigned long long older = 0;
