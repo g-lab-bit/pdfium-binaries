@@ -89,7 +89,11 @@ def main():
         ("render_then_edit", "basic_classic.pdf", ["--mode", "edit", "--render"], "ok", 2, {}),
         ("removed_annot_not_written", "basic_classic.pdf", ["--mode", "removed"], "ok", 2, {}),
         ("unused_stdfont_not_written", "basic_classic.pdf", ["--mode", "stdfont"], "ok", 2, {}),
+        ("ap_replaced_orphan_not_written", "basic_classic.pdf", ["--mode", "apreplaced"], "ok", 2, {}),
         ("direct_kid_refused", "direct_kid.pdf", ["--mode", "edit"], "refused", None, {}),
+        # control: listing the /Pages node too (its /Kids now references the
+        # page PDFium made indirect) makes the same edit valid.
+        ("direct_kid_with_pages_ok", "direct_kid.pdf", ["--mode", "edit", "--list", "2"], "ok", 3, {}),
         ("gen1_page_edit", "gen1_page.pdf", ["--mode", "edit"], "refused", None, {}),
         ("gen1_page_list", "gen1_page.pdf", ["--mode", "list", "--list", "3"], "refused", None, {}),
         ("gen1_ref_edit", "gen1_ref.pdf", ["--mode", "edit"], "refused", None, {}),

@@ -12,7 +12,11 @@
 //   removed: create a Square with /AP, remove it again, then do "edit";
 //            the removed annotation's /AP stream must not be written.
 //   stdfont: FPDFText_LoadStandardFont (unused), then "edit"; the font must
-//            not be written.
+//            not be written (in chromium/8076 it is a direct dict anyway).
+//   apreplaced: "edit", then FPDFAnnot_SetAP again; the first /AP stream is
+//            an unreferenced new object and must not be written.
+//   --list n,..: with mode list, exactly these; with other modes, appended
+//            to the objects the mode lists.
 //   session: ONE open document, several saves (no reopen); needs >= 3 pages.
 //            Writes OUT.s1.pdf (edit p0, L1), OUT.s2.pdf (edit p1 + /Rotate p2,
 //            L1+L2+L3), tries L2+L3 only (expected refusal) and writes
@@ -234,7 +238,7 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
   size_t n = 0;
   uint32_t page_num = 0, annots_num = 0;
   int edit = !strcmp(mode, "edit") || !strcmp(mode, "removed") ||
-             !strcmp(mode, "stdfont");
+             !strcmp(mode, "stdfont") || !strcmp(mode, "apreplaced");
   if (edit || !strcmp(mode, "touch") || render) {
     FPDF_PAGE page = FPDF_LoadPage(doc, page_no);
     if (!page) { Close(doc); return -1; }
@@ -261,15 +265,21 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
       }
       char nm[32];
       snprintf(nm, sizeof nm, "incr-real-%d", k);
-      uint32_t holder = AddSquare(page, rect, nm, NULL);
+      FPDF_ANNOTATION a = NULL;
+      uint32_t holder = AddSquare(page, rect, nm, &a);
+      if (a && !strcmp(mode, "apreplaced")) {
+        FPDF_WCHAR wbuf[64];
+        ToWide("q 0 0 1 RG 1 w 0 0 m 1 1 l S Q", wbuf, 64);
+        if (!FPDFAnnot_SetAP(a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, wbuf))
+          holder = 0;
+      }
+      if (a) FPDFPage_CloseAnnot(a);
       if (!holder) { FPDF_ClosePage(page); Close(doc); return -1; }
       objnums[n++] = holder;
     }
     FPDF_ClosePage(page);
   }
-  if (!strcmp(mode, "list")) {
-    for (size_t i = 0; i < list_n && i < 64; ++i) objnums[n++] = list[i];
-  }
+  for (size_t i = 0; i < list_n && n < 64; ++i) objnums[n++] = list[i];
   MemWriter w;
   double ms;
   FPDF_BOOL ok = Save(doc, objnums, n, &w, &ms);
