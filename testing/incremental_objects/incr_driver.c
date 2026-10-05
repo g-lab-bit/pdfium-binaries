@@ -25,6 +25,9 @@
 //   --avail   : load through FPDFAvail (all data available) instead of
 //               FPDF_LoadMemDocument64.
 //   --render  : render PAGE with annotations before editing.
+//   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
+//               output past N bytes (write-failure tests; PDFium buffers
+//               32 KiB, so small files only write in the final flush).
 // Prints "RESULT {json}" for harness/run_baseline.py. Exit 0 on success,
 // 2 on refusal (no OUT written), 1 on other errors.
 #include <stdint.h>
@@ -45,8 +48,11 @@ typedef struct {
   size_t len, cap;
 } MemWriter;
 
+static size_t g_fail_after = (size_t)-1;
+
 static int WriteBlockCb(FPDF_FILEWRITE* self, const void* d, unsigned long n) {
   MemWriter* w = (MemWriter*)self;
+  if (w->len + n > g_fail_after) return 0;
   if (w->len + n > w->cap) {
     size_t nc = (w->cap ? w->cap * 2 : 1 << 16);
     while (nc < w->len + n) nc *= 2;
@@ -319,6 +325,8 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[i], "--mode")) mode = argv[++i];
     else if (!strcmp(argv[i], "--repeat")) repeat = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--password")) pw = argv[++i];
+    else if (!strcmp(argv[i], "--fail-after"))
+      g_fail_after = (size_t)strtoull(argv[++i], NULL, 10);
     else if (!strcmp(argv[i], "--list")) {
       char* s = argv[++i];
       while (*s && list_n < 64) {

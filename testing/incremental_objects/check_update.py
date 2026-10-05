@@ -125,9 +125,11 @@ def main():
         off = int(prev) if prev else None
     secs.reverse()
     r["sections"] = []
-    entries_ok, bounds = True, [len(orig)] + [s[0] for s in secs]
+    # Each section's body starts after the previous section's %%EOF.
+    starts = [len(orig)] + [saved.index(b"%%EOF", s[0]) + 5 for s in secs]
+    entries_ok = True
     for n, (off, k, tr) in enumerate(secs):
-        body = saved[bounds[n]:off]
+        body = saved[starts[n]:off]
         objs = sorted(int(m.group(1)) for m in OBJ.finditer(body))
         gens = sorted({int(m.group(2)) for m in OBJ.finditer(body)})
         if k == "table":
@@ -160,6 +162,7 @@ def main():
         oe, ne = get(otr, b"Encrypt", rb"\d+\s+\d+\s+R"), get(ftr, b"Encrypt", rb"\d+\s+\d+\s+R")
         r["encrypt_same"] = oe == ne
         osz = get(otr, b"Size", rb"\d+")
+        r["orig_size"] = int(osz) if osz else None
         r["size_ge_orig"] = osz is None or int(get(ftr, b"Size", rb"\d+")) >= int(osz)
     print(json.dumps(r))
 

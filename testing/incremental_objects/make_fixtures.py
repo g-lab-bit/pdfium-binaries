@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Fixtures for the FPDF_SaveIncrementalObjects scripted test (stdlib only).
+"""Fixtures for the FPDF_SaveIncrementalObjects scripted test.
 
-usage: make_fixtures.py OUTDIR [--qpdf PATH]
-Optional extras: an encrypted file with encrypted XMP metadata (needs pikepdf)
-and a linearized file (needs qpdf); both are skipped when unavailable.
+usage: make_fixtures.py OUTDIR --qpdf PATH
+Requires pikepdf (encrypted fixtures) and qpdf (linearized fixture); fails
+if either is missing. data/hybrid_xrefstm.pdf is a synthetic hybrid-reference
+file (classic table + /XRefStm) from the Rapida save-spike corpus.
 """
-import os, re, subprocess, sys, zlib
+import os, re, shutil, subprocess, sys, zlib
 
+try:
+    import pikepdf
+except ImportError:
+    sys.exit("make_fixtures.py: pikepdf is required (pip install pikepdf)")
 OUT = sys.argv[1]
-QPDF = sys.argv[sys.argv.index("--qpdf") + 1] if "--qpdf" in sys.argv else "qpdf"
+QPDF = sys.argv[sys.argv.index("--qpdf") + 1] if "--qpdf" in sys.argv else shutil.which("qpdf")
+if not QPDF or not os.path.exists(QPDF):
+    sys.exit("make_fixtures.py: qpdf is required (--qpdf PATH)")
+HERE = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(OUT, exist_ok=True)
 ID = b"/ID [<00112233445566778899aabbccddeeff><00112233445566778899aabbccddeeff>]"
 
@@ -109,20 +117,35 @@ for name in ("basic_classic.pdf", "basic_xrefstm.pdf"):
     sx = int(re.match(rb"startxref\s+(\d+)", d[i:]).group(1))
     w("damaged_" + name[6:], d[:i] + b"startxref\n%d\n%%%%EOF\n" % (sx + 13))
 
-try:
-    import pikepdf
-    pdf = pikepdf.open(os.path.join(OUT, "basic_classic.pdf"))
-    with pdf.open_metadata() as meta:
-        meta["dc:title"] = "incr fixture"
-    pdf.save(os.path.join(OUT, "enc_aes128_metadata.pdf"),
-             encryption=pikepdf.Encryption(user="", owner="owner", R=4, aes=True, metadata=True))
-    p = pikepdf.open(os.path.join(OUT, "enc_aes128_metadata.pdf"))
-    open(os.path.join(OUT, "enc_aes128_metadata.nums"), "w").write(
-        "%d %d\n" % (p.Root.Metadata.objgen[0], p.trailer.Encrypt.objgen[0]))
-except Exception as e:  # optional
-    print("skip enc_aes128_metadata:", e)
-try:
-    subprocess.run([QPDF, "--linearize", os.path.join(OUT, "basic_classic.pdf"),
-                    os.path.join(OUT, "linearized.pdf")], check=True)
-except Exception as e:  # optional
-    print("skip linearized:", e)
+pdf = pikepdf.open(os.path.join(OUT, "basic_classic.pdf"))
+with pdf.open_metadata() as meta:
+    meta["dc:title"] = "incr fixture"
+pdf.save(os.path.join(OUT, "enc_aes128_metadata.pdf"),
+         encryption=pikepdf.Encryption(user="", owner="owner", R=4, aes=True, metadata=True))
+p = pikepdf.open(os.path.join(OUT, "enc_aes128_metadata.pdf"))
+open(os.path.join(OUT, "enc_aes128_metadata.nums"), "w").write(
+    "%d %d\n" % (p.Root.Metadata.objgen[0], p.trailer.Encrypt.objgen[0]))
+pikepdf.open(os.path.join(OUT, "basic_classic.pdf")).save(
+    os.path.join(OUT, "enc_aes256_r6.pdf"),
+    encryption=pikepdf.Encryption(user="", owner="owner", R=6))
+subprocess.run([QPDF, "--linearize", os.path.join(OUT, "basic_classic.pdf"),
+                os.path.join(OUT, "linearized.pdf")], check=True)
+shutil.copy(os.path.join(HERE, "data", "hybrid_xrefstm.pdf"), OUT)
+
+# Indirect /Length with generation 1, unfiltered and filtered stream.
+def length_gen1(filtered):
+    data = zlib.compress(CONTENT) if filtered else CONTENT
+    o = page1()
+    o[4] = (b"<< /Length 5 1 R%s >>\nstream\n" % (b" /Filter /FlateDecode" if filtered else b"")
+            + data + b"\nendstream")
+    o[5] = b"%d" % len(data)
+    return classic(o, gens={5: 1})
+w("gen1_length_unfiltered.pdf", length_gen1(False))
+w("gen1_length_filtered.pdf", length_gen1(True))
+
+# > 32 KiB so that the save flushes several times (write-failure cases).
+import random
+random.seed(1)
+big = b"".join(b"%% pad %08x\n" % random.getrandbits(32) for _ in range(9000))
+o = pages3(); o[6] = b"<< /Length %d >>\nstream\n" % (len(CONTENT) + len(big)) + CONTENT + big + b"endstream"
+w("big_classic.pdf", classic(o))

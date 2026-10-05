@@ -1,5 +1,5 @@
 diff --git a/core/fpdfapi/edit/cpdf_creator.cpp b/core/fpdfapi/edit/cpdf_creator.cpp
-index 31e004f..2d9ec6d 100644
+index 31e004f..7e582dd 100644
 --- a/core/fpdfapi/edit/cpdf_creator.cpp
 +++ b/core/fpdfapi/edit/cpdf_creator.cpp
 @@ -13,23 +13,29 @@
@@ -46,7 +46,7 @@ index 31e004f..2d9ec6d 100644
    FX_FILESIZE offset_ = 0;
    FixedSizeDataVector<uint8_t> buffer_;
    pdfium::raw_span<uint8_t> available_;
-@@ -119,6 +128,98 @@ bool OutputIndex(IFX_ArchiveStream* archive, FX_FILESIZE offset) {
+@@ -119,6 +128,78 @@ bool OutputIndex(IFX_ArchiveStream* archive, FX_FILESIZE offset) {
           archive->WriteByte(0);
  }
  
@@ -122,30 +122,10 @@ index 31e004f..2d9ec6d 100644
 +  return true;
 +}
 +
-+// Like ForEachReference(), but for the bytes CPDF_Stream::WriteTo() will
-+// produce: an unfiltered stream (other than XML metadata) is always
-+// Flate-encoded into a cloned dictionary with a direct /Length, so its
-+// original (possibly indirect) /Length is not written. A filtered stream keeps
-+// its dictionary, indirect /Length included, when the length is unchanged.
-+template <typename Fn>
-+bool ForEachWrittenReference(RetainPtr<const CPDF_Object> obj, Fn fn) {
-+  const CPDF_Stream* stream = obj->AsStream();
-+  if (!stream || stream->HasFilter() || IsXMLMetadataStream(stream)) {
-+    return ForEachReference(std::move(obj), fn);
-+  }
-+  CPDF_DictionaryLocker locker(stream->GetDict());
-+  for (const auto& [key, value] : locker) {
-+    if (key != "Length" && !ForEachReference(value, fn)) {
-+      return false;
-+    }
-+  }
-+  return true;
-+}
-+
  }  // namespace
  
  CPDF_Creator::CPDF_Creator(CPDF_Document* doc,
-@@ -133,7 +234,13 @@ CPDF_Creator::CPDF_Creator(CPDF_Document* doc,
+@@ -133,7 +214,13 @@ CPDF_Creator::CPDF_Creator(CPDF_Document* doc,
  CPDF_Creator::~CPDF_Creator() = default;
  
  bool CPDF_Creator::WriteIndirectObj(uint32_t objnum, const CPDF_Object* pObj) {
@@ -160,7 +140,7 @@ index 31e004f..2d9ec6d 100644
      return false;
    }
  
-@@ -142,11 +249,11 @@ bool CPDF_Creator::WriteIndirectObj(uint32_t objnum, const CPDF_Object* pObj) {
+@@ -142,11 +229,11 @@ bool CPDF_Creator::WriteIndirectObj(uint32_t objnum, const CPDF_Object* pObj) {
      encryptor = std::make_unique<CPDF_Encryptor>(GetCryptoHandler(), objnum);
    }
  
@@ -174,7 +154,7 @@ index 31e004f..2d9ec6d 100644
  }
  
  bool CPDF_Creator::WriteOldIndirectObject(uint32_t objnum) {
-@@ -709,6 +816,317 @@ bool CPDF_Creator::Continue() {
+@@ -709,6 +796,319 @@ bool CPDF_Creator::Continue() {
    return stage_ > Stage::kInvalid;
  }
  
@@ -295,7 +275,9 @@ index 31e004f..2d9ec6d 100644
 +    if (metadata_encrypted && IsXMLMetadataStream(obj.Get())) {
 +      return false;
 +    }
-+    if (!ForEachWrittenReference(obj, gen_is_zero)) {
++    // A stream's /Length is never a reference here: CPDF_Stream makes it a
++    // direct number on load, and the writer emits that.
++    if (!ForEachReference(obj, gen_is_zero)) {
 +      return false;
 +    }
 +  }
@@ -675,7 +657,7 @@ index 8aa49ee..5bd2fbf 100644
 +  return context->GetAnnotDict()->GetObjNum();
 +}
 diff --git a/public/fpdf_save.h b/public/fpdf_save.h
-index 093b889..6955b28 100644
+index 093b889..fb57e03 100644
 --- a/public/fpdf_save.h
 +++ b/public/fpdf_save.h
 @@ -7,6 +7,8 @@
@@ -754,9 +736,9 @@ index 093b889..6955b28 100644
 +//              referenced from the existing widget dictionaries). List those
 +//              objects or fall back to a full save;
 +//            - an object to write has a generation number other than 0 or
-+//              references an object that has one (an indirect /Length of an
-+//              unfiltered stream is exempt: it is rewritten as a direct
-+//              value);
++//              references an object that has one (a stream's /Length is
++//              always written as a direct number, so an indirect /Length
++//              object does not count);
 +//            - an XML metadata stream would be written unencrypted into a
 +//              file whose metadata is encrypted;
 +//            - the original /Size or the new xref stream's object number would
