@@ -183,6 +183,17 @@ def main():
         # an update must not define an object PDFium never held
         ("verify_injected_object", "basic_classic.pdf", E + ["--corrupt", "inject:6"], "ok", [0],
          {"verify": False, "mismatch": 6}),
+        # the original part must be an exact prefix (incl. bytes before %PDF-)
+        ("verify_prefix_byte_changed", "basic_classic.pdf", E + ["--corrupt", "origbyte"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        ("verify_junk_prefix_byte_changed", "junk_prefix.pdf", E + ["--corrupt", "firstbyte"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        # an update that frees (deletes) an object: never loaded (6, content
+        # stream) and loaded (3, the edited page)
+        ("verify_update_frees_unloaded", "basic_classic.pdf", E + ["--corrupt", "free:6"], "ok", [0],
+         {"verify": False, "mismatch": 6}),
+        ("verify_update_frees_loaded", "basic_classic.pdf", E + ["--corrupt", "free:3"], "ok", [0],
+         {"verify": False, "mismatch": 3}),
         # /Info changed in the update (no public API edits /Info in memory)
         ("verify_tampered_info", "with_info.pdf", E + ["--load-info", "--corrupt", "inject:5"], "ok", [0],
          {"verify": False, "mismatch": 5}),

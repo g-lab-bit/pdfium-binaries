@@ -48,7 +48,10 @@
 //               instead: the update's first "incr-real-" becomes
 //               "incr-REAL-"; the final startxref is incremented; a byte of
 //               the new Form XObject's Flate data is flipped; or a second
-//               update redefining object N is appended (classic originals).
+//               update redefining object N is appended (classic originals);
+//               "origbyte" flips a byte in the middle of the original part,
+//               "firstbyte" flips byte 0 (e.g. inside bytes before %PDF-),
+//               "free:N" appends an update whose xref frees object N.
 //               OUT stays uncorrupted.
 //   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
 //               output past N bytes (write-failure tests; PDFium buffers
@@ -273,8 +276,14 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
       }
       break;
     }
-  } else if (g_corrupt && !strncmp(g_corrupt, "inject:", 7)) {
-    unsigned n = (unsigned)atoi(g_corrupt + 7), root = 0, size = 0;
+  } else if (g_corrupt && !strcmp(g_corrupt, "origbyte")) {
+    copy[orig_len / 2] ^= 0x01;
+  } else if (g_corrupt && !strcmp(g_corrupt, "firstbyte")) {
+    copy[0] ^= 0x01;
+  } else if (g_corrupt && (!strncmp(g_corrupt, "inject:", 7) ||
+                           !strncmp(g_corrupt, "free:", 5))) {
+    const int is_free = !strncmp(g_corrupt, "free:", 5);
+    unsigned n = (unsigned)atoi(g_corrupt + (is_free ? 5 : 7)), root = 0, size = 0;
     unsigned long long prev = 0;
     for (size_t i = len; i-- > 9;) {
       if (!memcmp(copy + i - 9, "startxref", 9)) { prev = strtoull((char*)copy + i, NULL, 10); break; }
@@ -285,13 +294,21 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
       if (root && size) break;
     }
     size_t obj = len + 2;
-    int k = snprintf((char*)copy + len, 1024,
-                     "\r\n%u 0 obj\r\n<</Title (tampered)>>\r\nendobj\r\n", n);
+    int k = is_free ? snprintf((char*)copy + len, 1024, "\r\n")
+                    : snprintf((char*)copy + len, 1024,
+                               "\r\n%u 0 obj\r\n<</Title (tampered)>>\r\nendobj\r\n", n);
     size_t xref = len + k;
-    k += snprintf((char*)copy + len + k, 1024 - k,
-                  "xref\r\n%u 1\r\n%010zu 00000 n\r\ntrailer\r\n<</Size %u/Root %u 0 R/Prev %llu>>"
-                  "\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n",
-                  n, obj, size > n ? size : n + 1, root, prev, xref);
+    if (is_free) {
+      k += snprintf((char*)copy + len + k, 1024 - k,
+                    "xref\r\n%u 1\r\n0000000000 00001 f\r\ntrailer\r\n<</Size %u/Root %u 0 R/Prev %llu>>"
+                    "\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n",
+                    n, size > n ? size : n + 1, root, prev, xref);
+    } else {
+      k += snprintf((char*)copy + len + k, 1024 - k,
+                    "xref\r\n%u 1\r\n%010zu 00000 n\r\ntrailer\r\n<</Size %u/Root %u 0 R/Prev %llu>>"
+                    "\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n",
+                    n, obj, size > n ? size : n + 1, root, prev, xref);
+    }
     len += k;
   }
   Buf b = {copy, len};

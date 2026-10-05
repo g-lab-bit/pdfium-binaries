@@ -586,14 +586,15 @@ index 76cfa70..91919cc 100644
      return cross_ref_table_.get();
    }
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 8aa49ee..19054cf 100644
+index 8aa49ee..fdf0a7d 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
-@@ -8,22 +8,37 @@
+@@ -8,22 +8,41 @@
  
  #include <stdint.h>
  
 +#include <algorithm>
++#include <array>
 +#include <map>
  #include <optional>
 +#include <set>
@@ -616,18 +617,21 @@ index 8aa49ee..19054cf 100644
 +#include "core/fpdfapi/parser/cpdf_stream.h"
  #include "core/fpdfapi/parser/cpdf_stream_acc.h"
  #include "core/fpdfapi/parser/cpdf_string.h"
++#include "core/fpdfapi/parser/fpdf_parser_utility.h"
 +#include "core/fpdfapi/render/cpdf_docrenderdata.h"
 +#include "core/fxcrt/compiler_specific.h"
 +#include "core/fxcrt/containers/contains.h"
 +#include "core/fxcrt/data_vector.h"
  #include "core/fxcrt/fx_extension.h"
++#include "core/fxcrt/fx_safe_types.h"
  #include "core/fxcrt/mask.h"
++#include "core/fxcrt/numerics/safe_conversions.h"
  #include "core/fxcrt/stl_util.h"
 +#include "fpdfsdk/cpdfsdk_customaccess.h"
  #include "fpdfsdk/cpdfsdk_filewriteadapter.h"
  #include "fpdfsdk/cpdfsdk_helpers.h"
  #include "public/fpdf_edit.h"
-@@ -222,3 +237,530 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -222,3 +241,699 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       int fileVersion) {
    return DoDocSave(document, file_write, flags, fileVersion);
  }
@@ -776,6 +780,184 @@ index 8aa49ee..19054cf 100644
 +  DataVector<uint8_t> buffer_;
 +  FX_FILESIZE offset_ = 0;
 +};
++
++// Reads the cross-reference sections located after the original file (the
++// update) by following the saved file's startxref/Prev chain, and records
++// every object number they define (classic table entries, free or in use;
++// xref stream entries of any type). Returns false if the chain cannot be
++// read or uses /XRefStm. Positions are relative to the "%PDF-" header.
++bool CollectUpdateEntries(RetainPtr<IFX_SeekableReadStream> file,
++                          FX_FILESIZE header_offset,
++                          FX_FILESIZE original_size,
++                          FX_FILESIZE last_xref,
++                          CPDF_Document* saved_doc,
++                          std::map<uint32_t, bool>* defined,
++                          std::set<uint32_t>* xref_streams) {
++  FX_SAFE_FILESIZE safe_start = header_offset;
++  safe_start += original_size;
++  if (!safe_start.IsValid() || file->GetSize() < safe_start.ValueOrDie()) {
++    return false;
++  }
++  const FX_FILESIZE region_start = safe_start.ValueOrDie();
++  DataVector<uint8_t> region(
++      pdfium::checked_cast<size_t>(file->GetSize() - region_start));
++  if (!region.empty() && !file->ReadBlockAtOffset(region, region_start)) {
++    return false;
++  }
++  const pdfium::span<const uint8_t> bytes(region);
++  size_t i = 0;
++  auto skip_ws = [&]() {
++    while (i < bytes.size() && PDFCharIsWhitespace(bytes[i])) {
++      ++i;
++    }
++  };
++  auto read_uint = [&](uint64_t* value) {
++    skip_ws();
++    const size_t begin = i;
++    uint64_t v = 0;
++    while (i < bytes.size() &&
++           FXSYS_IsDecimalDigit(static_cast<char>(bytes[i])) &&
++           i - begin < 18) {
++      v = v * 10 + (bytes[i++] - '0');
++    }
++    *value = v;
++    return i > begin;
++  };
++  auto starts_with = [&](size_t pos, ByteStringView word) {
++    return pos + word.GetLength() <= bytes.size() &&
++           std::ranges::equal(bytes.subspan(pos, word.GetLength()),
++                              word.unsigned_span());
++  };
++
++  std::set<FX_FILESIZE> visited;
++  FX_FILESIZE pos = last_xref;
++  while (pos >= original_size) {
++    if (!visited.insert(pos).second || visited.size() > 1024) {
++      return false;
++    }
++    i = static_cast<size_t>(pos - original_size);
++    skip_ws();
++    if (i >= bytes.size()) {
++      return false;
++    }
++    std::optional<FX_FILESIZE> prev;
++    if (starts_with(i, "xref")) {
++      i += 4;
++      while (true) {
++        skip_ws();
++        if (starts_with(i, "trailer")) {
++          break;
++        }
++        uint64_t start = 0;
++        uint64_t count = 0;
++        if (!read_uint(&start) || !read_uint(&count) ||
++            start + count > CPDF_Parser::kMaxObjectNumber + 1) {
++          return false;
++        }
++        for (uint64_t k = 0; k < count; ++k) {
++          uint64_t offset = 0;
++          uint64_t gen = 0;
++          if (!read_uint(&offset) || !read_uint(&gen)) {
++            return false;
++          }
++          skip_ws();
++          if (i >= bytes.size() || (bytes[i] != 'n' && bytes[i] != 'f')) {
++            return false;
++          }
++          (*defined)[static_cast<uint32_t>(start + k)] = bytes[i++] == 'f';
++        }
++      }
++      // The trailer dictionary ends before the next "startxref".
++      const size_t trailer_begin = i;
++      size_t trailer_end = trailer_begin;
++      while (trailer_end < bytes.size() &&
++             !starts_with(trailer_end, "startxref")) {
++        ++trailer_end;
++      }
++      for (size_t k = trailer_begin; k < trailer_end; ++k) {
++        if (starts_with(k, "/XRefStm")) {
++          return false;
++        }
++        if (starts_with(k, "/Prev") && k + 5 < bytes.size() &&
++            !PDFCharIsOther(bytes[k + 5])) {
++          i = k + 5;
++          uint64_t value = 0;
++          if (!read_uint(&value)) {
++            return false;
++          }
++          prev = static_cast<FX_FILESIZE>(value);
++        }
++      }
++    } else {
++      uint64_t objnum = 0;
++      uint64_t gen = 0;
++      if (!read_uint(&objnum) || !read_uint(&gen) ||
++          objnum > CPDF_Parser::kMaxObjectNumber) {
++        return false;
++      }
++      RetainPtr<const CPDF_Object> obj =
++          saved_doc->GetOrParseIndirectObject(static_cast<uint32_t>(objnum));
++      const CPDF_Stream* stream = obj ? obj->AsStream() : nullptr;
++      RetainPtr<const CPDF_Dictionary> dict =
++          stream ? stream->GetDict() : nullptr;
++      if (!dict || dict->GetNameFor("Type") != "XRef" ||
++          dict->KeyExist("XRefStm")) {
++        return false;
++      }
++      xref_streams->insert(static_cast<uint32_t>(objnum));
++      RetainPtr<const CPDF_Array> w = dict->GetArrayFor("W");
++      if (!w || w->size() < 3) {
++        return false;
++      }
++      std::array<uint32_t, 3> widths;
++      uint32_t row = 0;
++      for (size_t k = 0; k < 3; ++k) {
++        const int width = w->GetIntegerAt(k);
++        if (width < 0 || width > 8) {
++          return false;
++        }
++        widths[k] = static_cast<uint32_t>(width);
++        row += widths[k];
++      }
++      std::vector<std::pair<uint32_t, uint32_t>> sections;
++      RetainPtr<const CPDF_Array> index = dict->GetArrayFor("Index");
++      if (index) {
++        for (size_t k = 0; k + 1 < index->size(); k += 2) {
++          sections.emplace_back(index->GetIntegerAt(k),
++                                index->GetIntegerAt(k + 1));
++        }
++      } else {
++        sections.emplace_back(0, dict->GetIntegerFor("Size"));
++      }
++      auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(stream));
++      acc->LoadAllDataFiltered();
++      pdfium::span<const uint8_t> data = acc->GetSpan();
++      size_t at = 0;
++      for (const auto& [first, count] : sections) {
++        for (uint32_t k = 0; k < count; ++k) {
++          if (row == 0 || at + row > data.size() ||
++              uint64_t{first} + k > CPDF_Parser::kMaxObjectNumber) {
++            return false;
++          }
++          uint32_t type = widths[0] ? 0 : 1;
++          for (uint32_t b = 0; b < widths[0]; ++b) {
++            type = (type << 8) | data[at + b];
++          }
++          (*defined)[first + k] = type == 0;
++          at += row;
++        }
++      }
++      if (dict->KeyExist("Prev")) {
++        prev = dict->GetIntegerFor("Prev");
++      }
++    }
++    if (!prev.has_value()) {
++      break;
++    }
++    pos = prev.value();
++  }
++  return true;
++}
 +
 +class SaveVerifier {
 + public:
@@ -1106,36 +1288,27 @@ index 8aa49ee..19054cf 100644
 +    ForEachRef(std::move(obj), add_new);
 +  }
 +
-+  // 4. Nothing else changed: every object the update section(s) define or
-+  //    delete must be in the compared set (an object PDFium never held
-+  //    cannot legitimately be in the update). The update's own xref stream
-+  //    is the only exception.
-+  const FX_FILESIZE original_size = parser->GetDocumentSize();
-+  const CPDF_CrossRefTable* saved_xref = saved_parser->GetCrossRefTable();
-+  const CPDF_CrossRefTable* original_xref = parser->GetCrossRefTable();
-+  for (const auto& [objnum, info] : saved_xref->objects_info()) {
-+    bool in_update = false;
-+    if (info.type == CPDF_CrossRefTable::ObjectType::kNormal) {
-+      in_update = info.pos >= original_size;
-+    } else if (info.type == CPDF_CrossRefTable::ObjectType::kCompressed) {
-+      const CPDF_CrossRefTable::ObjectInfo* stm =
-+          saved_xref->GetObjectInfo(info.archive.obj_num);
-+      in_update = stm && stm->type == CPDF_CrossRefTable::ObjectType::kNormal &&
-+                  stm->pos >= original_size;
-+    } else {
-+      const CPDF_CrossRefTable::ObjectInfo* before =
-+          original_xref->GetObjectInfo(objnum);
-+      in_update =
-+          before && before->type != CPDF_CrossRefTable::ObjectType::kFree;
++  // 4. Nothing else changed: every object an update section defines must
++  //    be in the compared set (an object PDFium never held cannot
++  //    legitimately be in the update), and no update section may free an
++  //    object. The sections are read directly: PDFium's own parser ignores
++  //    free entries in classic tables (ParseCrossRefTable does not read
++  //    their generation, so MergeCrossRefObjectsData skips them), while
++  //    other readers delete those objects.
++  std::map<uint32_t, bool> defined;  // objnum -> freed by the update
++  std::set<uint32_t> update_xref_streams;
++  if (!CollectUpdateEntries(saved_file, parser->GetHeaderOffsetInFile(),
++                            parser->GetDocumentSize(),
++                            saved_parser->GetLastXRefOffset(), saved_doc.get(),
++                            &defined, &update_xref_streams)) {
++    return false;
++  }
++  for (const auto& [objnum, freed] : defined) {
++    if (objnum == 0 && freed) {
++      continue;  // The free-list head.
 +    }
-+    if (!in_update || pdfium::Contains(objects, objnum)) {
-+      continue;
-+    }
-+    RetainPtr<const CPDF_Object> obj =
-+        saved_doc->GetOrParseIndirectObject(objnum);
-+    const CPDF_Stream* stream = obj ? obj->AsStream() : nullptr;
-+    if (info.type == CPDF_CrossRefTable::ObjectType::kNormal && stream &&
-+        stream->GetDict()->GetNameFor("Type") == "XRef") {
++    if (!freed && (pdfium::Contains(objects, objnum) ||
++                   pdfium::Contains(update_xref_streams, objnum))) {
 +      continue;
 +    }
 +    if (first_mismatch_objnum) {
@@ -1159,7 +1332,7 @@ index 8aa49ee..19054cf 100644
 +  return true;
 +}
 diff --git a/public/fpdf_save.h b/public/fpdf_save.h
-index 093b889..4f59adc 100644
+index 093b889..9c94944 100644
 --- a/public/fpdf_save.h
 +++ b/public/fpdf_save.h
 @@ -7,6 +7,8 @@
@@ -1171,7 +1344,7 @@ index 093b889..4f59adc 100644
  // clang-format off
  // NOLINTNEXTLINE(build/include)
  #include "fpdfview.h"
-@@ -86,6 +88,165 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -86,6 +88,167 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       FPDF_DWORD flags,
                       int file_version);
  
@@ -1276,8 +1449,10 @@ index 093b889..4f59adc 100644
 +//               itself after load (page tree /Type and /Count fixes, form
 +//               field /T /FT /Ff normalisation) are accepted only in their
 +//               exact form; see fpdf_save.cpp;
-+//            4. the update section(s) of |saved| define or delete no object
-+//               outside that set (other than their own xref stream).
++//            4. the cross-reference section(s) after the original (read
++//               directly, not through PDFium's merged table) define no
++//               object outside that set other than their own xref stream,
++//               free no object, and use no /XRefStm.
 +//          It does NOT prove:
 +//            - that the in-memory state is what the user intended: a side
 +//              effect of a PDFium API on a LISTED object is saved and then
