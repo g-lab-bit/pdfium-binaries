@@ -1,0 +1,105 @@
+diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
+index 919e1db..6c854d2 100644
+--- a/fpdfsdk/fpdf_doc.cpp
++++ b/fpdfsdk/fpdf_doc.cpp
+@@ -12,6 +12,7 @@
+ #include <optional>
+ #include <set>
+ #include <utility>
++#include <vector>
+ 
+ #include "constants/form_fields.h"
+ #include "core/fpdfapi/page/cpdf_annotcontext.h"
+@@ -1104,6 +1105,60 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+   return true;
+ }
+ 
++// g-lab-bit fork (annot_ocmd.patch).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
++                          FPDF_ANNOTATION annot,
++                          const int* ocg_indices,
++                          int count) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!doc || !AnnotBelongsToDoc(context, doc) || count < 0 ||
++      (count > 0 && !ocg_indices)) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
++  if (!annot_dict) {
++    return false;
++  }
++  // Validate everything before changing anything.
++  std::vector<uint32_t> objnums;
++  if (count > 0) {
++    // SAFETY: required from caller.
++    auto indices =
++        UNSAFE_BUFFERS(pdfium::span(ocg_indices, static_cast<size_t>(count)));
++    for (int index : indices) {
++      RetainPtr<CPDF_Dictionary> ocg = GetMutableOCGDict(doc, index);
++      if (!ocg || ocg->GetObjNum() == 0) {
++        return false;
++      }
++      if (!pdfium::Contains(objnums, ocg->GetObjNum())) {
++        objnums.push_back(ocg->GetObjNum());
++      }
++    }
++  }
++  if (objnums.empty()) {
++    annot_dict->RemoveFor("OC");
++    return true;
++  }
++  if (objnums.size() == 1) {
++    annot_dict->SetNewFor<CPDF_Reference>("OC", doc, objnums[0]);
++    return true;
++  }
++  // A new OCMD per call; an identical existing one is not reused, so no
++  // annotation's /OC ever aliases another's (the replaced OCMD, if any, is
++  // simply no longer referenced).
++  auto ocmd = doc->NewIndirect<CPDF_Dictionary>();
++  ocmd->SetNewFor<CPDF_Name>("Type", "OCMD");
++  auto ocgs = ocmd->SetNewFor<CPDF_Array>("OCGs");
++  for (uint32_t objnum : objnums) {
++    ocgs->AppendNew<CPDF_Reference>(doc, objnum);
++  }
++  ocmd->SetNewFor<CPDF_Name>("P", "AllOn");
++  annot_dict->SetNewFor<CPDF_Reference>("OC", doc, ocmd->GetObjNum());
++  return true;
++}
++
+ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+                                                    FPDF_ANNOTATION annot) {
+   CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index 6f4a63c..3a74dd7 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -592,6 +592,27 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+                                                     FPDF_ANNOTATION annot,
+                                                     int index);
+ 
++// g-lab-bit fork (annot_ocmd.patch)
++// Experimental API.
++// Set annotation |annot|'s optional content membership to ALL of the OCGs
++// |ocg_indices| (indices into /OCProperties /OCGs, e.g. a layer and its
++// ancestors; duplicates are ignored):
++//   count == 0: /OC is removed;
++//   one distinct OCG: /OC = an indirect reference to it;
++//   more: /OC = a new indirect OCMD << /Type /OCMD /OCGs [...] /P /AllOn >>
++//         (visible only when every group is on). An identical existing OCMD
++//         is not reused, so annotations never share one through this call.
++// Nothing changes unless every index is valid and refers to an indirect OCG.
++// FPDFAnnot_GetOCGIndex() returns -1 for an OCMD. FPDFDoc_DeleteOCG() prunes a
++// deleted group from such an OCMD's /OCGs and removes /OC when none is left.
++// Note: PDFium and PDFKit ignore annotation /OC when rendering; see
++// FPDFAnnot_SetAPOptionalContent() for the appearance stream.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
++                          FPDF_ANNOTATION annot,
++                          const int* ocg_indices,
++                          int count);
++
+ // Experimental API.
+ // Returns the index (as used by FPDFDoc_GetOCG*) of the OCG referenced by
+ // |annot|'s /OC entry, or -1 if it has none or it is not in /OCGs.

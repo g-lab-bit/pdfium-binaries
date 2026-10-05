@@ -1,0 +1,145 @@
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index 7ee8a63..258124e 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -18,6 +18,8 @@
+ #include "constants/catalog.h"
+ #include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
+ #include "core/fpdfapi/page/cpdf_annotcontext.h"
++#include "core/fpdfapi/page/cpdf_contentmarkitem.h"
++#include "core/fpdfapi/page/cpdf_contentmarks.h"
+ #include "core/fpdfapi/page/cpdf_form.h"
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
+@@ -2130,3 +2132,90 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
+   }
+   return static_cast<int>(numbers.size());
+ }
++
++// g-lab-bit fork (annot_ap_oc.patch).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
++                               FPDF_ANNOTATION annot,
++                               FPDF_ANNOT_APPEARANCEMODE appearance_mode,
++                               const int* ocg_indices,
++                               int count) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!doc || !context || !context->GetPage() ||
++      context->GetPage()->GetDocument() != doc ||
++      appearance_mode != FPDF_ANNOT_APPEARANCEMODE_NORMAL || count < 0 ||
++      (count > 0 && !ocg_indices) ||
++      !FPDFAnnot_IsObjectSupportedSubtype(FPDFAnnot_GetSubtype(annot))) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
++  RetainPtr<CPDF_Stream> stream =
++      GetAnnotAP(annot_dict.Get(), CPDF_Annot::AppearanceMode::kNormal);
++  // The AP must have its own /Resources (FPDFAnnot_AppendObject creates
++  // them); adding one would cut it off from names it may inherit.
++  RetainPtr<CPDF_Dictionary> resources =
++      stream ? stream->GetMutableDict()->GetMutableDictFor("Resources")
++             : nullptr;
++  if (!resources) {
++    return false;
++  }
++
++  // Validate every index before changing anything.
++  std::vector<uint32_t> objnums;
++  if (count > 0) {
++    const CPDF_Dictionary* root = doc->GetRoot();
++    RetainPtr<const CPDF_Dictionary> oc_properties =
++        root ? root->GetDictFor("OCProperties") : nullptr;
++    RetainPtr<const CPDF_Array> ocgs =
++        oc_properties ? oc_properties->GetArrayFor("OCGs") : nullptr;
++    // SAFETY: required from caller.
++    auto indices =
++        UNSAFE_BUFFERS(pdfium::span(ocg_indices, static_cast<size_t>(count)));
++    for (int index : indices) {
++      RetainPtr<const CPDF_Dictionary> ocg =
++          ocgs && index >= 0 && static_cast<size_t>(index) < ocgs->size()
++              ? ocgs->GetDictAt(index)
++              : nullptr;
++      if (!ocg || ocg->GetObjNum() == 0) {
++        return false;
++      }
++      if (!pdfium::Contains(objnums, ocg->GetObjNum())) {
++        objnums.push_back(ocg->GetObjNum());
++      }
++    }
++  }
++
++  if (!context->HasForm()) {
++    context->SetForm(stream);
++  }
++  CPDF_Form* form = context->GetForm();
++
++  // One /Properties entry per group, then nested /OC marks on every object
++  // of the appearance, outermost first (ocg_indices[0]); the content
++  // generator writes them as "/OC /OCGn BDC ... EMC".
++  std::vector<ByteString> names;
++  RetainPtr<CPDF_Dictionary> properties;
++  if (!objnums.empty()) {
++    properties = resources->GetOrCreateDictFor("Properties");
++    for (uint32_t objnum : objnums) {
++      ByteString name = ByteString::Format("OCG%u", objnum);
++      properties->SetNewFor<CPDF_Reference>(name, doc, objnum);
++      names.push_back(std::move(name));
++    }
++  }
++  for (auto& page_object : *form) {
++    CPDF_ContentMarks* marks = page_object->GetContentMarks();
++    for (size_t i = marks->CountItems(); i > 0; --i) {
++      CPDF_ContentMarkItem* item = marks->GetItem(i - 1);
++      if (item->GetName() == "OC") {
++        marks->RemoveMark(item);
++      }
++    }
++    for (const ByteString& name : names) {
++      marks->AddMarkWithPropertiesHolder("OC", properties, name);
++    }
++  }
++  UpdateContentStream(form, stream.Get());
++  return true;
++}
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index 1b9f81d..00f9ebf 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -259,6 +259,36 @@ FPDFAnnot_RemoveInkList(FPDF_ANNOTATION annot);
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+ FPDFAnnot_AppendObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj);
+ 
++// g-lab-bit fork (annot_ap_oc.patch)
++// Experimental API.
++// Put the appearance stream content of |annot| under optional content: every
++// object of the normal appearance gets nested marked content
++//   /OC /OCGn BDC ... EMC
++// one level per OCG in |ocg_indices| (indices into /OCProperties /OCGs;
++// ocg_indices[0] is the outermost, e.g. the top ancestor layer; duplicates
++// are ignored), and the appearance's /Resources get /Properties entries
++// referencing the groups. Viewers that ignore annotation /OC but honour marked
++// content (PDFium, PDFKit) then hide the markup when ANY of the groups is off,
++// through /OCProperties /D or FPDFDoc_SetOCGViewState(). Use together with
++// FPDFAnnot_SetOCMembership() for readers that use annotation /OC.
++//   appearance_mode - only FPDF_ANNOT_APPEARANCEMODE_NORMAL is supported.
++//   count           - 0 removes the /OC marks.
++// The appearance is regenerated from its page objects (as
++// FPDFAnnot_UpdateObject() does); existing /OC marks are replaced, other marks
++// are kept (the /OC levels are added inside them). Objects appended later
++// with FPDFAnnot_AppendObject() are not marked: call this again afterwards.
++// Supported for the subtypes FPDFAnnot_AppendObject() supports. Fails, without
++// changing anything, for an invalid index, a direct OCG, or an appearance
++// without its own /Resources.
++// FPDFDoc_DeleteOCG() does not remove these marks: re-mark the annotation
++// before deleting a group it uses.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
++                               FPDF_ANNOTATION annot,
++                               FPDF_ANNOT_APPEARANCEMODE appearance_mode,
++                               const int* ocg_indices,
++                               int count);
++
+ // Experimental API.
+ // Get the total number of objects in |annot|, including path objects, text
+ // objects, external objects, image objects, and shading objects.
