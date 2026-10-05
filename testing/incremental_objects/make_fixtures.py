@@ -231,3 +231,24 @@ o = page1()
 o[3] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> "
         b"/Annots [<< /Type /Annot /Subtype /Square /Rect [50 50 90 90] /C [0 0 1] >>] >>")
 w("inline_annot.pdf", classic(o))
+
+# Encrypted originals whose last section is an xref stream (qpdf, PDF 1.5+
+# with object streams): AES-256 and RC4-128.
+for name, args in (("enc_aes256_xrefstm.pdf", ["256"]),
+                   ("enc_rc4_xrefstm.pdf", ["128", "--use-aes=n", "--allow-weak-crypto"])):
+    subprocess.run([QPDF, "--object-streams=generate", "--encrypt", "", "owner", *args, "--",
+                    os.path.join(OUT, "basic_classic.pdf"), os.path.join(OUT, name)], check=True)
+    p = pikepdf.open(os.path.join(OUT, name))
+    open(os.path.join(OUT, name[:-4] + ".nums"), "w").write(
+        "%d\n" % p.pages[2].obj.Contents.objgen[0])  # never loaded by the edit
+
+# Two revisions (classic): the original's latest section has /Prev to the
+# first; an update whose /Prev skips the latest revision must fail.
+d = open(os.path.join(OUT, "basic_classic.pdf"), "rb").read()
+sx = int(re.search(rb"startxref\s+(\d+)", d[d.rfind(b"startxref"):]).group(1))
+rev = bytearray(d)
+o5 = len(rev)
+rev += b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << >> /Rotate 90 >>\nendobj\n"
+x = len(rev)
+rev += b"xref\n5 1\n%010d 00000 n\r\ntrailer\n<< /Size 7 /Root 1 0 R %s /Prev %d >>\nstartxref\n%d\n%%%%EOF\n" % (o5, ID, sx, x)
+w("multirev_classic.pdf", bytes(rev))

@@ -156,6 +156,8 @@ def main():
     subprocess.run([sys.executable, os.path.join(HERE, "make_fixtures.py"), FIX, "--qpdf", QPDF], check=True)
     os.makedirs(OUTDIR, exist_ok=True)
     meta, enc = open(os.path.join(FIX, "enc_aes128_metadata.nums")).read().split()
+    nums = {"aes_xs": open(os.path.join(FIX, "enc_aes256_xrefstm.nums")).read().strip(),
+            "rc4_xs": open(os.path.join(FIX, "enc_rc4_xrefstm.nums")).read().strip()}
 
     # name, fixture, args, expected status, new objects in the update as
     # offsets from the input /Size (None = not checked), extra checks.
@@ -194,6 +196,31 @@ def main():
          {"verify": False, "mismatch": 6}),
         ("verify_update_frees_loaded", "basic_classic.pdf", E + ["--corrupt", "free:3"], "ok", [0],
          {"verify": False, "mismatch": 3}),
+        # encrypted originals whose last section is an xref stream
+        ("edit_aes256_xrefstm", "enc_aes256_xrefstm.pdf", E, "ok", [0], {"kind": "stream"}),
+        ("edit_rc4_xrefstm", "enc_rc4_xrefstm.pdf", E, "ok", [0], {"kind": "stream"}),
+        # an xref-stream update freeing a never-loaded object
+        ("verify_xs_update_frees_aes256", "enc_aes256_xrefstm.pdf",
+         E + ["--corrupt", "xs:free:" + nums["aes_xs"]], "ok", [0],
+         {"verify": False, "mismatch": int(nums["aes_xs"])}),
+        ("verify_xs_update_frees_rc4", "enc_rc4_xrefstm.pdf",
+         E + ["--corrupt", "xs:free:" + nums["rc4_xs"]], "ok", [0],
+         {"verify": False, "mismatch": int(nums["rc4_xs"])}),
+        ("verify_xs_update_frees_plain", "basic_xrefstm.pdf", E + ["--corrupt", "xs:free:6"], "ok", [0],
+         {"verify": False, "mismatch": 6}),
+        # malformed xref-stream updates and /XRefStm in an update
+        ("verify_xs_odd_index", "basic_xrefstm.pdf", E + ["--corrupt", "xs:oddindex:6"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        ("verify_xs_trailing_bytes", "basic_xrefstm.pdf", E + ["--corrupt", "xs:trailing:6"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        ("verify_xs_type_width_5", "basic_xrefstm.pdf", E + ["--corrupt", "xs:wtype5:6"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        ("verify_update_with_xrefstm", "basic_classic.pdf", E + ["--corrupt", "xrefstm"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        # the update's /Prev skips the original's latest revision
+        ("edit_multirev", "multirev_classic.pdf", E, "ok", [0], {}),
+        ("verify_prev_skips_revision", "multirev_classic.pdf", E + ["--corrupt", "prevskip"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
         # an update entry pointing a never-loaded object at original bytes
         ("verify_update_remaps_into_original", "basic_classic.pdf", E + ["--corrupt", "remap:6"], "ok", [0],
          {"verify": False, "mismatch": 6}),

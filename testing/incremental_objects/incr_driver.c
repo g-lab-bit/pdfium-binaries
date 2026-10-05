@@ -53,7 +53,11 @@
 //               "firstbyte" flips byte 0 (e.g. inside bytes before %PDF-),
 //               "free:N" appends an update whose xref frees object N,
 //               "remap:N" one whose xref points N at object 4's original
-//               bytes (no new object written).
+//               bytes (no new object written), "xrefstm" a classic update
+//               with /XRefStm, "prevskip" sets the update's /Prev to the
+//               original's previous revision; "xs:V:N" appends an xref
+//               stream update (V = free: frees N; oddindex, trailing,
+//               wtype5: malformed).
 //               OUT stays uncorrupted.
 //   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
 //               output past N bytes (write-failure tests; PDFium buffers
@@ -320,6 +324,82 @@ static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
                     n, obj, size > n ? size : n + 1, root, prev, xref);
     }
     len += k;
+  }
+  if (g_corrupt && (!strcmp(g_corrupt, "xrefstm") || !strncmp(g_corrupt, "xs:", 3))) {
+    unsigned root = 0, size = 0;
+    unsigned long long prev = 0;
+    char enc[64] = "", id[160] = "";
+    for (size_t i = len; i-- > 9;) {
+      if (!memcmp(copy + i - 9, "startxref", 9)) { prev = strtoull((char*)copy + i, NULL, 10); break; }
+    }
+    for (size_t i = len; i-- > orig_len + 5;) {
+      if (!root && !memcmp(copy + i - 5, "/Root", 5)) root = (unsigned)strtoul((char*)copy + i, NULL, 10);
+      if (!size && !memcmp(copy + i - 5, "/Size", 5)) size = (unsigned)strtoul((char*)copy + i, NULL, 10);
+      if (!enc[0] && !memcmp(copy + i - 5, "/Encr", 5)) {  // "/Encrypt N 0 R"
+        size_t j = i - 5, e = j;
+        while (e < len && copy[e] != 'R') ++e;
+        if (e - j < sizeof enc - 1) { memcpy(enc, copy + j, e - j + 1); enc[e - j + 1] = 0; }
+      }
+      if (!id[0] && !memcmp(copy + i - 3, "/ID", 3)) {
+        size_t j = i - 3, e = j;
+        while (e < len && copy[e] != ']') ++e;
+        if (e - j < sizeof id - 1) { memcpy(id, copy + j, e - j + 1); id[e - j + 1] = 0; }
+      }
+    }
+    size_t at = len + 2;
+    int k = snprintf((char*)copy + len, 1024, "\r\n");
+    if (!strcmp(g_corrupt, "xrefstm")) {
+      k += snprintf((char*)copy + len + k, 1024 - k,
+                    "xref\r\n0 1\r\n0000000000 65535 f\r\ntrailer\r\n<</Size %u/Root %u 0 R%s%s"
+                    "/XRefStm %llu/Prev %llu>>\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n",
+                    size, root, enc, id, prev, prev, at);
+    } else {
+      const char* v = g_corrupt + 3;
+      unsigned n = (unsigned)atoi(strchr(v, ':') ? strchr(v, ':') + 1 : "0");
+      unsigned x = size;  // the new xref stream's own number
+      int wtype = !strncmp(v, "wtype5", 6) ? 5 : 1;
+      unsigned char rows[64];
+      size_t r = 0;
+      for (int b2 = 0; b2 < wtype; ++b2) rows[r++] = 0;  // N: type 0 (free)
+      rows[r++] = 0, rows[r++] = 0, rows[r++] = 0, rows[r++] = 0, rows[r++] = 1;
+      for (int b2 = 0; b2 < wtype - 1; ++b2) rows[r++] = 0;  // X: type 1
+      rows[r++] = 1;
+      rows[r++] = (unsigned char)(at >> 24), rows[r++] = (unsigned char)(at >> 16);
+      rows[r++] = (unsigned char)(at >> 8), rows[r++] = (unsigned char)at, rows[r++] = 0;
+      if (!strncmp(v, "trailing", 8)) for (int b2 = 0; b2 < 6; ++b2) rows[r++] = 0;
+      char index[64];
+      if (!strncmp(v, "oddindex", 8)) snprintf(index, sizeof index, "%u 1 %u", n, x);
+      else snprintf(index, sizeof index, "%u 1 %u 1", n, x);
+      k += snprintf((char*)copy + len + k, 1024 - k,
+                    "%u 0 obj\r\n<</Type/XRef/Size %u/Root %u 0 R%s%s/Prev %llu/W[%d 4 1]"
+                    "/Index[%s]/Length %zu>>stream\r\n",
+                    x, x + 1, root, enc, id, prev, wtype, index, r);
+      memcpy(copy + len + k, rows, r);
+      k += (int)r;
+      k += snprintf((char*)copy + len + k, 1024 - k,
+                    "\r\nendstream\r\nendobj\r\nstartxref\r\n%zu\r\n%%%%EOF\r\n", at);
+    }
+    len += k;
+  } else if (g_corrupt && !strcmp(g_corrupt, "prevskip")) {
+    // the original's own /Prev (its previous revision)
+    unsigned long long older = 0;
+    for (size_t i = orig_len; i-- > 5;) {
+      if (!memcmp(copy + i - 5, "/Prev", 5)) { older = strtoull((char*)copy + i, NULL, 10); break; }
+    }
+    for (size_t i = len; i-- > orig_len + 5;) {
+      if (memcmp(copy + i - 5, "/Prev", 5)) continue;
+      size_t j = i;
+      while (j < len && copy[j] == ' ') ++j;
+      size_t e = j;
+      while (e < len && copy[e] >= '0' && copy[e] <= '9') ++e;
+      char num[32];
+      int nl = snprintf(num, sizeof num, "%llu", older);
+      if ((size_t)nl <= e - j) {
+        memset(copy + j, ' ', e - j);
+        memcpy(copy + j, num, nl);
+      }
+      break;
+    }
   }
   Buf b = {copy, len};
   FPDF_FILEACCESS acc = {(unsigned long)len, GetBlock, &b};

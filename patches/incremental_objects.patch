@@ -586,10 +586,10 @@ index 76cfa70..91919cc 100644
      return cross_ref_table_.get();
    }
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 8aa49ee..ee344be 100644
+index 8aa49ee..b2dff67 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
-@@ -8,22 +8,41 @@
+@@ -8,22 +8,43 @@
  
  #include <stdint.h>
  
@@ -613,10 +613,12 @@ index 8aa49ee..ee344be 100644
  #include "core/fpdfapi/parser/cpdf_document.h"
 +#include "core/fpdfapi/parser/cpdf_object_walker.h"
 +#include "core/fpdfapi/parser/cpdf_parser.h"
++#include "core/fpdfapi/parser/cpdf_read_validator.h"
  #include "core/fpdfapi/parser/cpdf_reference.h"
 +#include "core/fpdfapi/parser/cpdf_stream.h"
  #include "core/fpdfapi/parser/cpdf_stream_acc.h"
  #include "core/fpdfapi/parser/cpdf_string.h"
++#include "core/fpdfapi/parser/cpdf_syntax_parser.h"
 +#include "core/fpdfapi/parser/fpdf_parser_utility.h"
 +#include "core/fpdfapi/render/cpdf_docrenderdata.h"
 +#include "core/fxcrt/compiler_specific.h"
@@ -631,7 +633,7 @@ index 8aa49ee..ee344be 100644
  #include "fpdfsdk/cpdfsdk_filewriteadapter.h"
  #include "fpdfsdk/cpdfsdk_helpers.h"
  #include "public/fpdf_edit.h"
-@@ -222,3 +241,708 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
+@@ -222,3 +243,731 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
                       int fileVersion) {
    return DoDocSave(document, file_write, flags, fileVersion);
  }
@@ -781,86 +783,102 @@ index 8aa49ee..ee344be 100644
 +  FX_FILESIZE offset_ = 0;
 +};
 +
++// Walks a dictionary at the parser's position ("<<" next) key by key,
++// skipping values with GetObjectBody() so strings cannot fake a key. Returns
++// the raw /Prev token as a 64-bit value (CPDF_Number cannot hold offsets of
++// 4 GB or more) and fails on /XRefStm.
++bool ReadSectionDict(CPDF_SyntaxParser* syntax,
++                     std::optional<FX_FILESIZE>* prev) {
++  if (syntax->GetNextWord().word != "<<") {
++    return false;
++  }
++  for (int keys = 0; keys < 1024; ++keys) {
++    const CPDF_SyntaxParser::WordResult key = syntax->GetNextWord();
++    if (key.word == ">>") {
++      return true;
++    }
++    if (key.word.GetLength() < 2 || key.word[0] != '/') {
++      return false;
++    }
++    if (key.word == "/XRefStm") {
++      return false;
++    }
++    if (key.word == "/Prev") {
++      const CPDF_SyntaxParser::WordResult value = syntax->GetNextWord();
++      if (!value.is_number || value.word.IsEmpty() ||
++          !FXSYS_IsDecimalDigit(value.word[0]) || value.word.GetLength() > 18) {
++        return false;
++      }
++      *prev = FXSYS_atoi64(value.word.c_str());
++      continue;
++    }
++    if (!syntax->GetObjectBody(nullptr)) {
++      return false;
++    }
++  }
++  return false;
++}
++
 +// Reads the cross-reference sections located after the original file (the
-+// update) by following the saved file's startxref/Prev chain, and records
-+// every object number they define (classic table entries, free or in use;
-+// xref stream entries of any type), and whether any of them frees it. Returns
-+// false if the chain cannot be read or uses /XRefStm. Positions are relative to
-+// the "%PDF-" header.
++// update) by following the saved file's startxref/Prev chain with a plain
++// syntax parser (no decryption), and records every object number they
++// define (classic entries, free or in use; xref stream entries of any type)
++// and whether any section frees it. The chain must end exactly at the
++// original's last cross-reference section. Positions are relative to the
++// "%PDF-" header.
 +bool CollectUpdateEntries(RetainPtr<IFX_SeekableReadStream> file,
 +                          FX_FILESIZE header_offset,
 +                          FX_FILESIZE original_size,
++                          FX_FILESIZE original_last_xref,
 +                          FX_FILESIZE last_xref,
-+                          CPDF_Document* saved_doc,
 +                          std::map<uint32_t, bool>* defined,
 +                          std::set<uint32_t>* xref_streams) {
-+  FX_SAFE_FILESIZE safe_start = header_offset;
-+  safe_start += original_size;
-+  if (!safe_start.IsValid() || file->GetSize() < safe_start.ValueOrDie()) {
-+    return false;
-+  }
-+  const FX_FILESIZE region_start = safe_start.ValueOrDie();
-+  DataVector<uint8_t> region(
-+      pdfium::checked_cast<size_t>(file->GetSize() - region_start));
-+  if (!region.empty() && !file->ReadBlockAtOffset(region, region_start)) {
-+    return false;
-+  }
-+  const pdfium::span<const uint8_t> bytes(region);
-+  size_t i = 0;
-+  auto skip_ws = [&]() {
-+    while (i < bytes.size() && PDFCharIsWhitespace(bytes[i])) {
-+      ++i;
-+    }
-+  };
-+  auto read_uint = [&](uint64_t* value) {
-+    skip_ws();
-+    const size_t begin = i;
-+    uint64_t v = 0;
-+    while (i < bytes.size() &&
-+           FXSYS_IsDecimalDigit(static_cast<char>(bytes[i])) &&
-+           i - begin < 18) {
-+      v = v * 10 + (bytes[i++] - '0');
-+    }
-+    *value = v;
-+    return i > begin;
-+  };
-+  auto starts_with = [&](size_t pos, ByteStringView word) {
-+    return pos + word.GetLength() <= bytes.size() &&
-+           std::ranges::equal(bytes.subspan(pos, word.GetLength()),
-+                              word.unsigned_span());
-+  };
-+
++  CPDF_SyntaxParser syntax(
++      pdfium::MakeRetain<CPDF_ReadValidator>(std::move(file), nullptr),
++      header_offset);
 +  // Sections are read newest first; an object freed by ANY update section
 +  // stays recorded as freed.
-+  auto record = [defined](uint32_t objnum, bool freed) {
-+    auto [it, inserted] = defined->emplace(objnum, freed);
++  auto record = [defined](uint64_t objnum, bool freed) {
++    if (objnum > CPDF_Parser::kMaxObjectNumber) {
++      return false;
++    }
++    auto [it, inserted] =
++        defined->emplace(static_cast<uint32_t>(objnum), freed);
 +    if (!inserted) {
 +      it->second = it->second || freed;
 +    }
++    return true;
 +  };
++  auto read_uint = [&syntax](uint64_t* value) {
++    const CPDF_SyntaxParser::WordResult w = syntax.GetNextWord();
++    if (!w.is_number || w.word.IsEmpty() || !FXSYS_IsDecimalDigit(w.word[0]) ||
++        w.word.GetLength() > 18) {
++      return false;
++    }
++    *value = static_cast<uint64_t>(FXSYS_atoi64(w.word.c_str()));
++    return true;
++  };
++
 +  std::set<FX_FILESIZE> visited;
 +  FX_FILESIZE pos = last_xref;
 +  while (pos >= original_size) {
-+    if (!visited.insert(pos).second || visited.size() > 1024) {
-+      return false;
-+    }
-+    i = static_cast<size_t>(pos - original_size);
-+    skip_ws();
-+    if (i >= bytes.size()) {
++    if (pos >= syntax.GetDocumentSize() || !visited.insert(pos).second ||
++        visited.size() > 1024) {
 +      return false;
 +    }
 +    std::optional<FX_FILESIZE> prev;
-+    if (starts_with(i, "xref")) {
-+      i += 4;
++    syntax.SetPos(pos);
++    const CPDF_SyntaxParser::WordResult first = syntax.GetNextWord();
++    if (first.word == "xref") {
 +      while (true) {
-+        skip_ws();
-+        if (starts_with(i, "trailer")) {
++        if (syntax.PeekNextWord() == "trailer") {
++          syntax.GetNextWord();
 +          break;
 +        }
 +        uint64_t start = 0;
 +        uint64_t count = 0;
 +        if (!read_uint(&start) || !read_uint(&count) ||
-+            start + count > CPDF_Parser::kMaxObjectNumber + 1) {
++            start + count > uint64_t{CPDF_Parser::kMaxObjectNumber} + 1) {
 +          return false;
 +        }
 +        for (uint64_t k = 0; k < count; ++k) {
@@ -869,103 +887,110 @@ index 8aa49ee..ee344be 100644
 +          if (!read_uint(&offset) || !read_uint(&gen)) {
 +            return false;
 +          }
-+          skip_ws();
-+          if (i >= bytes.size() || (bytes[i] != 'n' && bytes[i] != 'f')) {
++          const ByteString type = syntax.GetNextWord().word;
++          if ((type != "n" && type != "f") || !record(start + k, type == "f")) {
 +            return false;
 +          }
-+          record(static_cast<uint32_t>(start + k), bytes[i++] == 'f');
 +        }
 +      }
-+      // The trailer dictionary ends before the next "startxref".
-+      const size_t trailer_begin = i;
-+      size_t trailer_end = trailer_begin;
-+      while (trailer_end < bytes.size() &&
-+             !starts_with(trailer_end, "startxref")) {
-+        ++trailer_end;
-+      }
-+      for (size_t k = trailer_begin; k < trailer_end; ++k) {
-+        if (starts_with(k, "/XRefStm")) {
-+          return false;
-+        }
-+        if (starts_with(k, "/Prev") && k + 5 < bytes.size() &&
-+            !PDFCharIsOther(bytes[k + 5])) {
-+          i = k + 5;
-+          uint64_t value = 0;
-+          if (!read_uint(&value)) {
-+            return false;
-+          }
-+          prev = static_cast<FX_FILESIZE>(value);
-+        }
-+      }
-+    } else {
-+      uint64_t objnum = 0;
-+      uint64_t gen = 0;
-+      if (!read_uint(&objnum) || !read_uint(&gen) ||
-+          objnum > CPDF_Parser::kMaxObjectNumber) {
++      if (!ReadSectionDict(&syntax, &prev)) {
 +        return false;
 +      }
-+      RetainPtr<const CPDF_Object> obj =
-+          saved_doc->GetOrParseIndirectObject(static_cast<uint32_t>(objnum));
++    } else {
++      // An xref stream: "N G obj" exactly at `pos`, /Type /XRef. Parsed
++      // without decryption (xref streams are never encrypted).
++      uint64_t objnum = 0;
++      uint64_t gen = 0;
++      if (!first.is_number || first.word.IsEmpty() ||
++          !FXSYS_IsDecimalDigit(first.word[0]) || first.word.GetLength() > 10) {
++        return false;
++      }
++      objnum = static_cast<uint64_t>(FXSYS_atoi64(first.word.c_str()));
++      if (objnum == 0 || objnum > CPDF_Parser::kMaxObjectNumber ||
++          !read_uint(&gen) || gen != 0 || syntax.GetKeyword() != "obj" ||
++          !ReadSectionDict(&syntax, &prev)) {
++        return false;
++      }
++      syntax.SetPos(pos);
++      RetainPtr<CPDF_Object> obj = syntax.GetIndirectObject(
++          nullptr, CPDF_SyntaxParser::ParseType::kStrict);
 +      const CPDF_Stream* stream = obj ? obj->AsStream() : nullptr;
 +      RetainPtr<const CPDF_Dictionary> dict =
 +          stream ? stream->GetDict() : nullptr;
-+      if (!dict || dict->GetNameFor("Type") != "XRef" ||
-+          dict->KeyExist("XRefStm")) {
++      if (!dict || obj->GetObjNum() != objnum || obj->GetGenNum() != 0 ||
++          dict->GetNameFor("Type") != "XRef") {
 +        return false;
 +      }
 +      xref_streams->insert(static_cast<uint32_t>(objnum));
 +      RetainPtr<const CPDF_Array> w = dict->GetArrayFor("W");
-+      if (!w || w->size() < 3) {
++      if (!w || w->size() != 3) {
 +        return false;
 +      }
 +      std::array<uint32_t, 3> widths;
 +      uint32_t row = 0;
 +      for (size_t k = 0; k < 3; ++k) {
 +        const int width = w->GetIntegerAt(k);
-+        if (width < 0 || width > 8) {
++        if (width < 0 || width > (k == 0 ? 4 : 8)) {
 +          return false;
 +        }
 +        widths[k] = static_cast<uint32_t>(width);
 +        row += widths[k];
 +      }
-+      std::vector<std::pair<uint32_t, uint32_t>> sections;
++      if (row == 0) {
++        return false;
++      }
++      std::vector<std::pair<uint64_t, uint64_t>> sections;
 +      RetainPtr<const CPDF_Array> index = dict->GetArrayFor("Index");
 +      if (index) {
-+        for (size_t k = 0; k + 1 < index->size(); k += 2) {
-+          sections.emplace_back(index->GetIntegerAt(k),
-+                                index->GetIntegerAt(k + 1));
++        if (index->size() % 2 != 0) {
++          return false;
++        }
++        for (size_t k = 0; k < index->size(); k += 2) {
++          const int first_num = index->GetIntegerAt(k);
++          const int count = index->GetIntegerAt(k + 1);
++          if (first_num < 0 || count < 0) {
++            return false;
++          }
++          sections.emplace_back(first_num, count);
 +        }
 +      } else {
-+        sections.emplace_back(0, dict->GetIntegerFor("Size"));
++        const int size = dict->GetIntegerFor("Size");
++        if (size < 0) {
++          return false;
++        }
++        sections.emplace_back(0, size);
 +      }
 +      auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(stream));
 +      acc->LoadAllDataFiltered();
 +      pdfium::span<const uint8_t> data = acc->GetSpan();
 +      size_t at = 0;
-+      for (const auto& [first, count] : sections) {
-+        for (uint32_t k = 0; k < count; ++k) {
-+          if (row == 0 || at + row > data.size() ||
-+              uint64_t{first} + k > CPDF_Parser::kMaxObjectNumber) {
++      for (const auto& [first_num, count] : sections) {
++        for (uint64_t k = 0; k < count; ++k) {
++          if (at + row > data.size()) {
 +            return false;
 +          }
 +          uint32_t type = widths[0] ? 0 : 1;
 +          for (uint32_t b = 0; b < widths[0]; ++b) {
 +            type = (type << 8) | data[at + b];
 +          }
-+          record(first + k, type == 0);
++          if (!record(first_num + k, type == 0)) {
++            return false;
++          }
 +          at += row;
 +        }
 +      }
-+      if (dict->KeyExist("Prev")) {
-+        prev = dict->GetIntegerFor("Prev");
++      if (at != data.size()) {
++        return false;  // Trailing bytes after the last row.
 +      }
 +    }
 +    if (!prev.has_value()) {
-+      break;
++      return false;  // An update must chain to the original.
 +    }
 +    pos = prev.value();
 +  }
-+  return true;
++  // Leaving the update, the chain must land exactly on the original's last
++  // cross-reference section.
++  return pos == original_last_xref;
 +}
 +
 +class SaveVerifier {
@@ -1306,10 +1331,10 @@ index 8aa49ee..ee344be 100644
 +  //    other readers delete those objects.
 +  std::map<uint32_t, bool> defined;  // objnum -> freed by the update
 +  std::set<uint32_t> update_xref_streams;
-+  if (!CollectUpdateEntries(saved_file, parser->GetHeaderOffsetInFile(),
-+                            parser->GetDocumentSize(),
-+                            saved_parser->GetLastXRefOffset(), saved_doc.get(),
-+                            &defined, &update_xref_streams)) {
++  if (!CollectUpdateEntries(
++          saved_file, parser->GetHeaderOffsetInFile(),
++          parser->GetDocumentSize(), parser->GetLastXRefOffset(),
++          saved_parser->GetLastXRefOffset(), &defined, &update_xref_streams)) {
 +    return false;
 +  }
 +  for (const auto& [objnum, freed] : defined) {
