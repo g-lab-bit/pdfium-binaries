@@ -1,5 +1,5 @@
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index 7ee8a63..258124e 100644
+index 7ee8a63..2c31052 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -18,6 +18,8 @@
@@ -11,12 +11,24 @@ index 7ee8a63..258124e 100644
  #include "core/fpdfapi/page/cpdf_form.h"
  #include "core/fpdfapi/page/cpdf_page.h"
  #include "core/fpdfapi/page/cpdf_pageobject.h"
-@@ -2130,3 +2132,90 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
+@@ -2130,3 +2132,174 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
    }
    return static_cast<int>(numbers.size());
  }
 +
 +// g-lab-bit fork (annot_ap_oc.patch).
++namespace {
++
++constexpr char kOCPropertyPrefix[] = "RpOC";
++
++// The object number `value` refers to, or 0 if it is not a reference.
++uint32_t RefObjNum(const CPDF_Object* value) {
++  const CPDF_Reference* ref = ToReference(value);
++  return ref ? ref->GetRefObjNum() : 0;
++}
++
++}  // namespace
++
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
 +                               FPDF_ANNOTATION annot,
@@ -32,15 +44,22 @@ index 7ee8a63..258124e 100644
 +      !FPDFAnnot_IsObjectSupportedSubtype(FPDFAnnot_GetSubtype(annot))) {
 +    return false;
 +  }
++  // The appearance must look like one FPDFAnnot_AppendObject() builds: a
++  // direct /AP dictionary whose /N refers to a stream with direct /Resources.
 +  RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
-+  RetainPtr<CPDF_Stream> stream =
-+      GetAnnotAP(annot_dict.Get(), CPDF_Annot::AppearanceMode::kNormal);
-+  // The AP must have its own /Resources (FPDFAnnot_AppendObject creates
-+  // them); adding one would cut it off from names it may inherit.
-+  RetainPtr<CPDF_Dictionary> resources =
-+      stream ? stream->GetMutableDict()->GetMutableDictFor("Resources")
-+             : nullptr;
-+  if (!resources) {
++  RetainPtr<CPDF_Object> ap_object =
++      annot_dict ? annot_dict->GetMutableObjectFor("AP") : nullptr;
++  CPDF_Dictionary* ap_dict =
++      ap_object ? ap_object->AsMutableDictionary() : nullptr;
++  const uint32_t old_stream_objnum =
++      ap_dict ? RefObjNum(ap_dict->GetObjectFor("N").Get()) : 0;
++  RetainPtr<CPDF_Stream> old_stream =
++      old_stream_objnum
++          ? ToStream(doc->GetOrParseIndirectObject(old_stream_objnum))
++          : nullptr;
++  RetainPtr<const CPDF_Object> old_resources =
++      old_stream ? old_stream->GetDict()->GetObjectFor("Resources") : nullptr;
++  if (!old_resources || !old_resources->IsDictionary()) {
 +    return false;
 +  }
 +
@@ -70,23 +89,60 @@ index 7ee8a63..258124e 100644
 +  }
 +
 +  if (!context->HasForm()) {
-+    context->SetForm(stream);
++    context->SetForm(old_stream);
 +  }
 +  CPDF_Form* form = context->GetForm();
++  RetainPtr<CPDF_Dictionary> form_resources = form->GetMutableResources();
++  if (!form_resources) {
++    return false;
++  }
 +
-+  // One /Properties entry per group, then nested /OC marks on every object
-+  // of the appearance, outermost first (ocg_indices[0]); the content
-+  // generator writes them as "/OC /OCGn BDC ... EMC".
-+  std::vector<ByteString> names;
-+  RetainPtr<CPDF_Dictionary> properties;
-+  if (!objnums.empty()) {
-+    properties = resources->GetOrCreateDictFor("Properties");
-+    for (uint32_t objnum : objnums) {
-+      ByteString name = ByteString::Format("OCG%u", objnum);
-+      properties->SetNewFor<CPDF_Reference>(name, doc, objnum);
-+      names.push_back(std::move(name));
++  // The new /Properties: a direct copy of the current one (never modified in
++  // place). An entry is reused only if it already refers to the group;
++  // entries this API added before (/RpOC<n> referring to an OCG) that are no
++  // longer wanted are dropped; new entries get an unused /RpOC<n> name.
++  auto properties = doc->New<CPDF_Dictionary>();
++  RetainPtr<const CPDF_Dictionary> current_properties =
++      form_resources->GetDictFor("Properties");
++  if (current_properties) {
++    CPDF_DictionaryLocker locker(current_properties);
++    for (const auto& [key, value] : locker) {
++      const uint32_t target = RefObjNum(value.Get());
++      if (target && key.First(4) == kOCPropertyPrefix &&
++          !pdfium::Contains(objnums, target)) {
++        RetainPtr<const CPDF_Dictionary> target_dict =
++            ToDictionary(doc->GetOrParseIndirectObject(target));
++        if (target_dict && target_dict->GetNameFor("Type") == "OCG") {
++          continue;  // Stale entry of ours.
++        }
++      }
++      properties->SetFor(key, value->Clone());
 +    }
 +  }
++  std::vector<ByteString> names;
++  for (uint32_t objnum : objnums) {
++    ByteString name;
++    {
++      CPDF_DictionaryLocker locker(properties);
++      for (const auto& [key, value] : locker) {
++        if (RefObjNum(value.Get()) == objnum) {
++          name = key;
++          break;
++        }
++      }
++    }
++    for (uint32_t n = 1; name.IsEmpty(); ++n) {
++      ByteString candidate = ByteString::Format("%s%u", kOCPropertyPrefix, n);
++      if (!properties->KeyExist(candidate.AsStringView())) {
++        name = candidate;
++        properties->SetNewFor<CPDF_Reference>(name, doc, objnum);
++      }
++    }
++    names.push_back(std::move(name));
++  }
++
++  // Nested /OC marks on every object of the appearance, outermost first
++  // (ocg_indices[0]); the content generator writes "/OC /<name> BDC".
 +  for (auto& page_object : *form) {
 +    CPDF_ContentMarks* marks = page_object->GetContentMarks();
 +    for (size_t i = marks->CountItems(); i > 0; --i) {
@@ -99,38 +155,81 @@ index 7ee8a63..258124e 100644
 +      marks->AddMarkWithPropertiesHolder("OC", properties, name);
 +    }
 +  }
-+  UpdateContentStream(form, stream.Get());
++
++  // The marked appearance goes into a NEW stream object (so an incremental
++  // save writes it as a new object reachable from the annotation), and
++  // /AP /N is repointed. The old stream is left untouched.
++  auto new_dict = doc->New<CPDF_Dictionary>();
++  {
++    CPDF_DictionaryLocker locker(old_stream->GetDict());
++    for (const auto& [key, value] : locker) {
++      if (key != "Length" && key != "Filter" && key != "DecodeParms" &&
++          key != "DL" && key != "Resources") {
++        new_dict->SetFor(key, value->Clone());
++      }
++    }
++  }
++  auto new_stream = doc->NewIndirect<CPDF_Stream>(new_dict);
++  UpdateContentStream(form, new_stream.Get());
++  // Resources after generation, so they include anything it realized.
++  RetainPtr<CPDF_Dictionary> new_resources =
++      ToDictionary(form_resources->Clone());
++  if (!new_resources) {
++    return false;
++  }
++  if (properties->IsEmpty()) {
++    new_resources->RemoveFor("Properties");
++  } else {
++    new_resources->SetFor("Properties", properties);
++  }
++  new_dict->SetFor("Resources", new_resources);
++  ap_dict->SetNewFor<CPDF_Reference>("N", doc, new_stream->GetObjNum());
 +  return true;
 +}
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index 1b9f81d..00f9ebf 100644
+index 1b9f81d..af929ee 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
-@@ -259,6 +259,36 @@ FPDFAnnot_RemoveInkList(FPDF_ANNOTATION annot);
+@@ -259,6 +259,51 @@ FPDFAnnot_RemoveInkList(FPDF_ANNOTATION annot);
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
  FPDFAnnot_AppendObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj);
  
 +// g-lab-bit fork (annot_ap_oc.patch)
 +// Experimental API.
-+// Put the appearance stream content of |annot| under optional content: every
-+// object of the normal appearance gets nested marked content
-+//   /OC /OCGn BDC ... EMC
++// Put the normal appearance of |annot| under optional content: every object
++// of the appearance gets nested marked content
++//   /OC /<name> BDC ... EMC
 +// one level per OCG in |ocg_indices| (indices into /OCProperties /OCGs;
 +// ocg_indices[0] is the outermost, e.g. the top ancestor layer; duplicates
-+// are ignored), and the appearance's /Resources get /Properties entries
-+// referencing the groups. Viewers that ignore annotation /OC but honour marked
-+// content (PDFium, PDFKit) then hide the markup when ANY of the groups is off,
-+// through /OCProperties /D or FPDFDoc_SetOCGViewState(). Use together with
++// are ignored). Viewers that honour marked content in appearances (PDFium,
++// pdf.js) then hide the markup when ANY of the groups is off, through
++// /OCProperties /D or FPDFDoc_SetOCGViewState(). Use together with
 +// FPDFAnnot_SetOCMembership() for readers that use annotation /OC.
++// PDFKit ignores optional content in annotation appearances.
++//
++// ONLY for appearances built with FPDFAnnot_AppendObject(): the appearance is
++// re-serialised from PDFium's page objects, which can lose content another
++// producer wrote. To rebuild an appearance of an annotation already in the
++// file without modifying its existing stream object, call
++// FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, NULL) on a freshly
++// obtained annotation handle, then FPDFAnnot_AppendObject().
++//
++// The marked appearance is written to a NEW stream object and /AP /N is
++// repointed to it (the previous stream is left untouched and unreferenced),
++// so FPDF_SaveIncrementalObjects() writes it as a new object reachable from
++// the annotation (list the annotation or its /Annots holder). /Properties
++// entries in the new stream's /Resources: an existing entry is reused only if
++// it already refers to the group; new entries are named /RpOC<n> (an unused
++// name); /RpOC<n> entries referring to an OCG that is no longer in the set are
++// removed.
 +//   appearance_mode - only FPDF_ANNOT_APPEARANCEMODE_NORMAL is supported.
 +//   count           - 0 removes the /OC marks.
-+// The appearance is regenerated from its page objects (as
-+// FPDFAnnot_UpdateObject() does); existing /OC marks are replaced, other marks
-+// are kept (the /OC levels are added inside them). Objects appended later
-+// with FPDFAnnot_AppendObject() are not marked: call this again afterwards.
-+// Supported for the subtypes FPDFAnnot_AppendObject() supports. Fails, without
-+// changing anything, for an invalid index, a direct OCG, or an appearance
-+// without its own /Resources.
++// Existing /OC marks are replaced, other marks are kept (the /OC levels are
++// added inside them). Objects appended later with FPDFAnnot_AppendObject()
++// are not marked: call this again afterwards. Supported for the subtypes
++// FPDFAnnot_AppendObject() supports. Fails, without changing anything, for an
++// invalid index, a direct OCG, an /AP that is not a direct dictionary whose
++// /N refers to a stream, or a stream without direct /Resources.
 +// FPDFDoc_DeleteOCG() does not remove these marks: re-mark the annotation
 +// before deleting a group it uses.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
