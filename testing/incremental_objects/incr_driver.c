@@ -25,6 +25,11 @@
 //   --avail   : load through FPDFAvail (all data available) instead of
 //               FPDF_LoadMemDocument64.
 //   --render  : render PAGE with annotations before editing.
+//   Every successful save is checked with FPDF_VerifyIncrementalSave on the
+//   same open document ("verify", "mismatch", "verify_ms" in RESULT).
+//   --corrupt nm|startxref: verify a corrupted copy instead (the update's
+//               first "incr-real-" becomes "incr-REAL-", or the final
+//               startxref value is incremented); OUT stays uncorrupted.
 //   --fail-after N: the FPDF_FILEWRITE refuses any block that would take the
 //               output past N bytes (write-failure tests; PDFium buffers
 //               32 KiB, so small files only write in the final flush).
@@ -177,6 +182,56 @@ static int Save(FPDF_DOCUMENT doc, const uint32_t* l, size_t n, MemWriter* w,
   return ok;
 }
 
+static const char* g_corrupt = NULL;
+
+// FPDF_VerifyIncrementalSave on a copy of `data` (optionally corrupted).
+static int Verify(FPDF_DOCUMENT doc, const unsigned char* data, size_t len,
+                  size_t orig_len, uint32_t* mismatch, double* ms) {
+  unsigned char* copy = malloc(len ? len : 1);
+  memcpy(copy, data, len);
+  if (g_corrupt && !strcmp(g_corrupt, "nm")) {
+    int done = 0;
+    for (size_t i = orig_len; i + 10 <= len && !done; ++i) {
+      if (!memcmp(copy + i, "incr-real-", 10)) {
+        memcpy(copy + i, "incr-REAL-", 10);
+        done = 1;
+      }
+    }
+    // Encrypted file: the /NM string is ciphertext. Flip one byte inside
+    // it (past the AES IV), avoiding string delimiters and escapes.
+    for (size_t i = orig_len; i + 4 <= len && !done; ++i) {
+      if (memcmp(copy + i, "/NM(", 4)) continue;
+      for (size_t p = i + 4 + 20; p < len; ++p) {
+        unsigned char c = copy[p], f = c ^ 1;
+        if (strchr("()\\", c) || strchr("()\\", f) || copy[p - 1] == '\\' ||
+            c == 0 || f == 0)
+          continue;
+        copy[p] = f;
+        done = 1;
+        break;
+      }
+    }
+  } else if (g_corrupt && !strcmp(g_corrupt, "startxref")) {
+    for (size_t i = len; i-- > 9;) {
+      if (!memcmp(copy + i - 9, "startxref", 9)) {
+        size_t j = i;
+        while (j < len && (copy[j] < '0' || copy[j] > '9')) ++j;
+        size_t k = j;
+        while (k < len && copy[k] >= '0' && copy[k] <= '9') ++k;
+        if (k > j) copy[k - 1] = copy[k - 1] == '9' ? '0' : copy[k - 1] + 1;
+        break;
+      }
+    }
+  }
+  Buf b = {copy, len};
+  FPDF_FILEACCESS acc = {(unsigned long)len, GetBlock, &b};
+  double t0 = NowMs();
+  int ok = FPDF_VerifyIncrementalSave(doc, &acc, mismatch);
+  *ms = NowMs() - t0;
+  free(copy);
+  return ok;
+}
+
 // session mode (see header). Prints its own RESULT.
 static int Session(const unsigned char* in, size_t len, const char* out,
                    const float rect[4], const char* pw, int avail) {
@@ -190,7 +245,10 @@ static int Session(const unsigned char* in, size_t len, const char* out,
   FPDF_PAGE p0 = FPDF_LoadPage(doc, 0);
   L[0] = AddSquare(p0, rect, "session-p0", NULL);
   FPDF_ClosePage(p0);
+  uint32_t mm1 = 0, mm2 = 0, mm3 = 0;
+  double vms;
   int s1 = Save(doc, L, 1, &w, &ms);
+  int v1 = s1 && Verify(doc, w.data, w.len, len, &mm1, &vms);
   snprintf(path, sizeof path, "%s.s1.pdf", out);
   if (s1) WriteAll(path, w.data, w.len);
   free(w.data);
@@ -202,6 +260,7 @@ static int Session(const unsigned char* in, size_t len, const char* out,
   L[2] = FPDFPage_GetObjectNumber(p2);
   FPDF_ClosePage(p2);
   int s2 = Save(doc, L, 3, &w, &ms);  // cumulative L1+L2+L3
+  int v2 = s2 && Verify(doc, w.data, w.len, len, &mm2, &vms);
   snprintf(path, sizeof path, "%s.s2.pdf", out);
   if (s2) WriteAll(path, w.data, w.len);
   free(w.data);
@@ -209,14 +268,18 @@ static int Session(const unsigned char* in, size_t len, const char* out,
   size_t only_len = w.len;
   free(w.data);
   int s2_nol3 = Save(doc, L, 2, &w, &ms);  // L1+L2, rotation not listed
+  int v3 = s2_nol3 && Verify(doc, w.data, w.len, len, &mm3, &vms);
   snprintf(path, sizeof path, "%s.s2_noL3.pdf", out);
   if (s2_nol3) WriteAll(path, w.data, w.len);
   free(w.data);
   Close(doc);
   printf("RESULT {\"mode\":\"session\",\"L\":[%u,%u,%u],\"s1\":%d,"
          "\"s2_cumulative\":%d,\"s2_only_L2L3\":%d,\"s2_only_bytes\":%zu,"
-         "\"s2_noL3\":%d,\"status\":\"ok\"}\n",
-         L[0], L[1], L[2], s1, s2, s2_only, only_len, s2_nol3);
+         "\"s2_noL3\":%d,\"verify_s1\":%d,\"mismatch_s1\":%u,"
+         "\"verify_s2\":%d,\"mismatch_s2\":%u,\"verify_s2_noL3\":%d,"
+         "\"mismatch_s2_noL3\":%u,\"status\":\"ok\"}\n",
+         L[0], L[1], L[2], s1, s2, s2_only, only_len, s2_nol3, v1, mm1, v2,
+         mm2, v3, mm3);
   return 0;
 }
 
@@ -289,12 +352,17 @@ static int OneSave(const unsigned char* in, size_t in_len, int page_no,
   MemWriter w;
   double ms;
   FPDF_BOOL ok = Save(doc, objnums, n, &w, &ms);
+  uint32_t mismatch = 0;
+  double vms = 0;
+  int verified = ok && Verify(doc, w.data, w.len, in_len, &mismatch, &vms);
   Close(doc);
   int pos = snprintf(info, info_cap,
                      "\"ok\":%s,\"save_ms\":%.2f,\"page_objnum\":%u,"
                      "\"annots_objnum\":%u,\"avail_linearized\":%d,"
-                     "\"bytes_written\":%zu,\"objnums\":[",
-                     ok ? "true" : "false", ms, page_num, annots_num, lin, w.len);
+                     "\"bytes_written\":%zu,\"verify\":%s,\"mismatch\":%u,"
+                     "\"verify_ms\":%.2f,\"objnums\":[",
+                     ok ? "true" : "false", ms, page_num, annots_num, lin, w.len,
+                     verified ? "true" : "false", mismatch, vms);
   for (size_t i = 0; i < n && pos < (int)info_cap; ++i)
     pos += snprintf(info + pos, info_cap - pos, "%s%u", i ? "," : "", objnums[i]);
   if (pos < (int)info_cap) snprintf(info + pos, info_cap - pos, "]");
@@ -325,6 +393,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[i], "--mode")) mode = argv[++i];
     else if (!strcmp(argv[i], "--repeat")) repeat = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--password")) pw = argv[++i];
+    else if (!strcmp(argv[i], "--corrupt")) g_corrupt = argv[++i];
     else if (!strcmp(argv[i], "--fail-after"))
       g_fail_after = (size_t)strtoull(argv[++i], NULL, 10);
     else if (!strcmp(argv[i], "--list")) {

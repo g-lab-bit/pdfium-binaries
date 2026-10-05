@@ -126,6 +126,9 @@ p = pikepdf.open(os.path.join(OUT, "enc_aes128_metadata.pdf"))
 open(os.path.join(OUT, "enc_aes128_metadata.nums"), "w").write(
     "%d %d\n" % (p.Root.Metadata.objgen[0], p.trailer.Encrypt.objgen[0]))
 pikepdf.open(os.path.join(OUT, "basic_classic.pdf")).save(
+    os.path.join(OUT, "enc_rc4_r3.pdf"),
+    encryption=pikepdf.Encryption(user="", owner="owner", R=3, aes=False, metadata=False))
+pikepdf.open(os.path.join(OUT, "basic_classic.pdf")).save(
     os.path.join(OUT, "enc_aes256_r6.pdf"),
     encryption=pikepdf.Encryption(user="", owner="owner", R=6))
 subprocess.run([QPDF, "--linearize", os.path.join(OUT, "basic_classic.pdf"),

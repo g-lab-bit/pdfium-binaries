@@ -79,6 +79,21 @@ def qpdf_ok(path):
     return r.returncode in (0, 3)  # 3 = warnings only
 
 
+def verify_checks(res, extra):
+    """FPDF_VerifyIncrementalSave result of every save of a case."""
+    msgs = []
+    want = extra.get("verify", True)
+    for i, sv in enumerate(res.get("saves", [])):
+        if sv.get("verify") is not want:
+            msgs.append("save %d: verify=%s, expected %s (mismatch %s)"
+                        % (i, sv.get("verify"), want, sv.get("mismatch")))
+        elif not want:
+            exp = sv["objnums"][0] if extra.get("mismatch") == "holder" else extra.get("mismatch")
+            if sv.get("mismatch") != exp:
+                msgs.append("first_mismatch %s, expected %s" % (sv.get("mismatch"), exp))
+    return msgs
+
+
 def verify_ok(fixture, out, res, new, extra):
     """Checks for a successful save; returns a list of failure messages."""
     msgs = []
@@ -133,6 +148,16 @@ def main():
         ("edit_xrefstm", "basic_xrefstm.pdf", E, "ok", [0], {"kind": "stream"}),
         ("edit_hybrid", "hybrid_xrefstm.pdf", E, "ok", [0], {"kind": "table"}),
         ("edit_aes256_r6", "enc_aes256_r6.pdf", E, "ok", [0], {}),
+        ("edit_rc4_r3", "enc_rc4_r3.pdf", E, "ok", [0], {}),
+        # FPDF_VerifyIncrementalSave on a corrupted copy of the saved file
+        ("verify_corrupt_value_classic", "basic_classic.pdf", E + ["--corrupt", "nm"], "ok", [0],
+         {"verify": False, "mismatch": "holder"}),
+        ("verify_corrupt_value_xrefstm", "basic_xrefstm.pdf", E + ["--corrupt", "nm"], "ok", [0],
+         {"verify": False, "mismatch": "holder"}),
+        ("verify_corrupt_startxref", "basic_classic.pdf", E + ["--corrupt", "startxref"], "ok", [0],
+         {"verify": False, "mismatch": 0}),
+        ("verify_corrupt_value_aes256", "enc_aes256_r6.pdf", E + ["--corrupt", "nm"], "ok", [0],
+         {"verify": False, "mismatch": "holder"}),
         ("edit_aes128_metadata", "enc_aes128_metadata.pdf", E, "ok", [0], {}),
         ("repeat3_xrefstm", "basic_xrefstm.pdf", E + ["--repeat", "3"], "ok", [0], {"sections": 3}),
         ("repeat3_classic", "basic_classic.pdf", E + ["--repeat", "3"], "ok", [0], {"sections": 3}),
@@ -201,6 +226,7 @@ def main():
                 msgs.append("output written on refusal")
         if status == "ok" == expect:
             msgs += verify_ok(fx, out, res, new, extra)
+            msgs += verify_checks(res, extra)
         report(name, status, msgs)
 
     # Writer failures: the FPDF_FILEWRITE fails once the output would pass N
@@ -242,7 +268,12 @@ def main():
     if res.get("s2_only_L2L3") != 0 or res.get("s2_only_bytes") != 0:
         msgs.append("L2+L3-only save was not refused before writing")
     if not (res.get("s2_noL3") == 1 and b"session-p0" in nol3 and not rot(nol3)):
-        msgs.append("unlisted rotation was expected to be silently lost")
+        msgs.append("unlisted rotation was expected to be lost by the save")
+    if not (res.get("verify_s1") == 1 and res.get("verify_s2") == 1):
+        msgs.append("verify of a complete save was not TRUE")
+    if not (res.get("verify_s2_noL3") == 0 and res.get("mismatch_s2_noL3") == res.get("L", [0, 0, 0])[2]):
+        msgs.append("verify did not catch the unlisted rotation at the page (got %s/%s)"
+                    % (res.get("verify_s2_noL3"), res.get("mismatch_s2_noL3")))
     for p in (base + ".s1.pdf", base + ".s2.pdf"):
         c = check(os.path.join(FIX, "basic_classic.pdf"), p) if os.path.exists(p) else {}
         if not (c.get("prefix") and c.get("entries_ok") and c.get("id0_same") and qpdf_ok(p)):
