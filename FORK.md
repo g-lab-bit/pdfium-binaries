@@ -323,3 +323,53 @@ annotation dictionary, e.g. /C or /IC, whether or not /AP exists. Upstream
 
 Tests: `testing/annot_number_array/run_tests.py PDFIUM_DIR` (14 cases, including
 non-mutation).
+
+---
+
+## 13. `ocg_view_state.patch` (fork-p9): render-only layer visibility
+
+`FPDFDoc_SetOCGViewState(doc, ocg_index, state)` with state -1 (follow /D),
+0 (hidden) or 1 (visible); `FPDFDoc_GetOCGViewState`;
+`FPDFDoc_ClearOCGViewState`.
+
+- The override is held on `CPDF_Document`, keyed by OCG object number. It is never
+  written to /OCProperties or any dictionary, so saves, incremental saves and
+  verify are unaffected (tested).
+- It applies in `CPDF_OCContext::GetOCGVisible` for the "View" usage only. That
+  covers page content, marked content in annotation appearances, and OCMDs. Every
+  render entry point builds its context the same way
+  (`CPDFSDK_RenderPageWithContext`, so FPDF_RenderPageBitmap[_Start/Continue] and the
+  LOD paths; also FPDF_FFLDraw).
+- Rendering with FPDF_PRINTING (usage "Print") still follows the document.
+- A context caches each group's state at first use; a change shows from the next
+  render.
+- Not thread-safe; serialise with renders (Rapida's global PDFium lock).
+
+## 14. `annot_ocmd.patch` (fork-p9): `FPDFAnnot_SetOCMembership`
+
+`FPDFAnnot_SetOCMembership(doc, annot, ocg_indices, count)`:
+
+- one distinct OCG → /OC is a reference to it;
+- more → a new indirect `<< /Type /OCMD /OCGs [...] /P /AllOn >>` (never reused,
+  so annotations never alias an OCMD);
+- count 0 → /OC is removed.
+
+Indices are validated before anything changes. `FPDFDoc_DeleteOCG` prunes a
+deleted group from such an OCMD and removes /OC once none is left (tested).
+
+## 15. `annot_ap_oc.patch` (fork-p9): `FPDFAnnot_SetAPOptionalContent`
+
+`FPDFAnnot_SetAPOptionalContent(doc, annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+ocg_indices, count)`:
+
+- Puts nested `/OC /OCGn BDC … EMC` marks, outermost = `ocg_indices[0]`, on every
+  object of the normal appearance, with /Properties in the appearance's
+  /Resources, and regenerates the stream.
+- count 0 removes the marks. Objects appended later need a new call.
+- `FPDFDoc_DeleteOCG` does not remove these marks.
+
+Readers: PDFium and pdf.js hide the markup when any group is off. PDFKit
+ignores optional content in annotation appearances entirely (marked content,
+AP /OC, inner form /OC: tested).
+
+Tests: `testing/ocg_layers/run_tests.py PDFIUM_DIR` (31 cases).
