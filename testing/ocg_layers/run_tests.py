@@ -258,6 +258,57 @@ def main():
           r.get("verify") == 1 and marks == [] and sorted(names) == ["Foo", "RpOC1"],
           "%s %s %s" % (json.dumps(r), names, marks))
 
+    # --- the form follows the new stream; the old stream is never touched ---
+    def stream_snapshot(path, objnum):
+        pdf = pikepdf.open(path)
+        obj = pdf.get_object(objnum, 0)
+        return pdf, obj.read_raw_bytes(), repr(dict(obj.stream_dict.items()))
+
+    rich = os.path.join(WORK, "rich.pdf")
+    r = drv("rich", raw, rich)
+    check("rich fixture (transparent path + text, unmarked)", r.get("rich") == 1, json.dumps(r))
+    rich_pdf, _, ap0, _, _ = ap_info(rich)  # keep the Pdf alive
+    old_num = ap0.objgen[0]
+    _, old_data, old_dict = stream_snapshot(rich, old_num)
+
+    # (1) mark, then append text + change opacity WITHOUT re-marking
+    out = os.path.join(WORK, "markappend.pdf")
+    r = drv("markappend", files["all_on"], out, "0", "1")
+    check("mark then append/update without re-marking: incremental + verify TRUE",
+          all(r.get(k) == 1 for k in ("marked", "appended", "updated", "saved", "verify")), json.dumps(r))
+    pdf, a, ap, names, marks = ap_info(out)
+    res = ap.Resources
+    data = ap.read_bytes()
+    check("  new stream holds the Font and ExtGState it uses",
+          "/Font" in res and "/ExtGState" in res and b"Tf" in data and b" gs" in data,
+          "%s %r" % (list(res.keys()), data[:160]))
+    first_pdf = pikepdf.open(files["all_on"])
+    first_ap = first_pdf.pages[0].Annots[0].AP.N
+    _, d2, dict2 = stream_snapshot(out, first_ap.objgen[0])
+    check("  original stream unchanged (data and dictionary)",
+          ap.objgen != first_ap.objgen and d2 == first_ap.read_raw_bytes()
+          and dict2 == repr(dict(first_ap.stream_dict.items())), "objgen %s" % (ap.objgen,))
+    for states, exp in (([], [255, 127, 127]), (["1=0"], WHITE)):
+        rr = drv("render", out, *states)
+        px = rr.get("annot", [0, 0, 0])
+        ok = (px == WHITE) if exp == WHITE else (px[0] == 255 and 110 <= px[1] <= 145 and 110 <= px[2] <= 145)
+        check("  render markappend %s (semi-transparent red / hidden)" % (" ".join(states) or "-"), ok, json.dumps(rr))
+
+    # (2) reloaded appearance that needs resources, re-marked: generation
+    # realises them in the new stream; the original stream is unchanged
+    out = os.path.join(WORK, "rich_marked.pdf")
+    r = drv("incr", rich, out, "reloaded", "0", "1")
+    check("reloaded appearance needing resources: incremental + verify TRUE",
+          r.get("saved") == 1 and r.get("verify") == 1, json.dumps(r))
+    _, d2, dict2 = stream_snapshot(out, old_num)
+    check("  original stream unchanged (serialized before/after)",
+          d2 == old_data and dict2 == old_dict)
+    pdf, a, ap, names, marks = ap_info(out)
+    data = ap.read_bytes()
+    check("  new stream: marks + Font + ExtGState",
+          marks and "/Font" in ap.Resources and "/ExtGState" in ap.Resources and b"Tf" in data,
+          "%s %s" % (marks, list(ap.Resources.keys())))
+
     # --- view state through every render path (incl. FFLDraw) ---
     wfile = os.path.join(WORK, "widget.pdf")
     pdf = pikepdf.open(files["all_on"])

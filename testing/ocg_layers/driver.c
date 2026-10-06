@@ -30,6 +30,14 @@
 //                    AppendObject (green), then [indices]
 //         reloaded - annotation 0 already in the file, re-marked as is
 //         twice    - annotation 0 re-marked twice: [0,1], then [indices]
+//   driver rich IN OUT
+//       Like make, but the appearance needs resources (a semi-transparent
+//       path -> ExtGState, a text object -> Font) and is NOT marked.
+//   driver markappend IN OUT [indices...]
+//       Annotation 0 already in the file (fresh handle): mark it, then -
+//       without re-marking - append a text object and make path 0
+//       semi-transparent (FPDFAnnot_UpdateObject); incremental save of the
+//       /Annots holder + FPDF_VerifyIncrementalSave.
 //   driver paths IN [i=s ...]
 //       Renders page 0 through FPDF_RenderPageBitmap, the progressive
 //       Start/Continue path, both with FPDF_RENDER_LOD_SKIP_SUBPIXEL, and
@@ -411,6 +419,78 @@ static int Paths(int argc, char** argv) {
   return 0;
 }
 
+static int AppendText(FPDF_DOCUMENT doc, FPDF_ANNOTATION a) {
+  FPDF_PAGEOBJECT text = FPDFPageObj_NewTextObj(doc, "Helvetica", 12.0f);
+  FPDF_WCHAR hi[3] = {'H', 'i', 0};
+  if (!text || !FPDFText_SetText(text, hi) ||
+      !FPDFPageObj_SetFillColor(text, 0, 0, 0, 255)) {
+    return 0;
+  }
+  FPDFPageObj_Transform(text, 1, 0, 0, 1, 310, 310);
+  return FPDFAnnot_AppendObject(a, text);
+}
+
+static int Rich(const char* in, const char* out) {
+  FPDF_DOCUMENT doc = FPDF_LoadDocument(in, "");
+  if (!doc) return 1;
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  FPDF_ANNOTATION a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE);
+  FS_RECTF r = {300, 400, 400, 300};
+  FPDF_PAGEOBJECT rect = FPDFPageObj_CreateNewRect(300, 300, 100, 100);
+  int ok = a && FPDFAnnot_SetRect(a, &r) &&
+           FPDFAnnot_SetFlags(a, FPDF_ANNOT_FLAG_PRINT) && rect &&
+           FPDFPageObj_SetFillColor(rect, 255, 0, 0, 128) &&
+           FPDFPath_SetDrawMode(rect, FPDF_FILLMODE_ALTERNATE, 0) &&
+           FPDFAnnot_AppendObject(a, rect) && AppendText(doc, a);
+  if (a) FPDFPage_CloseAnnot(a);
+  FPDF_ClosePage(page);
+  MemWriter w;
+  Save(doc, 0, &w);
+  WriteFile(out, &w);
+  free(w.data);
+  FPDF_CloseDocument(doc);
+  printf("{\"rich\":%d}\n", ok);
+  return ok ? 0 : 1;
+}
+
+static int MarkAppend(int argc, char** argv) {
+  size_t len = 0;
+  unsigned char* orig = ReadAll(argv[2], &len);
+  FPDF_DOCUMENT doc = FPDF_LoadMemDocument64(orig, len, "");
+  if (!doc) return 1;
+  int idx[8], n = 0;
+  for (int i = 4; i < argc && n < 8; ++i) idx[n++] = atoi(argv[i]);
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  uint32_t holder = Holder(page);
+  FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
+  int marked = a && FPDFAnnot_SetOCMembership(doc, a, idx, n) &&
+               FPDFAnnot_SetAPOptionalContent(
+                   doc, a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, idx, n);
+  int appended = marked && AppendText(doc, a);
+  FPDF_PAGEOBJECT path = marked ? FPDFAnnot_GetObject(a, 0) : NULL;
+  int updated = path && FPDFPageObj_SetFillColor(path, 255, 0, 0, 128) &&
+                FPDFAnnot_UpdateObject(a, path);
+  if (a) FPDFPage_CloseAnnot(a);
+  MemWriter w;
+  memset(&w, 0, sizeof w);
+  w.fw.version = 1;
+  w.fw.WriteBlock = WriteBlockCb;
+  int saved = FPDF_SaveIncrementalObjects(doc, &w.fw, &holder, 1);
+  Buf b = {w.data, w.len};
+  FPDF_FILEACCESS acc = {(unsigned long)w.len, GetBlock, &b};
+  uint32_t mismatch = 0;
+  int verify = saved && FPDF_VerifyIncrementalSave(doc, &acc, &mismatch);
+  if (saved) WriteFile(argv[3], &w);
+  printf("{\"marked\":%d,\"appended\":%d,\"updated\":%d,\"saved\":%d,"
+         "\"verify\":%d,\"mismatch\":%u}\n",
+         marked, appended, updated, saved, verify, mismatch);
+  free(w.data);
+  FPDF_ClosePage(page);
+  FPDF_CloseDocument(doc);
+  free(orig);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) return 1;
   FPDF_InitLibrary();
@@ -423,6 +503,8 @@ int main(int argc, char** argv) {
   else if (!strcmp(argv[1], "unmark") && argc >= 4) rc = Unmark(argv[2], argv[3]);
   else if (!strcmp(argv[1], "incr") && argc >= 5) rc = Incr(argc, argv);
   else if (!strcmp(argv[1], "paths")) rc = Paths(argc, argv);
+  else if (!strcmp(argv[1], "rich") && argc >= 4) rc = Rich(argv[2], argv[3]);
+  else if (!strcmp(argv[1], "markappend") && argc >= 4) rc = MarkAppend(argc, argv);
   FPDF_DestroyLibrary();
   return rc;
 }

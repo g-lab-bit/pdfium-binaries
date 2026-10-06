@@ -367,8 +367,10 @@ ocg_indices, count)` puts nested `/OC /<name> BDC … EMC` marks, outermost =
   re-serialised from page objects.
 - **Rebuild recipe for an annotation already in the file:**
   `FPDFAnnot_SetAP(annot, NORMAL, NULL)` on a fresh handle, then `AppendObject`.
-- **Output goes to a NEW stream object;** /AP /N is repointed and the old stream is
-  untouched. `FPDF_SaveIncrementalObjects` therefore writes it as a new object
+- **Output goes to a NEW stream object** with its own copy of /Resources; /AP /N is
+  repointed and the annotation's object list is bound to that copy, so later
+  `AppendObject`/`UpdateObject` calls edit the new stream and its resources. The
+  old stream and its /Resources are never modified. `FPDF_SaveIncrementalObjects` therefore writes it as a new object
   reachable from the listed annotation, and `FPDF_VerifyIncrementalSave` passes
   (tested: a new annotation, a rebuilt one, a reloaded one, and a second call).
 - **/Properties names:** an existing entry is reused only if it already refers to
