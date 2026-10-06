@@ -191,6 +191,108 @@ def main():
     r = drv("render", out)
     check("unmarked: visible although L is off in /D", r.get("annot") == RED, json.dumps(r))
 
+    # --- incremental save + verify (S1) ---
+    GREEN = [0, 255, 0]
+
+    def ap_info(path):
+        pdf = pikepdf.open(path)
+        a = pdf.pages[0].Annots[0]
+        ap = a.AP.N
+        props = ap.Resources.get("/Properties", {})
+        names = {str(k)[1:]: (v.objgen[0] if v.is_indirect else None) for k, v in props.items()}
+        marks = [x.decode() for x in re.findall(rb"/OC\s*/(\w+)\s*BDC", ap.read_bytes())]
+        return pdf, a, ap, names, marks
+
+    raw = os.path.join(WORK, "all_on.pdf")
+    scen = [
+        # name, source, scenario, indices, render expectations [(states, annot)]
+        ("new annotation", raw, "new", ["0", "1"],
+         [([], RED), (["1=0"], WHITE), (["0=0"], WHITE)]),
+        ("existing annotation, AP rebuilt", files["all_on"], "rebuilt", ["1"],
+         [([], GREEN), (["1=0"], WHITE), (["0=0"], GREEN)]),
+        ("existing annotation, reloaded AP re-marked", files["all_on"], "reloaded", ["0"],
+         [([], RED), (["0=0"], WHITE), (["1=0"], RED)]),
+        ("re-marked twice ([WS,L] then [L])", files["all_on"], "twice", ["1"],
+         [([], RED), (["1=0"], WHITE), (["0=0"], RED)]),
+    ]
+    for name, src, scenario, idx, renders in scen:
+        out = os.path.join(WORK, "incr_%s.pdf" % scenario)
+        r = drv("incr", src, out, scenario, *idx)
+        check("incremental + verify: " + name,
+              all(r.get(k) == 1 for k in ("edit", "membership", "marked", "saved", "verify", "prefix")),
+              json.dumps(r))
+        if r.get("saved") != 1:
+            continue
+        for states, exp in renders:
+            rr = drv("render", out, *states)
+            check("  render %s %s" % (scenario, " ".join(states) or "-"), rr.get("annot") == exp, json.dumps(rr))
+    pdf, a, ap, names, marks = ap_info(os.path.join(WORK, "incr_twice.pdf"))
+    check("twice: stale /RpOC entry for WS removed, one mark for L",
+          list(names.values()) == [11] and marks == [k for k in names] and len(marks) == 1,
+          "%s %s" % (names, marks))
+    pdf, a, ap, names, marks = ap_info(os.path.join(WORK, "incr_rebuilt.pdf"))
+    orig_pdf = pikepdf.open(files["all_on"])
+    old_ap = orig_pdf.pages[0].Annots[0].AP.N.objgen[0]
+    check("rebuilt: /AP /N is a new stream object", ap.objgen[0] != old_ap, "%s vs %s" % (ap.objgen, old_ap))
+
+    # --- /Properties name collisions (S3) ---
+    coll = os.path.join(WORK, "collision.pdf")
+    pdf = pikepdf.open(files["all_on"])
+    ap = pdf.pages[0].Annots[0].AP.N
+    foo = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name("/Foo")))
+    ap.Resources.Properties = pikepdf.Dictionary(RpOC1=foo, Foo=pdf.get_object(10, 0))
+    pdf.save(coll)
+    out = os.path.join(WORK, "collision_marked.pdf")
+    r = drv("incr", coll, out, "reloaded", "0", "1")
+    pdf, a, ap, names, marks = ap_info(out)
+    # pikepdf renumbered the objects when writing the fixture: look the
+    # groups up by index.
+    ws_num, l_num = [o.objgen[0] for o in pdf.Root.OCProperties.OCGs]
+    check("collision: WS reuses /Foo, L gets an unused /RpOC2, /RpOC1 kept",
+          r.get("verify") == 1 and marks == ["Foo", "RpOC2"] and names.get("RpOC2") == l_num
+          and names.get("Foo") == ws_num and "RpOC1" in names, "%s %s %s" % (json.dumps(r), names, marks))
+    out2 = os.path.join(WORK, "collision_unmarked.pdf")
+    r = drv("incr", out, out2, "reloaded")
+    pdf, a, ap, names, marks = ap_info(out2)
+    check("collision: count 0 removes only our /RpOC2; /RpOC1 (not an OCG) and /Foo kept",
+          r.get("verify") == 1 and marks == [] and sorted(names) == ["Foo", "RpOC1"],
+          "%s %s %s" % (json.dumps(r), names, marks))
+
+    # --- view state through every render path (incl. FFLDraw) ---
+    wfile = os.path.join(WORK, "widget.pdf")
+    pdf = pikepdf.open(files["all_on"])
+    content = b"/OC /P1 BDC 0 1 0 rg 0 0 100 50 re f EMC"
+    wap = pdf.make_stream(content)
+    wap.Type = pikepdf.Name.XObject; wap.Subtype = pikepdf.Name.Form
+    wap.BBox = [0, 0, 100, 50]
+    wap.Resources = pikepdf.Dictionary(Properties=pikepdf.Dictionary(P1=pdf.get_object(11, 0)))
+    widget = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Widget, FT=pikepdf.Name.Tx,
+        T=pikepdf.String("w1"), Rect=[100, 500, 200, 550], F=4, P=pdf.pages[0].obj,
+        AP=pikepdf.Dictionary(N=wap)))
+    pdf.pages[0].Annots.append(widget)
+    pdf.Root.AcroForm = pikepdf.Dictionary(Fields=[widget])
+    pdf.save(wfile)
+    # FPDF_RenderPageBitmap never draws widgets (stock: bShowWidget = false);
+    # FPDF_FFLDraw draws them through CPDF_Annot::DrawAppearance, which
+    # renders WITHOUT an optional content context (stock), so the widget's
+    # /OC marked content is ignored there for /D and the view state alike.
+    # The checks pin that measured behaviour; the page is drawn without
+    # FPDF_ANNOT for FFLDraw, so the markup is not on that bitmap.
+    for states, on in (([], True), (["1=0"], False)):
+        r = drv("paths", wfile, *states)
+        for path in ("render", "progressive", "render_lod", "progressive_lod", "ffldraw"):
+            d = r.get(path, {})
+            if path == "ffldraw":
+                ok = (d.get("annot") == WHITE and d.get("content") == (BLUE if on else WHITE)
+                      and d.get("widget") == GREEN)
+                label = "view state %s via ffldraw (page content follows; widget OC ignored, stock)"
+            else:
+                ok = (d.get("annot") == (RED if on else WHITE) and d.get("content") == (BLUE if on else WHITE)
+                      and d.get("widget") == WHITE)
+                label = "view state %s via " + path
+            check(label % (" ".join(states) or "-"), ok, json.dumps(d))
+
     print("\n%d case(s), %d failure(s)" % (ran, len(failures)))
     sys.exit(1 if failures else 0)
 

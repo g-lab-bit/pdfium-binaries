@@ -22,6 +22,19 @@
 //       full save to OUT.
 //   driver unmark IN OUT
 //       FPDFAnnot_SetAPOptionalContent(count 0) on annotation 0.
+//   driver incr IN OUT SCENARIO [indices...]
+//       Edits, then FPDF_SaveIncrementalObjects (listing the /Annots holder)
+//       and FPDF_VerifyIncrementalSave on the same open document:
+//         new      - add a Square (AppendObject) on [indices]
+//         rebuilt  - annotation 0 already in the file: SetAP(NULL) +
+//                    AppendObject (green), then [indices]
+//         reloaded - annotation 0 already in the file, re-marked as is
+//         twice    - annotation 0 re-marked twice: [0,1], then [indices]
+//   driver paths IN [i=s ...]
+//       Renders page 0 through FPDF_RenderPageBitmap, the progressive
+//       Start/Continue path, both with FPDF_RENDER_LOD_SKIP_SUBPIXEL, and
+//       FPDF_FFLDraw (form environment); prints the annotation, page content
+//       and widget (150,525) colours per path.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +43,8 @@
 #include "fpdf_annot.h"
 #include "fpdf_doc.h"
 #include "fpdf_edit.h"
+#include "fpdf_formfill.h"
+#include "fpdf_progressive.h"
 #include "fpdf_save.h"
 #include "fpdfview.h"
 
@@ -266,6 +281,136 @@ static int Unmark(const char* in, const char* out) {
   return 0;
 }
 
+static uint32_t Holder(FPDF_PAGE page) {
+  uint32_t annots = FPDFPage_GetAnnotsObjectNumber(page);
+  return annots ? annots : FPDFPage_GetObjectNumber(page);
+}
+
+static int AppendRect(FPDF_ANNOTATION a, unsigned g) {
+  FPDF_PAGEOBJECT rect = FPDFPageObj_CreateNewRect(300, 300, 100, 100);
+  return rect && FPDFPageObj_SetFillColor(rect, g ? 0 : 255, g, 0, 255) &&
+         FPDFPath_SetDrawMode(rect, FPDF_FILLMODE_ALTERNATE, 0) &&
+         FPDFAnnot_AppendObject(a, rect);
+}
+
+static int Incr(int argc, char** argv) {
+  size_t len = 0;
+  unsigned char* orig = ReadAll(argv[2], &len);
+  FPDF_DOCUMENT doc = FPDF_LoadMemDocument64(orig, len, "");
+  if (!doc) return 1;
+  const char* scenario = argv[4];
+  int idx[8], n = 0;
+  for (int i = 5; i < argc && n < 8; ++i) idx[n++] = atoi(argv[i]);
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  uint32_t holder = Holder(page);
+  int ok = 1;
+  FPDF_ANNOTATION a = NULL;
+  if (!strcmp(scenario, "new")) {
+    a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE);
+    FS_RECTF r = {300, 400, 400, 300};
+    ok = a && FPDFAnnot_SetRect(a, &r) &&
+         FPDFAnnot_SetFlags(a, FPDF_ANNOT_FLAG_PRINT) && AppendRect(a, 0);
+  } else {
+    a = FPDFPage_GetAnnot(page, 0);
+    if (!strcmp(scenario, "rebuilt")) {
+      ok = a && FPDFAnnot_SetAP(a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, NULL) &&
+           AppendRect(a, 255);
+    } else if (!strcmp(scenario, "twice")) {
+      int both[2] = {0, 1};
+      ok = a && FPDFAnnot_SetAPOptionalContent(
+                    doc, a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, both, 2);
+    }
+  }
+  int member = ok && FPDFAnnot_SetOCMembership(doc, a, idx, n);
+  int marked = ok && FPDFAnnot_SetAPOptionalContent(
+                         doc, a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, idx, n);
+  if (a) FPDFPage_CloseAnnot(a);
+  MemWriter w;
+  memset(&w, 0, sizeof w);
+  w.fw.version = 1;
+  w.fw.WriteBlock = WriteBlockCb;
+  int saved = FPDF_SaveIncrementalObjects(doc, &w.fw, &holder, 1);
+  Buf b = {w.data, w.len};
+  FPDF_FILEACCESS acc = {(unsigned long)w.len, GetBlock, &b};
+  uint32_t mismatch = 0;
+  int verify = saved && FPDF_VerifyIncrementalSave(doc, &acc, &mismatch);
+  if (saved) WriteFile(argv[3], &w);
+  printf("{\"edit\":%d,\"membership\":%d,\"marked\":%d,\"saved\":%d,"
+         "\"verify\":%d,\"mismatch\":%u,\"prefix\":%d}\n",
+         ok, member, marked, saved, verify, mismatch,
+         saved && w.len > len && !memcmp(w.data, orig, len));
+  free(w.data);
+  FPDF_ClosePage(page);
+  FPDF_CloseDocument(doc);
+  free(orig);
+  return 0;
+}
+
+static FPDF_BOOL NoPause(IFSDK_PAUSE* p) { return 0; }
+
+static void Sample(FPDF_BITMAP bmp, int h, const char* path, int first) {
+  char a[32], c[32], wgt[32];
+  Pixel(bmp, 350, h - 350, a);
+  Pixel(bmp, 100, h - 100, c);
+  Pixel(bmp, 150, h - 525, wgt);
+  printf("%s\"%s\":{\"annot\":%s,\"content\":%s,\"widget\":%s}",
+         first ? "" : ",", path, a, c, wgt);
+}
+
+static int Paths(int argc, char** argv) {
+  FPDF_DOCUMENT doc = FPDF_LoadDocument(argv[2], "");
+  if (!doc) return 1;
+  for (int i = 3; i < argc; ++i) {
+    int idx, st;
+    if (sscanf(argv[i], "%d=%d", &idx, &st) == 2)
+      FPDFDoc_SetOCGViewState(doc, idx, st);
+  }
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  int w = (int)FPDF_GetPageWidthF(page), h = (int)FPDF_GetPageHeightF(page);
+  printf("{");
+  const int lod = FPDF_RENDER_LOD_SKIP_SUBPIXEL;
+  struct { const char* name; int progressive; int flags; } paths[] = {
+      {"render", 0, FPDF_ANNOT},
+      {"progressive", 1, FPDF_ANNOT},
+      {"render_lod", 0, FPDF_ANNOT | lod},
+      {"progressive_lod", 1, FPDF_ANNOT | lod},
+  };
+  for (size_t p = 0; p < sizeof paths / sizeof paths[0]; ++p) {
+    FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);
+    FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
+    if (paths[p].progressive) {
+      IFSDK_PAUSE pause = {1, NoPause, NULL};
+      int st = FPDF_RenderPageBitmap_Start(bmp, page, 0, 0, w, h, 0,
+                                           paths[p].flags, &pause);
+      while (st == FPDF_RENDER_TOBECONTINUED)
+        st = FPDF_RenderPage_Continue(page, &pause);
+      FPDF_RenderPage_Close(page);
+    } else {
+      FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, 0, paths[p].flags);
+    }
+    Sample(bmp, h, paths[p].name, p == 0);
+    FPDFBitmap_Destroy(bmp);
+  }
+  // FPDF_FFLDraw: page without annotations, then the form layer on top.
+  static FPDF_FORMFILLINFO ffi;
+  memset(&ffi, 0, sizeof ffi);
+  ffi.version = 1;
+  FPDF_FORMHANDLE form = FPDFDOC_InitFormFillEnvironment(doc, &ffi);
+  FORM_OnAfterLoadPage(page, form);
+  FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);
+  FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
+  FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, 0, 0);
+  FPDF_FFLDraw(form, bmp, page, 0, 0, w, h, 0, 0);
+  Sample(bmp, h, "ffldraw", 0);
+  FPDFBitmap_Destroy(bmp);
+  FORM_OnBeforeClosePage(page, form);
+  FPDFDOC_ExitFormFillEnvironment(form);
+  printf("}\n");
+  FPDF_ClosePage(page);
+  FPDF_CloseDocument(doc);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) return 1;
   FPDF_InitLibrary();
@@ -276,6 +421,8 @@ int main(int argc, char** argv) {
   else if (!strcmp(argv[1], "membership") && argc >= 4) rc = Membership(argv[2], argv[3]);
   else if (!strcmp(argv[1], "delete") && argc >= 5) rc = Delete(argc, argv);
   else if (!strcmp(argv[1], "unmark") && argc >= 4) rc = Unmark(argv[2], argv[3]);
+  else if (!strcmp(argv[1], "incr") && argc >= 5) rc = Incr(argc, argv);
+  else if (!strcmp(argv[1], "paths")) rc = Paths(argc, argv);
   FPDF_DestroyLibrary();
   return rc;
 }
