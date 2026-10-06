@@ -1,5 +1,5 @@
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index 7ee8a63..2c31052 100644
+index 7ee8a63..dd99a32 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -18,6 +18,8 @@
@@ -11,7 +11,7 @@ index 7ee8a63..2c31052 100644
  #include "core/fpdfapi/page/cpdf_form.h"
  #include "core/fpdfapi/page/cpdf_page.h"
  #include "core/fpdfapi/page/cpdf_pageobject.h"
-@@ -2130,3 +2132,174 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
+@@ -2130,3 +2132,179 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetNumberArray(FPDF_ANNOTATION annot,
    }
    return static_cast<int>(numbers.size());
  }
@@ -158,20 +158,12 @@ index 7ee8a63..2c31052 100644
 +
 +  // The marked appearance goes into a NEW stream object (so an incremental
 +  // save writes it as a new object reachable from the annotation), and
-+  // /AP /N is repointed. The old stream is left untouched.
-+  auto new_dict = doc->New<CPDF_Dictionary>();
-+  {
-+    CPDF_DictionaryLocker locker(old_stream->GetDict());
-+    for (const auto& [key, value] : locker) {
-+      if (key != "Length" && key != "Filter" && key != "DecodeParms" &&
-+          key != "DL" && key != "Resources") {
-+        new_dict->SetFor(key, value->Clone());
-+      }
-+    }
-+  }
-+  auto new_stream = doc->NewIndirect<CPDF_Stream>(new_dict);
-+  UpdateContentStream(form, new_stream.Get());
-+  // Resources after generation, so they include anything it realized.
++  // /AP /N is repointed. The new stream owns a copy of the form's resources,
++  // and the annotation's form is rebound to that copy BEFORE generating:
++  // this generation and every later FPDFAnnot_AppendObject() /
++  // FPDFAnnot_UpdateObject() (which regenerate into the stream /AP /N now
++  // refers to) realise fonts and graphics states there. The previous stream
++  // and its /Resources are never modified.
 +  RetainPtr<CPDF_Dictionary> new_resources =
 +      ToDictionary(form_resources->Clone());
 +  if (!new_resources) {
@@ -182,15 +174,28 @@ index 7ee8a63..2c31052 100644
 +  } else {
 +    new_resources->SetFor("Properties", properties);
 +  }
++  auto new_dict = doc->New<CPDF_Dictionary>();
++  {
++    CPDF_DictionaryLocker locker(old_stream->GetDict());
++    for (const auto& [key, value] : locker) {
++      if (key != "Length" && key != "Filter" && key != "DecodeParms" &&
++          key != "DL" && key != "Resources") {
++        new_dict->SetFor(key, value->Clone());
++      }
++    }
++  }
 +  new_dict->SetFor("Resources", new_resources);
++  auto new_stream = doc->NewIndirect<CPDF_Stream>(new_dict);
++  form->SetResources(new_resources);
++  UpdateContentStream(form, new_stream.Get());
 +  ap_dict->SetNewFor<CPDF_Reference>("N", doc, new_stream->GetObjNum());
 +  return true;
 +}
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index 1b9f81d..af929ee 100644
+index 1b9f81d..661425a 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
-@@ -259,6 +259,51 @@ FPDFAnnot_RemoveInkList(FPDF_ANNOTATION annot);
+@@ -259,6 +259,55 @@ FPDFAnnot_RemoveInkList(FPDF_ANNOTATION annot);
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
  FPDFAnnot_AppendObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj);
  
@@ -214,10 +219,14 @@ index 1b9f81d..af929ee 100644
 +// FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, NULL) on a freshly
 +// obtained annotation handle, then FPDFAnnot_AppendObject().
 +//
-+// The marked appearance is written to a NEW stream object and /AP /N is
-+// repointed to it (the previous stream is left untouched and unreferenced),
-+// so FPDF_SaveIncrementalObjects() writes it as a new object reachable from
-+// the annotation (list the annotation or its /Annots holder). /Properties
++// The marked appearance is written to a NEW stream object with its own copy of
++// the /Resources, /AP /N is repointed to it, and the annotation's object list
++// is bound to that copy: later FPDFAnnot_AppendObject() /
++// FPDFAnnot_UpdateObject() calls on the same handle edit the new stream and
++// its resources. The previous stream and its /Resources are never modified
++// (it is left unreferenced), so FPDF_SaveIncrementalObjects() writes the new
++// stream as a new object reachable from the annotation (list the annotation
++// or its /Annots holder). /Properties
 +// entries in the new stream's /Resources: an existing entry is reused only if
 +// it already refers to the group; new entries are named /RpOC<n> (an unused
 +// name); /RpOC<n> entries referring to an OCG that is no longer in the set are
