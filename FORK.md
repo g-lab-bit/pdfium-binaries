@@ -360,16 +360,30 @@ deleted group from such an OCMD and removes /OC once none is left (tested).
 ## 15. `annot_ap_oc.patch` (fork-p9): `FPDFAnnot_SetAPOptionalContent`
 
 `FPDFAnnot_SetAPOptionalContent(doc, annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
-ocg_indices, count)`:
+ocg_indices, count)` puts nested `/OC /<name> BDC … EMC` marks, outermost =
+`ocg_indices[0]`, on every object of the normal appearance.
 
-- Puts nested `/OC /OCGn BDC … EMC` marks, outermost = `ocg_indices[0]`, on every
-  object of the normal appearance, with /Properties in the appearance's
-  /Resources, and regenerates the stream.
+- **Only for appearances built with `FPDFAnnot_AppendObject`.** The appearance is
+  re-serialised from page objects.
+- **Rebuild recipe for an annotation already in the file:**
+  `FPDFAnnot_SetAP(annot, NORMAL, NULL)` on a fresh handle, then `AppendObject`.
+- **Output goes to a NEW stream object;** /AP /N is repointed and the old stream is
+  untouched. `FPDF_SaveIncrementalObjects` therefore writes it as a new object
+  reachable from the listed annotation, and `FPDF_VerifyIncrementalSave` passes
+  (tested: a new annotation, a rebuilt one, a reloaded one, and a second call).
+- **/Properties names:** an existing entry is reused only if it already refers to
+  the group; new names are unused `/RpOC<n>`; stale `/RpOC<n>` entries that
+  refer to an OCG are removed (tested with a collision fixture).
 - count 0 removes the marks. Objects appended later need a new call.
-- `FPDFDoc_DeleteOCG` does not remove these marks.
+  `FPDFDoc_DeleteOCG` does not remove these marks.
 
-Readers: PDFium and pdf.js hide the markup when any group is off. PDFKit
-ignores optional content in annotation appearances entirely (marked content,
-AP /OC, inner form /OC: tested).
+Readers: PDFium and pdf.js hide the markup when any group is off. PDFKit ignores
+optional content in annotation appearances entirely (marked content, AP /OC,
+inner form /OC: tested).
+
+Stock limits:
+- `FPDF_RenderPageBitmap` never draws widget annotations.
+- `FPDF_FFLDraw` draws widgets without an optional-content context, so /OC
+  inside widget appearances is ignored there (for /D and the view state).
 
 Tests: `testing/ocg_layers/run_tests.py PDFIUM_DIR` (31 cases).
