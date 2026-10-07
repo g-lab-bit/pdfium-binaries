@@ -456,16 +456,19 @@ including a revert inside a direct /Annots array).
 `FPDFAnnot_SetOCMembership` writes, as indices into `/OCProperties /OCGs`
 (`FPDFAnnot_GetOCGIndex` returns -1 for an OCMD):
 
-- /OC an OCG → 1 index; an OCMD → its /OCGs in order (duplicates once) when it
-  means "all of them" (`/P /AllOn`, or a single group) and has no /VE;
+- /OC an OCG → 1 index; an OCMD → its /OCGs (an OCG or an array, direct or
+  indirect) in order (duplicates once) when it means "all of them": `/P /AllOn`,
+  or a single group with `/AnyOn` (the default) or `/AllOn`; no /VE;
 - returns the total count and copies up to `buflen` (`buflen` 0 sizes);
-  0 = no /OC; -1 = bad arguments, or a membership that is not an all-on set of
-  listed groups (other /P with 2+ groups, /VE, a direct OCG, a member missing
-  from /OCGs).
+  0 = no /OC, `/OC null`, or an empty /OCGs; -1 = bad arguments, or a
+  membership that is not an all-on set of listed groups (`/AllOff`/`/AnyOff`
+  even with one group — those mean "visible when OFF"; `/AnyOn` over 2+
+  groups; /VE; a direct OCG; a member missing from /OCGs).
 
 Rapida uses it to re-apply a markup's layer chain to its rebuilt appearance
 (`FPDFAnnot_SetAPOptionalContent`) and to show the markup's layer.
 
 Tests: `testing/ocg_layers/run_tests.py` (membership read-back after every
 `SetOCMembership` case and after `DeleteOCG`; ten /OC shapes other tools write;
-buffer sizing and bad arguments).
+buffer sizing and bad arguments; one-group /AllOff and /AnyOff, indirect
+/OCGs array, direct OCMD, empty /OCGs, /OC null).

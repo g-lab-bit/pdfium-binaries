@@ -207,15 +207,27 @@ def main():
         ("direct_ocg", pikepdf.Dictionary(Type=N.OCG, Name="Direct"), [-1, []]),
         ("none", None, [0, []]),
         ("dup_members", ocmd(OCGs=pikepdf.Array([l, l]), P=N.AllOn), [1, [1]]),
+        ("single_all_off", ocmd(OCGs=l, P=N.AllOff), [-1, []]),       # visible when L is OFF
+        ("single_any_off", ocmd(OCGs=pikepdf.Array([l]), P=N.AnyOff), [-1, []]),
+        ("single_all_on", ocmd(OCGs=pikepdf.Array([l]), P=N.AllOn), [1, [1]]),
+        ("indirect_ocgs_array", ocmd(OCGs=pf.make_indirect(pikepdf.Array([ws, l])), P=N.AllOn), [2, [0, 1]]),
+        ("direct_ocmd", pikepdf.Dictionary(Type=N.OCMD, OCGs=pikepdf.Array([ws, l]), P=N.AllOn), [2, [0, 1]]),
+        ("empty_ocgs", ocmd(OCGs=pikepdf.Array([]), P=N.AllOn), [0, []]),
+        ("oc_null", "null", [0, []]),
     ]
     annots = pikepdf.Array()
     for k, (_, oc, _) in enumerate(variants):
         d = pikepdf.Dictionary(Type=N.Annot, Subtype=N.Square, Rect=[10 + 20 * k, 500, 25 + 20 * k, 515])
-        if oc is not None:
+        if isinstance(oc, str):
+            d.OC = N.RpNullMarker   # becomes "null" below (pikepdf cannot write a null value)
+        elif oc is not None:
             d.OC = oc
         annots.append(pf.make_indirect(d))
     pf.pages[0].Annots = annots
-    pf.save(src)
+    pf.save(src, object_stream_mode=pikepdf.ObjectStreamMode.disable)
+    raw = open(src, "rb").read()
+    open(src, "wb").write(raw.replace(b"/RpNullMarker", b"null         "))   # same length: offsets hold
+    check("fixture: an annotation has /OC null", raw.count(b"/RpNullMarker") == 1)
     r = drv("getmember", src)
     for k, (name, _, want) in enumerate(variants):
         got = r.get(str(k), {})
