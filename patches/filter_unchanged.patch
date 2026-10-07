@@ -1,0 +1,150 @@
+diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
+index 48f506c..7f2ce70 100644
+--- a/fpdfsdk/fpdf_save.cpp
++++ b/fpdfsdk/fpdf_save.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <functional>
+ #include <map>
+ #include <optional>
+ #include <set>
+@@ -605,8 +606,14 @@ bool CollectUpdateEntries(RetainPtr<IFX_SeekableReadStream> file,
+ 
+ class SaveVerifier {
+  public:
+-  SaveVerifier(CPDF_Document* memory_doc, CPDF_Document* saved_doc)
+-      : memory_doc_(memory_doc), saved_doc_(saved_doc) {
++  // `resolve_saved` resolves an object number on the "saved" side (the saved
++  // file for FPDF_VerifyIncrementalSave, the original file for
++  // FPDF_FilterUnchangedObjects).
++  using SavedResolver =
++      std::function<RetainPtr<const CPDF_Object>(uint32_t objnum)>;
++
++  SaveVerifier(CPDF_Document* memory_doc, SavedResolver resolve_saved)
++      : memory_doc_(memory_doc), resolve_saved_(std::move(resolve_saved)) {
+     // Page tree and field tree dictionaries, found in memory without
+     // parsing (an unloaded node cannot have been changed).
+     const CPDF_Dictionary* root = memory_doc_->GetRoot();
+@@ -812,8 +819,7 @@ class SaveVerifier {
+     if (key == "T" && mem_value->IsString() && saved_value &&
+         saved_value->IsReference()) {  // M7 (a)
+       RetainPtr<const CPDF_Object> target =
+-          saved_doc_->GetOrParseIndirectObject(
+-              saved_value->AsReference()->GetRefObjNum());
++          resolve_saved_(saved_value->AsReference()->GetRefObjNum());
+       const ByteString expected =
+           target && target->IsString() ? target->GetString() : ByteString();
+       return mem_value->GetString() == expected;
+@@ -863,7 +869,7 @@ class SaveVerifier {
+   }
+ 
+   UnownedPtr<CPDF_Document> const memory_doc_;
+-  UnownedPtr<CPDF_Document> const saved_doc_;
++  const SavedResolver resolve_saved_;
+   std::set<const CPDF_Dictionary*> page_tree_;
+   std::set<const CPDF_Dictionary*> field_tree_;
+ };
+@@ -974,7 +980,11 @@ FPDF_VerifyIncrementalSave(FPDF_DOCUMENT document,
+   }
+ 
+   // 5. Deep comparison.
+-  SaveVerifier verifier(doc, saved_doc.get());
++  CPDF_Document* saved_doc_ptr = saved_doc.get();
++  SaveVerifier verifier(doc, [saved_doc_ptr](uint32_t objnum) {
++    return RetainPtr<const CPDF_Object>(
++        saved_doc_ptr->GetOrParseIndirectObject(objnum));
++  });
+   for (const auto& [objnum, obj] : objects) {
+     RetainPtr<const CPDF_Object> saved_obj =
+         saved_doc->GetOrParseIndirectObject(objnum);
+@@ -987,3 +997,47 @@ FPDF_VerifyIncrementalSave(FPDF_DOCUMENT document,
+   }
+   return true;
+ }
++
++// g-lab-bit fork (filter_unchanged.patch).
++FPDF_EXPORT int FPDF_CALLCONV
++FPDF_FilterUnchangedObjects(FPDF_DOCUMENT document,
++                            uint32_t* objnums,
++                            int count) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc || count < 0 || (count > 0 && !objnums)) {
++    return -1;
++  }
++  CPDF_Parser* parser = doc->GetParser();
++  if (!parser || count == 0) {
++    return count;  // No original file: nothing can be unchanged.
++  }
++  // Originals are parsed by the parser directly: a decrypted copy that is
++  // not stored in the document's object map.
++  SaveVerifier verifier(doc, [parser](uint32_t objnum) {
++    return RetainPtr<const CPDF_Object>(parser->ParseIndirectObject(objnum));
++  });
++  const uint32_t last_obj_num = parser->GetLastObjNum();
++  // SAFETY: required from caller.
++  auto list = UNSAFE_BUFFERS(pdfium::span(objnums, static_cast<size_t>(count)));
++  size_t kept = 0;
++  for (size_t i = 0; i < list.size(); ++i) {
++    const uint32_t objnum = list[i];
++    bool unchanged = false;
++    if (objnum != 0 && objnum <= last_obj_num) {
++      // Only a loaded object can have been changed.
++      RetainPtr<const CPDF_Object> current = doc->GetIndirectObject(objnum);
++      if (!current) {
++        unchanged = true;
++      } else {
++        RetainPtr<const CPDF_Object> original =
++            parser->ParseIndirectObject(objnum);
++        unchanged =
++            original && verifier.ObjectsEqual(current.Get(), original.Get(), 0);
++      }
++    }
++    if (!unchanged) {
++      list[kept++] = objnum;
++    }
++  }
++  return pdfium::checked_cast<int>(kept);
++}
+diff --git a/public/fpdf_save.h b/public/fpdf_save.h
+index 9c94944..22dffaf 100644
+--- a/public/fpdf_save.h
++++ b/public/fpdf_save.h
+@@ -224,6 +224,36 @@ FPDF_VerifyIncrementalSave(FPDF_DOCUMENT document,
+                            FPDF_FILEACCESS* saved,
+                            uint32_t* first_mismatch_objnum);
+ 
++// g-lab-bit fork (filter_unchanged.patch)
++// Experimental API.
++// Function: FPDF_FilterUnchangedObjects
++//          Removes from |objnums|, in place and keeping the order, every
++//          EXISTING object (number <= the original's last object number)
++//          whose current in-memory value equals its value in the loaded
++//          file - e.g. an annotation edited and then reverted, or listed by
++//          a failed edit. Objects never loaded since the document was opened
++//          are unchanged by definition and also removed. Values are compared
++//          like FPDF_VerifyIncrementalSave() compares them (decrypted strings
++//          and streams; streams by dictionary without /Length and by data;
++//          PDFium's own post-load normalisations accepted exactly). The
++//          original value is parsed from the file without adding anything to
++//          the document's object map. New objects (created since load) are
++//          never removed; FPDF_SaveIncrementalObjects() already skips those
++//          that are not reachable. Entries that are 0 or cannot be parsed are
++//          kept (FPDF_SaveIncrementalObjects() then refuses them).
++//          If the result is 0 and nothing new is reachable, the save would be
++//          an exact copy of the original: the caller can skip writing.
++// Parameters:
++//          document - The document handle.
++//          objnums  - The list to filter; modified in place.
++//          count    - Number of entries in |objnums|.
++// Return value:
++//          The new number of entries, or -1 on error.
++FPDF_EXPORT int FPDF_CALLCONV
++FPDF_FilterUnchangedObjects(FPDF_DOCUMENT document,
++                            uint32_t* objnums,
++                            int count);
++
+ // g-lab-bit fork (incremental_objects.patch)
+ // Experimental API.
+ // Object-number accessors for building the |objnums| list above. They use
