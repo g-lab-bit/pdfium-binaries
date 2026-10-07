@@ -405,18 +405,24 @@ Tests: `testing/ocg_layers/run_tests.py PDFIUM_DIR` (31 cases).
     existing object it can touch, before and after, and reports the ones that
     changed.
   - That set is the catalog plus the optional content structures, collected
-    by a structural walk: /OCProperties, its /OCGs, /D and /Configs and their
-    arrays (/ON, /OFF, /Locked, /Order, /RBGroups, /AS), OCG dictionaries, and
-    OCMDs with /OCGs and /VE. Anything else these link to (pages, catalog,
-    resources, streams) is neither followed nor recorded, so the walk stays
-    bounded.
+    by a structural walk that identifies them by their POSITION in the graph:
+    /OCProperties, its /OCGs, /D and /Configs and their arrays (/ON, /OFF,
+    /Locked, /Order, /RBGroups, /AS), OCG dictionaries, and OCMDs with /OCGs
+    and /VE.
+  - A dictionary at a structure position is entered whatever its /Type
+    (fork-p11 fix: fork-p10 skipped a typed /OCProperties or configuration),
+    except a page, page tree node, catalog or annotation. Anything else these
+    link to (pages, catalog, resources, streams) is neither followed nor
+    recorded, so the walk stays bounded.
   - DeleteOCG adds pages, /Annots, annotations and their /OC structures;
     annotation calls add the annotation and its holders.
   - So a change in a direct sub-object is reported through its indirect holder.
     The result is exact by construction, without per-path bookkeeping.
-- Tests: `testing/ocg_objnums` (65 cases) covers every call on five layouts, the
-  fifth a hostile fixture whose OC structures link the page, catalog, page tree
-  and a 5 MB stream. It also times DeleteOCG on 200 pages x 25 annotations. The
+- Tests: `testing/ocg_objnums` (125 cases) covers every call on five layouts, each
+  also with /Type on /OCProperties and on every configuration (fork-p10 fails 27
+  of those). The fifth layout is
+  a hostile fixture whose OC structures link the page, catalog, page tree and a
+  5 MB stream. It also times DeleteOCG on 200 pages x 25 annotations. The
   first four layouts are:
   /OCProperties indirect, direct in the catalog, inside an ObjStm, and with
   /OCGs, /D and arrays as separate objects. The report is sufficient (listing it
