@@ -224,7 +224,7 @@ index dd99a32..c5d2e20 100644
      context->SetForm(old_stream);
    }
 diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
-index 6c854d2..1b8d502 100644
+index 6c854d2..8a34c25 100644
 --- a/fpdfsdk/fpdf_doc.cpp
 +++ b/fpdfsdk/fpdf_doc.cpp
 @@ -25,6 +25,7 @@
@@ -235,16 +235,20 @@ index 6c854d2..1b8d502 100644
  #include "core/fpdfapi/parser/cpdf_string.h"
  #include "core/fpdfapi/parser/fpdf_parser_decode.h"
  #include "core/fpdfdoc/cpdf_aaction.h"
-@@ -840,6 +841,223 @@ bool IsReservedOCGKey(ByteStringView key) {
+@@ -840,6 +841,232 @@ bool IsReservedOCGKey(ByteStringView key) {
  
  // |annot| must come from a page of |doc|, or /OC would reference an object of
  // another document.
 +// g-lab-bit fork (ocg_objnums.patch): collects the indirect objects of the
-+// optional content structures an OCG write call can modify - /OCProperties,
-+// its /OCGs, /D and /Configs dictionaries and their arrays (/ON, /OFF,
-+// /Locked, /Order, /RBGroups, /AS with its /OCGs and /Category), OCG
-+// dictionaries, and OCMDs with their /OCGs and /VE. Only these structures are
-+// entered and recorded: a reference to anything else (a page, the catalog, a
++// optional content structures an OCG write call can modify, identified by
++// their POSITION in the graph: the catalog's /OCProperties, its /OCGs, /D and
++// /Configs dictionaries and their arrays (/ON, /OFF, /Locked, /Order,
++// /RBGroups, /AS with its /OCGs and /Category), OCG dictionaries, and OCMDs
++// with their /OCGs and /VE. A dictionary at a structure position is entered
++// whatever its /Type (some producers write /Type on /OCProperties or the
++// configurations), except a page, page tree node, catalog or annotation; a
++// stream never is. Only optional content keys are read from an entered
++// dictionary, and a reference to anything else (a page, the catalog, a
 +// resource dictionary, a stream) is neither followed nor recorded, so the
 +// walk stays bounded however the file links them.
 +class OCStructureWalker {
@@ -253,7 +257,7 @@ index 6c854d2..1b8d502 100644
 +      : doc_(doc), out_(out) {}
 +
 +  void Properties(RetainPtr<const CPDF_Object> obj) {
-+    RetainPtr<const CPDF_Object> props = Take(std::move(obj), kUntypedDict);
++    RetainPtr<const CPDF_Object> props = Take(std::move(obj), kStructDict);
 +    const CPDF_Dictionary* dict = props ? props->AsDictionary() : nullptr;
 +    if (!dict) {
 +      return;
@@ -285,7 +289,7 @@ index 6c854d2..1b8d502 100644
 +  }
 +
 + private:
-+  enum Kind { kArray, kUntypedDict, kOCG, kOCMD };
++  enum Kind { kArray, kStructDict, kOCG, kOCMD };
 +  static constexpr int kMaxDepth = 32;
 +
 +  // Resolves `obj`; returns it if it is of `kind`, recording its object
@@ -312,9 +316,14 @@ index 6c854d2..1b8d502 100644
 +      case kArray:
 +        accepted = obj->IsArray();
 +        break;
-+      case kUntypedDict:
-+        accepted = dict && !dict->KeyExist("Type");
++      case kStructDict: {
++        // Any dictionary at a structure position, except objects that are
++        // never optional content structures (and must not be entered).
++        const ByteString type = dict ? dict->GetNameFor("Type") : ByteString();
++        accepted = dict && type != "Page" && type != "Pages" &&
++                   type != "Catalog" && type != "Annot";
 +        break;
++      }
 +      case kOCG:
 +        accepted = dict && dict->GetNameFor("Type") == "OCG";
 +        break;
@@ -373,7 +382,7 @@ index 6c854d2..1b8d502 100644
 +  }
 +
 +  void Config(RetainPtr<const CPDF_Object> obj) {
-+    RetainPtr<const CPDF_Object> config = Take(std::move(obj), kUntypedDict);
++    RetainPtr<const CPDF_Object> config = Take(std::move(obj), kStructDict);
 +    const CPDF_Dictionary* dict = config ? config->AsDictionary() : nullptr;
 +    if (!dict) {
 +      return;
@@ -392,7 +401,7 @@ index 6c854d2..1b8d502 100644
 +        Take(dict->GetObjectFor("AS"), kArray);
 +    if (auto_state) {
 +      ForEach(auto_state, [this](RetainPtr<const CPDF_Object> e) {
-+        RetainPtr<const CPDF_Object> usage = Take(e, kUntypedDict);
++        RetainPtr<const CPDF_Object> usage = Take(e, kStructDict);
 +        const CPDF_Dictionary* usage_dict =
 +            usage ? usage->AsDictionary() : nullptr;
 +        if (usage_dict) {
@@ -459,7 +468,7 @@ index 6c854d2..1b8d502 100644
  bool AnnotBelongsToDoc(CPDF_AnnotContext* context, CPDF_Document* doc) {
    return context && context->GetPage() &&
           context->GetPage()->GetDocument() == doc;
-@@ -952,9 +1170,15 @@ void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
+@@ -952,9 +1179,15 @@ void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
  FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_CreateOCG(FPDF_DOCUMENT document,
                                                 FPDF_WIDESTRING name) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -475,7 +484,7 @@ index 6c854d2..1b8d502 100644
    RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, true);
    if (!props) {
      return -1;
-@@ -985,6 +1209,9 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
+@@ -985,6 +1218,9 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            FPDF_WIDESTRING value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -485,7 +494,7 @@ index 6c854d2..1b8d502 100644
    if (!doc || !key || !value || IsReservedOCGKey(key)) {
      return false;
    }
-@@ -992,6 +1219,9 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
+@@ -992,6 +1228,9 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
    if (!ocg) {
      return false;
    }
@@ -495,7 +504,7 @@ index 6c854d2..1b8d502 100644
    // SAFETY: required from caller.
    WideString ws = UNSAFE_BUFFERS(WideStringFromFPDFWideString(value));
    ocg->SetNewFor<CPDF_String>(key, ws.AsStringView());
-@@ -1004,6 +1234,9 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+@@ -1004,6 +1243,9 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            float value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -505,7 +514,7 @@ index 6c854d2..1b8d502 100644
    if (!doc || !key || IsReservedOCGKey(key) || !std::isfinite(value)) {
      return false;
    }
-@@ -1011,6 +1244,9 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+@@ -1011,6 +1253,9 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
    if (!ocg) {
      return false;
    }
@@ -515,7 +524,7 @@ index 6c854d2..1b8d502 100644
    ocg->SetNewFor<CPDF_Number>(key, value);
    return true;
  }
-@@ -1022,6 +1258,9 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+@@ -1022,6 +1267,9 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
                            const float* values,
                            int count) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -525,7 +534,7 @@ index 6c854d2..1b8d502 100644
    if (!doc || !key || IsReservedOCGKey(key) || count < 0 ||
        (count > 0 && !values)) {
      return false;
-@@ -1036,6 +1275,9 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+@@ -1036,6 +1284,9 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
    if (!ocg) {
      return false;
    }
@@ -535,7 +544,7 @@ index 6c854d2..1b8d502 100644
    auto arr = ocg->SetNewFor<CPDF_Array>(key);
    for (int i = 0; i < count; ++i) {
      // SAFETY: required from caller (|values| holds |count| floats).
-@@ -1049,6 +1291,9 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
+@@ -1049,6 +1300,9 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
                                  int index,
                                  FPDF_BOOL visible) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
@@ -545,7 +554,7 @@ index 6c854d2..1b8d502 100644
    if (!doc) {
      return false;
    }
-@@ -1057,6 +1302,9 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
+@@ -1057,6 +1311,9 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
      return false;
    }
    const uint32_t objnum = ocg->GetObjNum();
@@ -555,7 +564,7 @@ index 6c854d2..1b8d502 100644
    RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, false);
    RetainPtr<CPDF_Dictionary> config = props->GetMutableDictFor("D");
    if (!config) {
-@@ -1086,6 +1334,9 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -1086,6 +1343,9 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
                                                      int index) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -565,7 +574,7 @@ index 6c854d2..1b8d502 100644
    if (!doc || !AnnotBelongsToDoc(context, doc)) {
      return false;
    }
-@@ -1093,6 +1344,10 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -1093,6 +1353,10 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
    if (!annot_dict) {
      return false;
    }
@@ -576,7 +585,7 @@ index 6c854d2..1b8d502 100644
    if (index == -1) {
      annot_dict->RemoveFor("OC");
      return true;
-@@ -1113,6 +1368,9 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+@@ -1113,6 +1377,9 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
                            int count) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -586,7 +595,7 @@ index 6c854d2..1b8d502 100644
    if (!doc || !AnnotBelongsToDoc(context, doc) || count < 0 ||
        (count > 0 && !ocg_indices)) {
      return false;
-@@ -1137,6 +1395,10 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+@@ -1137,6 +1404,10 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
        }
      }
    }
@@ -597,7 +606,7 @@ index 6c854d2..1b8d502 100644
    if (objnums.empty()) {
      annot_dict->RemoveFor("OC");
      return true;
-@@ -1222,10 +1484,52 @@ FPDFDoc_ClearOCGViewState(FPDF_DOCUMENT document) {
+@@ -1222,10 +1493,52 @@ FPDFDoc_ClearOCGViewState(FPDF_DOCUMENT document) {
    }
  }
  
@@ -650,7 +659,7 @@ index 6c854d2..1b8d502 100644
    if (!doc) {
      return -1;
    }
-@@ -1241,6 +1545,9 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
+@@ -1241,6 +1554,9 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
      return -1;  // only indirect OCGs can be referenced, and so deleted
    }
    const uint32_t objnum = entry_ref->GetRefObjNum();
