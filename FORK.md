@@ -449,3 +449,23 @@ listed existing object whose in-memory value equals the loaded file's.
 
 Tests: `testing/filter_unchanged` (17 cases: plain, RC4 + ObjStm, AES-256 + ObjStm,
 including a revert inside a direct /Annots array).
+
+## 19. `annot_oc_membership.patch` (fork-p12): `FPDFAnnot_GetOCMembership`
+
+`FPDFAnnot_GetOCMembership(doc, annot, buffer, buflen)` reads back what
+`FPDFAnnot_SetOCMembership` writes, as indices into `/OCProperties /OCGs`
+(`FPDFAnnot_GetOCGIndex` returns -1 for an OCMD):
+
+- /OC an OCG → 1 index; an OCMD → its /OCGs in order (duplicates once) when it
+  means "all of them" (`/P /AllOn`, or a single group) and has no /VE;
+- returns the total count and copies up to `buflen` (`buflen` 0 sizes);
+  0 = no /OC; -1 = bad arguments, or a membership that is not an all-on set of
+  listed groups (other /P with 2+ groups, /VE, a direct OCG, a member missing
+  from /OCGs).
+
+Rapida uses it to re-apply a markup's layer chain to its rebuilt appearance
+(`FPDFAnnot_SetAPOptionalContent`) and to show the markup's layer.
+
+Tests: `testing/ocg_layers/run_tests.py` (membership read-back after every
+`SetOCMembership` case and after `DeleteOCG`; ten /OC shapes other tools write;
+buffer sizing and bad arguments).

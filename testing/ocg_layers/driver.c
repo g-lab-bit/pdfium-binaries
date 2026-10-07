@@ -1,4 +1,5 @@
-// Driver for ocg_view_state.patch, annot_ocmd.patch and annot_ap_oc.patch.
+// Driver for ocg_view_state.patch, annot_ocmd.patch, annot_ap_oc.patch and
+// annot_oc_membership.patch.
 //
 //   driver make IN OUT
 //       Adds a Square annotation (red filled rect appearance via
@@ -17,6 +18,10 @@
 //   driver membership IN OUTPREFIX
 //       FPDFAnnot_SetOCMembership cases on annotation 0, each saved to
 //       OUTPREFIX.<case>.pdf for inspection; prints return values.
+//       Each case also reads the membership back (FPDFAnnot_GetOCMembership).
+//   driver getmember IN
+//       FPDFAnnot_GetOCMembership for every annotation on page 0, plus the
+//       buffer-sizing calls (buflen 0, buflen 1) for each.
 //   driver delete IN OUT INDEX...
 //       FPDFDoc_DeleteOCG for each INDEX in turn (indices as at call time),
 //       full save to OUT.
@@ -222,6 +227,42 @@ static int Persist(const char* in, const char* prefix) {
   return 0;
 }
 
+// Prints "[n,[i,...]]" for |a|: the count FPDFAnnot_GetOCMembership returns
+// and the indices it copied.
+static void PrintMember(FPDF_DOCUMENT doc, FPDF_ANNOTATION a) {
+  int got[16];
+  int n = FPDFAnnot_GetOCMembership(doc, a, got, 16);
+  printf("[%d,[", n);
+  for (int i = 0; i < n && i < 16; ++i) printf("%s%d", i ? "," : "", got[i]);
+  printf("]]");
+}
+
+static int GetMember(const char* in) {
+  FPDF_DOCUMENT doc = FPDF_LoadDocument(in, "");
+  if (!doc) return 1;
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  printf("{");
+  for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i) {
+    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, i);
+    int first = -9;
+    int sized = FPDFAnnot_GetOCMembership(doc, a, NULL, 0);
+    int partial = FPDFAnnot_GetOCMembership(doc, a, &first, 1);
+    printf("%s\"%d\":{\"member\":", i ? "," : "", i);
+    PrintMember(doc, a);
+    printf(",\"sized\":%d,\"partial\":[%d,%d]}", sized, partial, first);
+    FPDFPage_CloseAnnot(a);
+  }
+  int bad = FPDFAnnot_GetOCMembership(doc, NULL, NULL, 0);
+  FPDF_ANNOTATION a0 = FPDFPage_GetAnnot(page, 0);
+  int neg = FPDFAnnot_GetOCMembership(doc, a0, NULL, -1);
+  int nullbuf = FPDFAnnot_GetOCMembership(doc, a0, NULL, 4);
+  FPDFPage_CloseAnnot(a0);
+  printf(",\"bad_annot\":%d,\"neg_len\":%d,\"null_buf\":%d}\n", bad, neg, nullbuf);
+  FPDF_ClosePage(page);
+  FPDF_CloseDocument(doc);
+  return 0;
+}
+
 static int Membership(const char* in, const char* prefix) {
   struct { const char* name; int idx[4]; int count; } cases[] = {
       {"one", {1}, 1},          {"two", {0, 1}, 2},
@@ -235,6 +276,10 @@ static int Membership(const char* in, const char* prefix) {
     FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
     int ret = FPDFAnnot_SetOCMembership(doc, a, cases[c].idx, cases[c].count);
     int index = FPDFAnnot_GetOCGIndex(doc, a);
+    printf("%s\"%s\":{\"ret\":%d,\"ocg_index\":%d,\"get\":", c ? "," : "",
+           cases[c].name, ret, index);
+    PrintMember(doc, a);
+    printf("}");
     FPDFPage_CloseAnnot(a);
     FPDF_ClosePage(page);
     MemWriter w;
@@ -244,8 +289,6 @@ static int Membership(const char* in, const char* prefix) {
     WriteFile(path, &w);
     free(w.data);
     FPDF_CloseDocument(doc);
-    printf("%s\"%s\":{\"ret\":%d,\"ocg_index\":%d}", c ? "," : "",
-           cases[c].name, ret, index);
   }
   printf("}\n");
   return 0;
@@ -257,7 +300,13 @@ static int Delete(int argc, char** argv) {
   printf("{\"deleted\":[");
   for (int i = 4; i < argc; ++i)
     printf("%s%d", i > 4 ? "," : "", FPDFDoc_DeleteOCG(doc, atoi(argv[i])));
-  printf("]}\n");
+  printf("],\"member\":");
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
+  PrintMember(doc, a);
+  FPDFPage_CloseAnnot(a);
+  FPDF_ClosePage(page);
+  printf("}\n");
   MemWriter w;
   Save(doc, 0, &w);
   WriteFile(argv[3], &w);
@@ -500,6 +549,7 @@ int main(int argc, char** argv) {
   else if (!strcmp(argv[1], "persist") && argc >= 4) rc = Persist(argv[2], argv[3]);
   else if (!strcmp(argv[1], "membership") && argc >= 4) rc = Membership(argv[2], argv[3]);
   else if (!strcmp(argv[1], "delete") && argc >= 5) rc = Delete(argc, argv);
+  else if (!strcmp(argv[1], "getmember") && argc >= 3) rc = GetMember(argv[2]);
   else if (!strcmp(argv[1], "unmark") && argc >= 4) rc = Unmark(argv[2], argv[3]);
   else if (!strcmp(argv[1], "incr") && argc >= 5) rc = Incr(argc, argv);
   else if (!strcmp(argv[1], "paths")) rc = Paths(argc, argv);

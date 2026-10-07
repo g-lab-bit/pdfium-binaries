@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Scripted test for ocg_view_state.patch, annot_ocmd.patch, annot_ap_oc.patch.
+"""Scripted test for ocg_view_state.patch, annot_ocmd.patch, annot_ap_oc.patch,
+annot_oc_membership.patch.
 
 usage: run_tests.py PDFIUM_DIR [--work DIR]
 Requires pikepdf (to inspect saved files). Builds driver.c against the
@@ -11,7 +12,7 @@ Fixture: OCGs WS (index 0, obj 10) and L (index 1, obj 11, nested under WS in
 a Square annotation with a red appearance at 300..400 and puts it on
 [WS, L] via FPDFAnnot_SetOCMembership + FPDFAnnot_SetAPOptionalContent.
 """
-import json, os, platform, re, shutil, subprocess, sys
+import io, json, os, platform, re, shutil, subprocess, sys
 
 try:
     import pikepdf
@@ -150,6 +151,12 @@ def main():
     def load(c):
         opened.append(pikepdf.open(os.path.join(WORK, "member.%s.pdf" % c)))
         return opened[-1].pages[0].Annots[0]
+    # annot_oc_membership: what was written reads back (invalid/negative leave
+    # the fixture's [WS, L]; count 0 has no /OC).
+    expect_get = {"one": [1, [1]], "two": [2, [0, 1]], "dup": [2, [1, 0]], "invalid": [2, [0, 1]],
+                  "negative": [2, [0, 1]], "none": [0, []]}
+    for c, want in expect_get.items():
+        check("get membership after set: " + c, r[c].get("get") == want, json.dumps(r[c]))
     a = load("one")
     check("membership: one -> /OC = ref to L", r["one"]["ret"] == 1 and a.OC.objgen[0] == 11
           and r["one"]["ocg_index"] == 1, json.dumps(r["one"]))
@@ -174,11 +181,50 @@ def main():
     check("DeleteOCG(L): OCMD pruned to [WS]", r["deleted"] == [1] and a.OC.Type == "/OCMD"
           and [o.objgen[0] for o in a.OC.OCGs] == [10], json.dumps(r))
     check("DeleteOCG(L): AP marks kept (documented)", b"BDC" in a.AP.N.read_bytes())
+    check("DeleteOCG(L): membership reads [WS]", r.get("member") == [1, [0]], json.dumps(r))
     out = os.path.join(WORK, "deleted_both.pdf")
     r = drv("delete", files["all_on"], out, "1", "0")
     pd2 = pikepdf.open(out)
     a = pd2.pages[0].Annots[0]
     check("DeleteOCG(L, WS): /OC removed", r["deleted"] == [1, 1] and "/OC" not in a, json.dumps(r))
+    check("DeleteOCG(L, WS): membership reads none", r.get("member") == [0, []], json.dumps(r))
+
+    # --- annot_oc_membership: /OC written by other tools ---
+    src = os.path.join(WORK, "foreign_oc.pdf")
+    pf = pikepdf.open(io.BytesIO(fixture(b"")))
+    ws, l = pf.get_object(10, 0), pf.get_object(11, 0)
+    stray = pf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.OCG, Name="Stray"))   # not in /OCGs
+    N = pikepdf.Name
+    ocmd = lambda **kw: pf.make_indirect(pikepdf.Dictionary(Type=N.OCMD, **kw))
+    variants = [
+        ("ocg", l, [1, [1]]),
+        ("all_on", ocmd(OCGs=pikepdf.Array([ws, l]), P=N.AllOn), [2, [0, 1]]),
+        ("single_ref_any_on", ocmd(OCGs=l), [1, [1]]),
+        ("any_on_two", ocmd(OCGs=pikepdf.Array([ws, l])), [-1, []]),
+        ("all_off_two", ocmd(OCGs=pikepdf.Array([ws, l]), P=N.AllOff), [-1, []]),
+        ("ve", ocmd(OCGs=pikepdf.Array([ws, l]), P=N.AllOn, VE=pikepdf.Array([N.And, ws, l])), [-1, []]),
+        ("not_listed", ocmd(OCGs=pikepdf.Array([ws, stray]), P=N.AllOn), [-1, []]),
+        ("direct_ocg", pikepdf.Dictionary(Type=N.OCG, Name="Direct"), [-1, []]),
+        ("none", None, [0, []]),
+        ("dup_members", ocmd(OCGs=pikepdf.Array([l, l]), P=N.AllOn), [1, [1]]),
+    ]
+    annots = pikepdf.Array()
+    for k, (_, oc, _) in enumerate(variants):
+        d = pikepdf.Dictionary(Type=N.Annot, Subtype=N.Square, Rect=[10 + 20 * k, 500, 25 + 20 * k, 515])
+        if oc is not None:
+            d.OC = oc
+        annots.append(pf.make_indirect(d))
+    pf.pages[0].Annots = annots
+    pf.save(src)
+    r = drv("getmember", src)
+    for k, (name, _, want) in enumerate(variants):
+        got = r.get(str(k), {})
+        n = want[0]
+        ok = (got.get("member") == want and got.get("sized") == n
+              and got.get("partial") == ([n, want[1][0]] if n > 0 else [n, -9]))
+        check("get membership: " + name, ok, json.dumps(got))
+    check("get membership: bad arguments -> -1",
+          r.get("bad_annot") == -1 and r.get("neg_len") == -1 and r.get("null_buf") == -1, json.dumps(r))
 
     # --- annot_ap_oc: removal and refusals ---
     out = os.path.join(WORK, "unmarked.pdf")

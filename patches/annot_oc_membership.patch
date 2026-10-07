@@ -1,0 +1,122 @@
+diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
+index 8a34c25..0e1c0ef 100644
+--- a/fpdfsdk/fpdf_doc.cpp
++++ b/fpdfsdk/fpdf_doc.cpp
+@@ -1456,6 +1456,89 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+   return -1;
+ }
+ 
++// g-lab-bit fork (annot_oc_membership.patch).
++FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCMembership(FPDF_DOCUMENT document,
++                                                       FPDF_ANNOTATION annot,
++                                                       int* buffer,
++                                                       int buflen) {
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!context || !context->GetAnnotDict() ||
++      !AnnotBelongsToDoc(context, CPDFDocumentFromFPDFDocument(document)) ||
++      buflen < 0 || (buflen > 0 && !buffer)) {
++    return -1;
++  }
++  const CPDF_Dictionary* annot_dict = context->GetAnnotDict();
++  if (!annot_dict->KeyExist("OC")) {
++    return 0;
++  }
++  RetainPtr<const CPDF_Dictionary> oc = annot_dict->GetDictFor("OC");
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(document);
++  if (!oc || !ocgs) {
++    return -1;
++  }
++  // Object numbers of the member groups, in order.
++  std::vector<uint32_t> members;
++  if (oc->GetNameFor("Type") == "OCMD" || oc->KeyExist("OCGs")) {
++    if (oc->KeyExist("VE")) {
++      return -1;  // a visibility expression is not a plain set of groups
++    }
++    RetainPtr<const CPDF_Object> list = oc->GetObjectFor("OCGs");
++    if (!list) {
++      return -1;
++    }
++    if (const CPDF_Array* arr = list->AsArray()) {
++      for (size_t i = 0; i < arr->size(); ++i) {
++        RetainPtr<const CPDF_Object> item = arr->GetObjectAt(i);
++        const CPDF_Reference* ref = item ? item->AsReference() : nullptr;
++        if (!ref) {
++          return -1;
++        }
++        members.push_back(ref->GetRefObjNum());
++      }
++    } else if (const CPDF_Reference* ref = list->AsReference()) {
++      members.push_back(ref->GetRefObjNum());
++    } else {
++      return -1;
++    }
++    // /P defaults to AnyOn; with more than one group only AllOn is "all of".
++    std::set<uint32_t> distinct(members.begin(), members.end());
++    if (distinct.size() > 1 && oc->GetNameFor("P") != "AllOn") {
++      return -1;
++    }
++  } else {
++    if (oc->GetObjNum() == 0) {
++      return -1;  // a direct OCG has no index
++    }
++    members.push_back(oc->GetObjNum());
++  }
++  std::vector<int> indices;
++  for (uint32_t objnum : members) {
++    int found = -1;
++    for (size_t i = 0; i < ocgs->size(); ++i) {
++      RetainPtr<const CPDF_Object> obj = ocgs->GetObjectAt(i);
++      const CPDF_Reference* r = obj ? obj->AsReference() : nullptr;
++      if (r && r->GetRefObjNum() == objnum) {
++        found = pdfium::checked_cast<int>(i);
++        break;
++      }
++    }
++    if (found < 0) {
++      return -1;  // a member that is not in /OCProperties /OCGs
++    }
++    if (!pdfium::Contains(indices, found)) {
++      indices.push_back(found);
++    }
++  }
++  if (buflen > 0) {
++    // SAFETY: required from caller.
++    auto out = UNSAFE_BUFFERS(pdfium::span(buffer, static_cast<size_t>(buflen)));
++    for (size_t i = 0; i < indices.size() && i < out.size(); ++i) {
++      out[i] = indices[i];
++    }
++  }
++  return pdfium::checked_cast<int>(indices.size());
++}
++
+ // g-lab-bit fork (ocg_view_state.patch).
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+ FPDFDoc_SetOCGViewState(FPDF_DOCUMENT document, int index, int state) {
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index 2dbdc30..214fecf 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -661,6 +661,23 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+                                                    FPDF_ANNOTATION annot);
+ 
++// g-lab-bit fork (annot_oc_membership.patch)
++// Experimental API.
++// Reads |annot|'s optional content membership as indices into
++// /OCProperties /OCGs, i.e. what FPDFAnnot_SetOCMembership() writes:
++//   /OC an OCG            -> 1 index;
++//   /OC an OCMD           -> its /OCGs in array order (duplicates once), when
++//                            it means "all of them" (/P /AllOn, or one group)
++//                            and has no /VE.
++// Copies up to |buflen| indices into |buffer| and returns the total count:
++// 0 when there is no /OC; -1 for bad arguments, or a membership that is not an
++// all-on set of groups listed in /OCGs (any other /P, a /VE, a direct OCG, a
++// member missing from /OCGs). Call with |buflen| 0 to size the buffer.
++FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCMembership(FPDF_DOCUMENT document,
++                                                       FPDF_ANNOTATION annot,
++                                                       int* buffer,
++                                                       int buflen);
++
+ // g-lab-bit fork (ocg_view_state.patch)
+ // Experimental API.
+ // Render-only visibility override ("view state") for OCG |index| (in
