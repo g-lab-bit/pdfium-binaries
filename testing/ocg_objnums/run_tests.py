@@ -106,6 +106,16 @@ def fixtures():
     o[25] = b"[10 0 R [11 0 R]]"
     o[32] = b"[30 0 R %s]" % DIRECT_ANNOT
     f["separate_arrays"] = classic(o)
+    # Hostile: OC structures reference the page, the catalog, the page tree
+    # and a large content stream; none of them may be entered or recorded.
+    o = base(b"20 0 R")
+    big = b"".join(b"%% filler line %08d\n" % i for i in range(250000))  # ~5 MB
+    o[4] = b"<< /Length %d >>\nstream\n" % len(big) + big + b"endstream"
+    o[10] = b"<< /Type /OCG /Name (WS) /Foo 3 0 R /Bar 1 0 R /Usage << /View 4 0 R >> >>"
+    o[31] = b"<< /Type /OCMD /OCGs [10 0 R 11 0 R 2 0 R] /P /AllOn /VE [/And 10 0 R 3 0 R [/Not 4 0 R]] >>"
+    o[20] = (b"<< /OCGs [10 0 R 11 0 R 3 0 R] /D << /ON [10 0 R 11 0 R 4 0 R] /OFF [] "
+             b"/Order [10 0 R 4 0 R [11 0 R 3 0 R 1 0 R]] >> /Configs [3 0 R 2 0 R] >>")
+    f["hostile"] = classic(o)
     return f
 
 
@@ -127,8 +137,12 @@ EXPECTED = {
     ("indirect", "delete"): [3, 20, 31],
     ("separate_arrays", "delete"): [21, 23, 25, 31, 32],
     ("direct_in_catalog", "delete"): [1, 3, 31],
+    ("hostile", "default_off"): [20],
+    ("hostile", "string"): [10],
+    ("hostile", "delete"): [3, 20, 31],
 }
-IDS = {"indirect": (1, 20), "direct_in_catalog": (1, 0), "objstm": (1, 20), "separate_arrays": (1, 20)}
+IDS = {"indirect": (1, 20), "direct_in_catalog": (1, 0), "objstm": (1, 20), "separate_arrays": (1, 20),
+       "hostile": (1, 20)}
 
 
 def main():
@@ -178,6 +192,50 @@ def main():
             if exp is not None and mods != exp:
                 msgs.append("reported %s, expected %s" % (mods, exp))
             check("%s %s -> %s" % (fname, op, mods), not msgs, "; ".join(msgs) + " " + json.dumps(r))
+
+    # Bounded walk: on the hostile fixture (OC structures link a ~5 MB
+    # content stream, the page, the catalog and the page tree) a call that
+    # does not touch annotations must not enter them - it runs about as fast
+    # as on the small fixture.
+    import time
+
+    def wall(path, op):
+        t0 = time.perf_counter()
+        drv("timed", path, op)
+        return (time.perf_counter() - t0) * 1000
+
+    small = min(wall(paths["indirect"], "string") for _ in range(3))
+    hostile = min(wall(paths["hostile"], "string") for _ in range(3))
+    r = drv("timed", paths["hostile"], "string")
+    check("hostile: bounded walk (%.0f ms vs %.0f ms small; op %.2f ms)" % (hostile, small, r.get("op_ms", -1)),
+          r.get("listed") == 1 and r.get("op_ms", 1e9) < 20, json.dumps(r))
+
+    # Large document: DeleteOCG over 200 pages x 25 annotations on L.
+    big = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /OCProperties 20 0 R >>",
+        10: b"<< /Type /OCG /Name (WS) >>",
+        11: b"<< /Type /OCG /Name (L) >>",
+        20: OCPROPS,
+    }
+    kids, n = [], 100
+    for p in range(200):
+        page_num = n; n += 1
+        annots = []
+        for a in range(25):
+            big[n] = (b"<< /Type /Annot /Subtype /Square /Rect [%d %d %d %d] /F 4 /OC %s >>"
+                      % (20 * a, 20, 20 * a + 15, 35, b"11 0 R" if a % 2 else b"<< /Type /OCMD /OCGs [10 0 R 11 0 R] >>"))
+            annots.append(b"%d 0 R" % n); n += 1
+        big[page_num] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Annots [%s] >>"
+                         % b" ".join(annots))
+        kids.append(b"%d 0 R" % page_num)
+    big[2] = b"<< /Type /Pages /Kids [%s] /Count 200 >>" % b" ".join(kids)
+    large = os.path.join(WORK, "large_200x25.pdf")
+    open(large, "wb").write(classic(big))
+    r = drv("timed", large, "delete")
+    check("large 200 pages x 25 annots: DeleteOCG(L) %.0f ms, peak RSS %.0f -> %.0f MB, %d objects, save+verify %.0f ms"
+          % (r.get("op_ms", -1), r.get("peak_rss_mb_before", -1), r.get("peak_rss_mb_after", -1),
+             r.get("count", -1), r.get("save_verify_ms", -1)),
+          r.get("ret") == 1 and r.get("count") == 5001 and r.get("listed") == 1, json.dumps(r))
 
     # a failed call leaves an empty list
     # (an invalid OCG index; reuse the driver's array op on a document whose

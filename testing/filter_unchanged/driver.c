@@ -4,6 +4,8 @@
 //     revert   - annotation 0: /Rect and /C changed, then set back to the
 //                original values; list = [annotation, page]
 //     change   - annotation 0: /Rect changed; list = [annotation, page]
+//     revert_direct - like revert, on annotation 1 (a direct dictionary in
+//                the page's /Annots); list = [page]
 //     unloaded - list = [N] (an object never loaded)
 //     newobj   - FPDFDoc_CreateOCG; list = [new OCG] + the reported
 //                modified objects
@@ -95,8 +97,10 @@ int main(int argc, char** argv) {
   FPDF_PAGE page = FPDF_LoadPage(doc, 0);
   uint32_t list[8];
   int n = 0, edit_ok = 1;
-  if (!strcmp(scenario, "revert") || !strcmp(scenario, "change")) {
-    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
+  if (!strcmp(scenario, "revert") || !strcmp(scenario, "change") ||
+      !strcmp(scenario, "revert_direct")) {
+    FPDF_ANNOTATION a =
+        FPDFPage_GetAnnot(page, !strcmp(scenario, "revert_direct") ? 1 : 0);
     FS_RECTF r0 = {0, 0, 0, 0}, moved;
     unsigned int R = 0, G = 0, B = 0, A = 255;
     edit_ok = a && FPDFAnnot_GetRect(a, &r0) &&
@@ -105,12 +109,12 @@ int main(int argc, char** argv) {
     moved.left += 7;
     moved.right += 7;
     edit_ok = edit_ok && FPDFAnnot_SetRect(a, &moved);
-    if (!strcmp(scenario, "revert")) {
+    if (strcmp(scenario, "change")) {
       edit_ok = edit_ok && FPDFAnnot_SetRect(a, &r0) &&
                 FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color, 0, 0, 255, A) &&
                 FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color, R, G, B, A);
     }
-    list[n++] = FPDFAnnot_GetObjectNumber(a);
+    if (FPDFAnnot_GetObjectNumber(a)) list[n++] = FPDFAnnot_GetObjectNumber(a);
     list[n++] = FPDFPage_GetObjectNumber(page);
     if (a) FPDFPage_CloseAnnot(a);
   } else if (!strcmp(scenario, "unloaded") && argc >= 4) {

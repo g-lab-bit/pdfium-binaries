@@ -40,7 +40,8 @@ CONTENT = b"0 0 1 rg 50 50 100 100 re f\n"
 FIXTURE = {
     1: b"<< /Type /Catalog /Pages 2 0 R >>",
     2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> /Annots [10 0 R] >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> "
+       b"/Annots [10 0 R << /Type /Annot /Subtype /Square /Rect [50.5 60 70 80.25] /C [0 1 0] /CA 1 /F 4 >>] >>",
     4: b"<< /Length %d >>\nstream\n" % len(CONTENT) + CONTENT + b"endstream",
     10: b"<< /Type /Annot /Subtype /Square /Rect [100.5 200 300 400.25] /C [1 0 0] /CA 1 /F 4 >>",
 }
@@ -96,6 +97,10 @@ def main():
         r = drv("revert", path)
         check("%s: edit + revert -> filtered out, save identical" % label,
               r.get("edit") == 1 and r.get("before") == [annot, page] and r.get("after") == []
+              and common(r) and r.get("identical_to_original") == 1, json.dumps(r))
+        r = drv("revert_direct", path)
+        check("%s: revert inside a direct /Annots array -> page filtered out" % label,
+              r.get("edit") == 1 and r.get("before") == [page] and r.get("after") == []
               and common(r) and r.get("identical_to_original") == 1, json.dumps(r))
         r = drv("change", path)
         check("%s: real change -> annotation kept, page dropped" % label,

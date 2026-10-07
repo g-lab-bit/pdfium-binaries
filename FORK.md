@@ -401,14 +401,23 @@ Tests: `testing/ocg_layers/run_tests.py PDFIUM_DIR` (31 cases).
   SetOCGDefaultVisibility, SetOCGString/Number/NumberArray, DeleteOCG,
   FPDFAnnot_SetOCG, SetOCMembership, SetAPOptionalContent.
   - Each call clears the list when it starts.
-  - How it works: the call serialises every existing object it can touch, before
-    and after. That set is the catalog and everything reachable from
-    /OCProperties; DeleteOCG adds pages, /Annots, annotations and their /OC
-    targets; annotation calls add the annotation and its holders. The objects
-    whose serialisation changed are reported.
+  - How it works: after validating its arguments, the call serialises every
+    existing object it can touch, before and after, and reports the ones that
+    changed.
+  - That set is the catalog plus the optional content structures, collected
+    by a structural walk: /OCProperties, its /OCGs, /D and /Configs and their
+    arrays (/ON, /OFF, /Locked, /Order, /RBGroups, /AS), OCG dictionaries, and
+    OCMDs with /OCGs and /VE. Anything else these link to (pages, catalog,
+    resources, streams) is neither followed nor recorded, so the walk stays
+    bounded.
+  - DeleteOCG adds pages, /Annots, annotations and their /OC structures;
+    annotation calls add the annotation and its holders.
   - So a change in a direct sub-object is reported through its indirect holder.
     The result is exact by construction, without per-path bookkeeping.
-- Tests: `testing/ocg_objnums` (51 cases) covers every call on four layouts:
+- Tests: `testing/ocg_objnums` (65 cases) covers every call on five layouts, the
+  fifth a hostile fixture whose OC structures link the page, catalog, page tree
+  and a 5 MB stream. It also times DeleteOCG on 200 pages x 25 annotations. The
+  first four layouts are:
   /OCProperties indirect, direct in the catalog, inside an ObjStm, and with
   /OCGs, /D and arrays as separate objects. The report is sufficient (listing it
   saves and verifies TRUE) and each entry necessary (omitting any one refuses or
@@ -432,4 +441,5 @@ listed existing object whose in-memory value equals the loaded file's.
 - If the result is 0 and nothing new is reachable, the save is an exact copy, so
   the caller may skip writing.
 
-Tests: `testing/filter_unchanged` (14 cases: plain, RC4 + ObjStm, AES-256 + ObjStm).
+Tests: `testing/filter_unchanged` (17 cases: plain, RC4 + ObjStm, AES-256 + ObjStm,
+including a revert inside a direct /Annots array).

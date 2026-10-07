@@ -12,6 +12,9 @@
 //           out (must be refused, or verify FALSE).
 //       Annotation 0 = indirect Square with an OCMD and an existing /AP;
 //       annotation 1 = direct Square on L. OCG 0 = WS, 1 = L.
+//   driver timed IN OPERATION
+//       Like op, but without the omission loop; reports the call's time and
+//       the process's peak resident memory (for large documents).
 //   driver empty IN MODE
 //       new:    adds a Text annotation whose /AP /N is an EMPTY stream
 //               (FPDFAnnot_SetAP with ""), lists the /Annots holder;
@@ -22,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <time.h>
 
 #include "fpdf_annot.h"
 #include "fpdf_doc.h"
@@ -149,6 +154,51 @@ static int Op(const char* in, const char* op) {
   return 0;
 }
 
+static double NowMs(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static double PeakRssMb(void) {
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+  return ru.ru_maxrss / (1024.0 * 1024.0);  // bytes
+#else
+  return ru.ru_maxrss / 1024.0;  // kilobytes
+#endif
+}
+
+static int Timed(const char* in, const char* op) {
+  size_t len = 0;
+  unsigned char* orig = ReadAll(in, &len);
+  FPDF_DOCUMENT doc = FPDF_LoadMemDocument64(orig, len, "");
+  if (!doc) return 1;
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  double rss_before = PeakRssMb();
+  double t0 = NowMs();
+  int ret = RunOp(doc, page, op);
+  double ms = NowMs() - t0;
+  double rss_after = PeakRssMb();
+  int n = FPDFDoc_GetLastModifiedObjects(doc, NULL, 0);
+  uint32_t* mod = malloc(sizeof(uint32_t) * (n > 0 ? n : 1));
+  FPDFDoc_GetLastModifiedObjects(doc, mod, n);
+  uint32_t mismatch = 0;
+  double t1 = NowMs();
+  int listed = SaveVerify(doc, mod, n, &mismatch);
+  double save_verify_ms = NowMs() - t1;
+  printf("{\"ret\":%d,\"count\":%d,\"op_ms\":%.1f,\"peak_rss_mb_before\":%.1f,"
+         "\"peak_rss_mb_after\":%.1f,\"listed\":%d,\"mismatch\":%u,"
+         "\"save_verify_ms\":%.1f}\n",
+         ret, n, ms, rss_before, rss_after, listed, mismatch, save_verify_ms);
+  free(mod);
+  FPDF_ClosePage(page);
+  FPDF_CloseDocument(doc);
+  free(orig);
+  return 0;
+}
+
 static int Ids(const char* in) {
   FPDF_DOCUMENT doc = FPDF_LoadDocument(in, "");
   if (!doc) return 1;
@@ -194,6 +244,7 @@ int main(int argc, char** argv) {
   int rc = 1;
   if (!strcmp(argv[1], "ids")) rc = Ids(argv[2]);
   else if (!strcmp(argv[1], "op") && argc >= 4) rc = Op(argv[2], argv[3]);
+  else if (!strcmp(argv[1], "timed") && argc >= 4) rc = Timed(argv[2], argv[3]);
   else if (!strcmp(argv[1], "empty") && argc >= 4)
     rc = Empty(argv[2], argv[3], argc >= 5 ? (uint32_t)atoi(argv[4]) : 0);
   FPDF_DestroyLibrary();
