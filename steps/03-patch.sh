@@ -39,6 +39,9 @@ apply_patch "$PATCHES/annot_number_array.patch"
 apply_patch "$PATCHES/ocg_view_state.patch"
 apply_patch "$PATCHES/annot_ocmd.patch"
 apply_patch "$PATCHES/annot_ap_oc.patch"
+apply_patch "$PATCHES/ocg_objnums.patch"
+apply_patch "$PATCHES/verify_empty_stream.patch"
+apply_patch "$PATCHES/filter_unchanged.patch"
 apply_patch "$PATCHES/clang_rt.patch" build
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"

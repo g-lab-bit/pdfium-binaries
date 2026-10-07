@@ -389,3 +389,57 @@ Stock limits:
   inside widget appearances is ignored there (for /D and the view state).
 
 Tests: `testing/ocg_layers/run_tests.py PDFIUM_DIR` (31 cases).
+
+---
+
+## 16. `ocg_objnums.patch` (fork-p10): which existing objects a layer call modified
+
+- `FPDFDoc_GetCatalogObjectNumber`, `FPDFDoc_GetOCPropertiesObjectNumber` (0 when
+  /OCProperties is direct in the catalog: list the catalog).
+- `FPDFDoc_GetLastModifiedObjects(doc, buf, count)`: the existing indirect objects
+  modified by the most recent of these calls: CreateOCG,
+  SetOCGDefaultVisibility, SetOCGString/Number/NumberArray, DeleteOCG,
+  FPDFAnnot_SetOCG, SetOCMembership, SetAPOptionalContent.
+  - Each call clears the list when it starts.
+  - How it works: after validating its arguments, the call serialises every
+    existing object it can touch, before and after, and reports the ones that
+    changed.
+  - That set is the catalog plus the optional content structures, collected
+    by a structural walk: /OCProperties, its /OCGs, /D and /Configs and their
+    arrays (/ON, /OFF, /Locked, /Order, /RBGroups, /AS), OCG dictionaries, and
+    OCMDs with /OCGs and /VE. Anything else these link to (pages, catalog,
+    resources, streams) is neither followed nor recorded, so the walk stays
+    bounded.
+  - DeleteOCG adds pages, /Annots, annotations and their /OC structures;
+    annotation calls add the annotation and its holders.
+  - So a change in a direct sub-object is reported through its indirect holder.
+    The result is exact by construction, without per-path bookkeeping.
+- Tests: `testing/ocg_objnums` (65 cases) covers every call on five layouts, the
+  fifth a hostile fixture whose OC structures link the page, catalog, page tree
+  and a 5 MB stream. It also times DeleteOCG on 200 pages x 25 annotations. The
+  first four layouts are:
+  /OCProperties indirect, direct in the catalog, inside an ObjStm, and with
+  /OCGs, /D and arrays as separate objects. The report is sufficient (listing it
+  saves and verifies TRUE) and each entry necessary (omitting any one refuses or
+  verifies FALSE).
+
+## 17. `verify_empty_stream.patch` (fork-p10)
+
+`FPDF_VerifyIncrementalSave` decodes Flate-normalised saved streams explicitly.
+`CPDF_StreamAcc` returns the raw bytes when decoding yields nothing, so an empty
+stream (e.g. a comment reply's 0-byte /AP) compared as non-empty. Tested in
+`testing/ocg_objnums`.
+
+## 18. `filter_unchanged.patch` (fork-p10): `FPDF_FilterUnchangedObjects`
+
+`FPDF_FilterUnchangedObjects(doc, objnums, count)` removes, in place, every
+listed existing object whose in-memory value equals the loaded file's.
+
+- Same deep compare as verify. The original is parsed via
+  `CPDF_Parser::ParseIndirectObject` and not stored in the document's map.
+- Never-loaded objects are removed. New objects are kept.
+- If the result is 0 and nothing new is reachable, the save is an exact copy, so
+  the caller may skip writing.
+
+Tests: `testing/filter_unchanged` (17 cases: plain, RC4 + ObjStm, AES-256 + ObjStm,
+including a revert inside a direct /Annots array).

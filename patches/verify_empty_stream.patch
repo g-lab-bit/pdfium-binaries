@@ -1,0 +1,44 @@
+diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
+index 640968f..48f506c 100644
+--- a/fpdfsdk/fpdf_save.cpp
++++ b/fpdfsdk/fpdf_save.cpp
+@@ -34,6 +34,7 @@
+ #include "core/fpdfapi/parser/cpdf_stream_acc.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fpdfapi/parser/cpdf_syntax_parser.h"
++#include "core/fpdfapi/parser/fpdf_parser_decode.h"
+ #include "core/fpdfapi/parser/fpdf_parser_utility.h"
+ #include "core/fpdfapi/render/cpdf_docrenderdata.h"
+ #include "core/fxcrt/compiler_specific.h"
+@@ -724,13 +725,25 @@ class SaveVerifier {
+     mem_acc->LoadAllDataRaw();
+     auto saved_acc =
+         pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(saved));
+-    if (flate_normalised) {
+-      saved_acc->LoadAllDataFiltered();
+-    } else {
+-      saved_acc->LoadAllDataRaw();
+-    }
++    saved_acc->LoadAllDataRaw();
+     pdfium::span<const uint8_t> a = mem_acc->GetSpan();
+-    pdfium::span<const uint8_t> b = saved_acc->GetSpan();
++    if (!flate_normalised) {
++      pdfium::span<const uint8_t> b = saved_acc->GetSpan();
++      return a.size() == b.size() && std::ranges::equal(a, b);
++    }
++    // Decode explicitly: CPDF_StreamAcc::LoadAllDataFiltered() returns the
++    // raw (still encoded) bytes when decoding yields no data, so an empty
++    // stream the writer Flate-encoded would not compare as empty.
++    std::optional<DecoderArray> decoders = GetDecoderArray(saved_dict);
++    if (!decoders.has_value() || decoders.value().empty()) {
++      return false;
++    }
++    std::optional<PDFDataDecodeResult> decoded = PDF_DataDecode(
++        saved_acc->GetSpan(), 0, /*bImageAcc=*/false, decoders.value());
++    if (!decoded.has_value() || !decoded.value().image_encoding.IsEmpty()) {
++      return false;
++    }
++    pdfium::span<const uint8_t> b = decoded.value().data;
+     return a.size() == b.size() && std::ranges::equal(a, b);
+   }
+ 
