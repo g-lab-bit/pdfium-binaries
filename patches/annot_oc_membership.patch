@@ -1,8 +1,8 @@
 diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
-index 8a34c25..0e1c0ef 100644
+index 8a34c25..96798a7 100644
 --- a/fpdfsdk/fpdf_doc.cpp
 +++ b/fpdfsdk/fpdf_doc.cpp
-@@ -1456,6 +1456,89 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+@@ -1456,6 +1456,96 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
    return -1;
  }
  
@@ -18,10 +18,12 @@ index 8a34c25..0e1c0ef 100644
 +    return -1;
 +  }
 +  const CPDF_Dictionary* annot_dict = context->GetAnnotDict();
-+  if (!annot_dict->KeyExist("OC")) {
++  // No /OC, or /OC null (ISO 32000-1 7.3.9: the same as absent).
++  RetainPtr<const CPDF_Object> oc_obj = annot_dict->GetDirectObjectFor("OC");
++  if (!oc_obj || oc_obj->IsNull()) {
 +    return 0;
 +  }
-+  RetainPtr<const CPDF_Dictionary> oc = annot_dict->GetDictFor("OC");
++  const CPDF_Dictionary* oc = oc_obj->AsDictionary();
 +  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(document);
 +  if (!oc || !ocgs) {
 +    return -1;
@@ -32,7 +34,8 @@ index 8a34c25..0e1c0ef 100644
 +    if (oc->KeyExist("VE")) {
 +      return -1;  // a visibility expression is not a plain set of groups
 +    }
-+    RetainPtr<const CPDF_Object> list = oc->GetObjectFor("OCGs");
++    // /OCGs: an OCG dictionary or an array of them, direct or indirect.
++    RetainPtr<const CPDF_Object> list = oc->GetDirectObjectFor("OCGs");
 +    if (!list) {
 +      return -1;
 +    }
@@ -45,14 +48,18 @@ index 8a34c25..0e1c0ef 100644
 +        }
 +        members.push_back(ref->GetRefObjNum());
 +      }
-+    } else if (const CPDF_Reference* ref = list->AsReference()) {
-+      members.push_back(ref->GetRefObjNum());
++    } else if (list->AsDictionary() && list->GetObjNum() != 0) {
++      members.push_back(list->GetObjNum());
 +    } else {
 +      return -1;
 +    }
-+    // /P defaults to AnyOn; with more than one group only AllOn is "all of".
++    // "Member of every group": /P /AllOn; with one group also /AnyOn (the
++    // default). /AllOff and /AnyOff mean visible when groups are OFF.
++    const ByteString policy = oc->KeyExist("P") ? oc->GetNameFor("P") : ByteString("AnyOn");
 +    std::set<uint32_t> distinct(members.begin(), members.end());
-+    if (distinct.size() > 1 && oc->GetNameFor("P") != "AllOn") {
++    const bool all_on =
++        policy == "AllOn" || (distinct.size() <= 1 && policy == "AnyOn");
++    if (!all_on) {
 +      return -1;
 +    }
 +  } else {
@@ -93,10 +100,10 @@ index 8a34c25..0e1c0ef 100644
  FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
  FPDFDoc_SetOCGViewState(FPDF_DOCUMENT document, int index, int state) {
 diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
-index 2dbdc30..214fecf 100644
+index 2dbdc30..c9a9981 100644
 --- a/public/fpdf_doc.h
 +++ b/public/fpdf_doc.h
-@@ -661,6 +661,23 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+@@ -661,6 +661,26 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
  FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
                                                     FPDF_ANNOTATION annot);
  
@@ -105,13 +112,16 @@ index 2dbdc30..214fecf 100644
 +// Reads |annot|'s optional content membership as indices into
 +// /OCProperties /OCGs, i.e. what FPDFAnnot_SetOCMembership() writes:
 +//   /OC an OCG            -> 1 index;
-+//   /OC an OCMD           -> its /OCGs in array order (duplicates once), when
-+//                            it means "all of them" (/P /AllOn, or one group)
-+//                            and has no /VE.
++//   /OC an OCMD           -> its /OCGs (an OCG or an array, direct or
++//                            indirect) in order (duplicates once), when it
++//                            means "all of them": /P /AllOn, or a single group
++//                            with /P /AnyOn (the default) or /AllOn; no /VE.
 +// Copies up to |buflen| indices into |buffer| and returns the total count:
-+// 0 when there is no /OC; -1 for bad arguments, or a membership that is not an
-+// all-on set of groups listed in /OCGs (any other /P, a /VE, a direct OCG, a
-+// member missing from /OCGs). Call with |buflen| 0 to size the buffer.
++// 0 when there is no /OC, /OC is null, or the OCMD's /OCGs is empty; -1 for
++// bad arguments, or a membership that is not an all-on set of groups listed
++// in /OCGs (/P /AllOff or /AnyOff, /AnyOn over two or more groups, a /VE, a
++// direct OCG, a member missing from /OCGs). Call with |buflen| 0 to size the
++// buffer.
 +FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCMembership(FPDF_DOCUMENT document,
 +                                                       FPDF_ANNOTATION annot,
 +                                                       int* buffer,
