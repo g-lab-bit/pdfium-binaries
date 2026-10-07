@@ -190,7 +190,7 @@ index bb6e684..54dd25a 100644
  FPDF_PAGE FPDFPageFromIPDFPage(IPDF_Page* page);
  CPDF_Page* CPDFPageFromFPDFPage(FPDF_PAGE page);
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index dd99a32..462da16 100644
+index dd99a32..c5d2e20 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -10,6 +10,8 @@
@@ -202,23 +202,29 @@ index dd99a32..462da16 100644
  #include <sstream>
  #include <utility>
  #include <vector>
-@@ -2154,6 +2156,14 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
+@@ -2154,6 +2156,9 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
                                 int count) {
    CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, context && context->GetPage() &&
-+                                 context->GetPage()->GetDocument() == doc
-+                             ? CPDFSDK_AnnotHolderObjects(context)
-+                             : std::set<uint32_t>());
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !context || !context->GetPage() ||
        context->GetPage()->GetDocument() != doc ||
        appearance_mode != FPDF_ANNOT_APPEARANCEMODE_NORMAL || count < 0 ||
+@@ -2205,6 +2210,10 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
+     }
+   }
+ 
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc,
++                                         CPDFSDK_AnnotHolderObjects(context));
+   if (!context->HasForm()) {
+     context->SetForm(old_stream);
+   }
 diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
-index 6c854d2..9787f70 100644
+index 6c854d2..1b8d502 100644
 --- a/fpdfsdk/fpdf_doc.cpp
 +++ b/fpdfsdk/fpdf_doc.cpp
 @@ -25,6 +25,7 @@
@@ -229,46 +235,182 @@ index 6c854d2..9787f70 100644
  #include "core/fpdfapi/parser/cpdf_string.h"
  #include "core/fpdfapi/parser/fpdf_parser_decode.h"
  #include "core/fpdfdoc/cpdf_aaction.h"
-@@ -840,6 +841,86 @@ bool IsReservedOCGKey(ByteStringView key) {
+@@ -840,6 +841,223 @@ bool IsReservedOCGKey(ByteStringView key) {
  
  // |annot| must come from a page of |doc|, or /OC would reference an object of
  // another document.
-+// g-lab-bit fork (ocg_objnums.patch): adds the object numbers of `obj` (if
-+// a reference) and of every indirect object reachable from it.
-+void CollectReachableObjects(CPDF_Document* doc,
-+                             RetainPtr<const CPDF_Object> obj,
-+                             std::set<uint32_t>* out) {
-+  std::vector<RetainPtr<const CPDF_Object>> pending;
-+  pending.push_back(std::move(obj));
-+  while (!pending.empty()) {
-+    RetainPtr<const CPDF_Object> current = std::move(pending.back());
-+    pending.pop_back();
-+    if (!current) {
-+      continue;
++// g-lab-bit fork (ocg_objnums.patch): collects the indirect objects of the
++// optional content structures an OCG write call can modify - /OCProperties,
++// its /OCGs, /D and /Configs dictionaries and their arrays (/ON, /OFF,
++// /Locked, /Order, /RBGroups, /AS with its /OCGs and /Category), OCG
++// dictionaries, and OCMDs with their /OCGs and /VE. Only these structures are
++// entered and recorded: a reference to anything else (a page, the catalog, a
++// resource dictionary, a stream) is neither followed nor recorded, so the
++// walk stays bounded however the file links them.
++class OCStructureWalker {
++ public:
++  OCStructureWalker(CPDF_Document* doc, std::set<uint32_t>* out)
++      : doc_(doc), out_(out) {}
++
++  void Properties(RetainPtr<const CPDF_Object> obj) {
++    RetainPtr<const CPDF_Object> props = Take(std::move(obj), kUntypedDict);
++    const CPDF_Dictionary* dict = props ? props->AsDictionary() : nullptr;
++    if (!dict) {
++      return;
 +    }
-+    if (const CPDF_Reference* ref = current->AsReference()) {
-+      if (out->insert(ref->GetRefObjNum()).second) {
-+        pending.push_back(doc->GetOrParseIndirectObject(ref->GetRefObjNum()));
-+      }
-+    } else if (const CPDF_Array* array = current->AsArray()) {
-+      for (size_t i = 0; i < array->size(); ++i) {
-+        pending.push_back(array->GetObjectAt(i));
-+      }
-+    } else if (const CPDF_Dictionary* dict = current->AsDictionary()) {
-+      CPDF_DictionaryLocker locker(dict);
-+      for (const auto& item : locker) {
-+        pending.push_back(item.second);
-+      }
-+    } else if (const CPDF_Stream* stream = current->AsStream()) {
-+      pending.push_back(stream->GetDict());
++    GroupArray(dict->GetObjectFor("OCGs"));
++    Config(dict->GetObjectFor("D"));
++    RetainPtr<const CPDF_Object> configs =
++        Take(dict->GetObjectFor("Configs"), kArray);
++    if (configs) {
++      ForEach(configs, [this](RetainPtr<const CPDF_Object> e) { Config(e); });
 +    }
 +  }
-+}
++
++  // An annotation's /OC: an OCG or an OCMD.
++  void Membership(RetainPtr<const CPDF_Object> obj) {
++    if (Take(obj, kOCG)) {
++      return;
++    }
++    RetainPtr<const CPDF_Object> target = Take(std::move(obj), kOCMD);
++    const CPDF_Dictionary* ocmd = target ? target->AsDictionary() : nullptr;
++    if (!ocmd) {
++      return;
++    }
++    RetainPtr<const CPDF_Object> members = ocmd->GetObjectFor("OCGs");
++    if (!Take(members, kOCG)) {
++      GroupArray(members);
++    }
++    Expression(ocmd->GetObjectFor("VE"), 0);
++  }
++
++ private:
++  enum Kind { kArray, kUntypedDict, kOCG, kOCMD };
++  static constexpr int kMaxDepth = 32;
++
++  // Resolves `obj`; returns it if it is of `kind`, recording its object
++  // number when it is indirect (each indirect object is entered once).
++  RetainPtr<const CPDF_Object> Take(RetainPtr<const CPDF_Object> obj,
++                                    Kind kind) {
++    if (!obj) {
++      return nullptr;
++    }
++    uint32_t objnum = 0;
++    if (const CPDF_Reference* ref = ToReference(obj.Get())) {
++      objnum = ref->GetRefObjNum();
++      if (pdfium::Contains(*out_, objnum)) {
++        return nullptr;
++      }
++      obj = doc_->GetOrParseIndirectObject(objnum);
++      if (!obj) {
++        return nullptr;
++      }
++    }
++    const CPDF_Dictionary* dict = obj->AsDictionary();
++    bool accepted = false;
++    switch (kind) {
++      case kArray:
++        accepted = obj->IsArray();
++        break;
++      case kUntypedDict:
++        accepted = dict && !dict->KeyExist("Type");
++        break;
++      case kOCG:
++        accepted = dict && dict->GetNameFor("Type") == "OCG";
++        break;
++      case kOCMD:
++        accepted = dict && dict->GetNameFor("Type") == "OCMD";
++        break;
++    }
++    if (!accepted) {
++      return nullptr;
++    }
++    if (objnum) {
++      out_->insert(objnum);
++    }
++    return obj;
++  }
++
++  template <typename Fn>
++  void ForEach(const RetainPtr<const CPDF_Object>& array_obj, Fn fn) {
++    const CPDF_Array* array = array_obj->AsArray();
++    for (size_t i = 0; array && i < array->size(); ++i) {
++      fn(array->GetObjectAt(i));
++    }
++  }
++
++  void Group(RetainPtr<const CPDF_Object> obj) { Take(std::move(obj), kOCG); }
++
++  void GroupArray(RetainPtr<const CPDF_Object> obj) {
++    RetainPtr<const CPDF_Object> array = Take(std::move(obj), kArray);
++    if (array) {
++      ForEach(array, [this](RetainPtr<const CPDF_Object> e) { Group(e); });
++    }
++  }
++
++  void Order(RetainPtr<const CPDF_Object> obj, int depth) {
++    RetainPtr<const CPDF_Object> array = Take(std::move(obj), kArray);
++    if (!array || depth > kMaxDepth) {
++      return;
++    }
++    ForEach(array, [this, depth](RetainPtr<const CPDF_Object> e) {
++      if (!Take(e, kOCG)) {
++        Order(e, depth + 1);
++      }
++    });
++  }
++
++  void Expression(RetainPtr<const CPDF_Object> obj, int depth) {
++    RetainPtr<const CPDF_Object> array = Take(std::move(obj), kArray);
++    if (!array || depth > kMaxDepth) {
++      return;
++    }
++    ForEach(array, [this, depth](RetainPtr<const CPDF_Object> e) {
++      if (!Take(e, kOCG)) {
++        Expression(e, depth + 1);
++      }
++    });
++  }
++
++  void Config(RetainPtr<const CPDF_Object> obj) {
++    RetainPtr<const CPDF_Object> config = Take(std::move(obj), kUntypedDict);
++    const CPDF_Dictionary* dict = config ? config->AsDictionary() : nullptr;
++    if (!dict) {
++      return;
++    }
++    GroupArray(dict->GetObjectFor("ON"));
++    GroupArray(dict->GetObjectFor("OFF"));
++    GroupArray(dict->GetObjectFor("Locked"));
++    Order(dict->GetObjectFor("Order"), 0);
++    RetainPtr<const CPDF_Object> rb_groups =
++        Take(dict->GetObjectFor("RBGroups"), kArray);
++    if (rb_groups) {
++      ForEach(rb_groups,
++              [this](RetainPtr<const CPDF_Object> e) { GroupArray(e); });
++    }
++    RetainPtr<const CPDF_Object> auto_state =
++        Take(dict->GetObjectFor("AS"), kArray);
++    if (auto_state) {
++      ForEach(auto_state, [this](RetainPtr<const CPDF_Object> e) {
++        RetainPtr<const CPDF_Object> usage = Take(e, kUntypedDict);
++        const CPDF_Dictionary* usage_dict =
++            usage ? usage->AsDictionary() : nullptr;
++        if (usage_dict) {
++          GroupArray(usage_dict->GetObjectFor("OCGs"));
++          Take(usage_dict->GetObjectFor("Category"), kArray);
++        }
++      });
++    }
++  }
++
++  UnownedPtr<CPDF_Document> const doc_;
++  UnownedPtr<std::set<uint32_t>> const out_;
++};
 +
 +// g-lab-bit fork (ocg_objnums.patch): every existing indirect object an OCG
-+// write call can modify: the catalog, everything reachable from
-+// /OCProperties and, for calls that update annotations, every page, its
-+// /Annots array, its annotations and everything reachable from their /OC.
++// write call can modify: the catalog, the optional content structures (see
++// OCStructureWalker) and, for calls that update annotations, every page, its
++// /Annots array, its annotations and their /OC structures.
 +std::set<uint32_t> OCWriteCandidates(CPDF_Document* doc,
 +                                     bool with_annotations) {
 +  std::set<uint32_t> out;
@@ -279,7 +421,8 @@ index 6c854d2..9787f70 100644
 +  if (root->GetObjNum()) {
 +    out.insert(root->GetObjNum());
 +  }
-+  CollectReachableObjects(doc, root->GetObjectFor("OCProperties"), &out);
++  OCStructureWalker walker(doc, &out);
++  walker.Properties(root->GetObjectFor("OCProperties"));
 +  if (!with_annotations) {
 +    return out;
 +  }
@@ -306,7 +449,7 @@ index 6c854d2..9787f70 100644
 +      }
 +      RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
 +      if (annot) {
-+        CollectReachableObjects(doc, annot->GetObjectFor("OC"), &out);
++        walker.Membership(annot->GetObjectFor("OC"));
 +      }
 +    }
 +  }
@@ -316,95 +459,145 @@ index 6c854d2..9787f70 100644
  bool AnnotBelongsToDoc(CPDF_AnnotContext* context, CPDF_Document* doc) {
    return context && context->GetPage() &&
           context->GetPage()->GetDocument() == doc;
-@@ -952,6 +1033,11 @@ void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
+@@ -952,9 +1170,15 @@ void RemoveOCGRef(CPDF_Array* list, uint32_t objnum) {
  FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_CreateOCG(FPDF_DOCUMENT document,
                                                 FPDF_WIDESTRING name) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, OCWriteCandidates(doc, false));
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !name) {
      return -1;
    }
-@@ -985,6 +1071,11 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, OCWriteCandidates(doc, false));
+   RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, true);
+   if (!props) {
+     return -1;
+@@ -985,6 +1209,9 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            FPDF_WIDESTRING value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, OCWriteCandidates(doc, false));
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !key || !value || IsReservedOCGKey(key)) {
      return false;
    }
-@@ -1004,6 +1095,11 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+@@ -992,6 +1219,9 @@ FPDFDoc_SetOCGStringValue(FPDF_DOCUMENT document,
+   if (!ocg) {
+     return false;
+   }
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, OCWriteCandidates(doc, false));
+   // SAFETY: required from caller.
+   WideString ws = UNSAFE_BUFFERS(WideStringFromFPDFWideString(value));
+   ocg->SetNewFor<CPDF_String>(key, ws.AsStringView());
+@@ -1004,6 +1234,9 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
                            FPDF_BYTESTRING key,
                            float value) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, OCWriteCandidates(doc, false));
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !key || IsReservedOCGKey(key) || !std::isfinite(value)) {
      return false;
    }
-@@ -1022,6 +1118,11 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+@@ -1011,6 +1244,9 @@ FPDFDoc_SetOCGNumberValue(FPDF_DOCUMENT document,
+   if (!ocg) {
+     return false;
+   }
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, OCWriteCandidates(doc, false));
+   ocg->SetNewFor<CPDF_Number>(key, value);
+   return true;
+ }
+@@ -1022,6 +1258,9 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
                            const float* values,
                            int count) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, OCWriteCandidates(doc, false));
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !key || IsReservedOCGKey(key) || count < 0 ||
        (count > 0 && !values)) {
      return false;
-@@ -1049,6 +1150,11 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
+@@ -1036,6 +1275,9 @@ FPDFDoc_SetOCGNumberArray(FPDF_DOCUMENT document,
+   if (!ocg) {
+     return false;
+   }
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, OCWriteCandidates(doc, false));
+   auto arr = ocg->SetNewFor<CPDF_Array>(key);
+   for (int i = 0; i < count; ++i) {
+     // SAFETY: required from caller (|values| holds |count| floats).
+@@ -1049,6 +1291,9 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
                                  int index,
                                  FPDF_BOOL visible) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, OCWriteCandidates(doc, false));
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc) {
      return false;
    }
-@@ -1086,6 +1192,13 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+@@ -1057,6 +1302,9 @@ FPDFDoc_SetOCGDefaultVisibility(FPDF_DOCUMENT document,
+     return false;
+   }
+   const uint32_t objnum = ocg->GetObjNum();
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, OCWriteCandidates(doc, false));
+   RetainPtr<CPDF_Dictionary> props = GetMutableOCProperties(doc, false);
+   RetainPtr<CPDF_Dictionary> config = props->GetMutableDictFor("D");
+   if (!config) {
+@@ -1086,6 +1334,9 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
                                                      int index) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, AnnotBelongsToDoc(context, doc)
-+                             ? CPDFSDK_AnnotHolderObjects(context)
-+                             : std::set<uint32_t>());
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !AnnotBelongsToDoc(context, doc)) {
      return false;
    }
-@@ -1113,6 +1226,13 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+@@ -1093,6 +1344,10 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+   if (!annot_dict) {
+     return false;
+   }
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc,
++                                         CPDFSDK_AnnotHolderObjects(context));
+   if (index == -1) {
+     annot_dict->RemoveFor("OC");
+     return true;
+@@ -1113,6 +1368,9 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
                            int count) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
    CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, AnnotBelongsToDoc(context, doc)
-+                             ? CPDFSDK_AnnotHolderObjects(context)
-+                             : std::set<uint32_t>());
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc || !AnnotBelongsToDoc(context, doc) || count < 0 ||
        (count > 0 && !ocg_indices)) {
      return false;
-@@ -1222,10 +1342,54 @@ FPDFDoc_ClearOCGViewState(FPDF_DOCUMENT document) {
+@@ -1137,6 +1395,10 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+       }
+     }
+   }
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc,
++                                         CPDFSDK_AnnotHolderObjects(context));
+   if (objnums.empty()) {
+     annot_dict->RemoveFor("OC");
+     return true;
+@@ -1222,10 +1484,52 @@ FPDFDoc_ClearOCGViewState(FPDF_DOCUMENT document) {
    }
  }
  
@@ -451,14 +644,22 @@ index 6c854d2..9787f70 100644
  FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
                                                 int index) {
    auto* doc = CPDFDocumentFromFPDFDocument(document);
-+  // g-lab-bit fork (ocg_objnums.patch).
-+  std::optional<CPDFSDK_ModifiedObjectsTracker> tracker;
 +  if (doc) {
-+    tracker.emplace(doc, OCWriteCandidates(doc, true));
++    doc->SetLastModifiedObjects({});  // g-lab-bit fork (ocg_objnums.patch)
 +  }
    if (!doc) {
      return -1;
    }
+@@ -1241,6 +1545,9 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
+     return -1;  // only indirect OCGs can be referenced, and so deleted
+   }
+   const uint32_t objnum = entry_ref->GetRefObjNum();
++  // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
++  // the call modifies.
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, OCWriteCandidates(doc, true));
+ 
+   // 1. The group list and every configuration (/D and /Configs).
+   RemoveOCGRef(ocgs.Get(), objnum);
 diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
 index 3a74dd7..2dbdc30 100644
 --- a/public/fpdf_doc.h
