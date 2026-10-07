@@ -1,0 +1,190 @@
+diff --git a/core/fpdfapi/page/cpdf_occontext.cpp b/core/fpdfapi/page/cpdf_occontext.cpp
+index 5b04be7..bc1e6fb 100644
+--- a/core/fpdfapi/page/cpdf_occontext.cpp
++++ b/core/fpdfapi/page/cpdf_occontext.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include "core/fpdfapi/page/cpdf_occontext.h"
+ 
++#include <optional>
++
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+@@ -181,6 +183,19 @@ bool CPDF_OCContext::GetOCGVisible(const CPDF_Dictionary* pOCGDict) const {
+     return it->second;
+   }
+ 
++  // g-lab-bit fork (ocg_view_state.patch): the document's render-only view
++  // override wins over /OCProperties for the "View" usage. Page content,
++  // marked content inside annotation appearances and OCMD evaluation all
++  // reach the group's state through here.
++  if (usage_type_ == kView && pOCGDict->GetObjNum()) {
++    std::optional<bool> view_override =
++        document_->GetOCGViewOverride(pOCGDict->GetObjNum());
++    if (view_override.has_value()) {
++      ogcstate_cache_[pdfium::WrapRetain(pOCGDict)] = view_override.value();
++      return view_override.value();
++    }
++  }
++
+   bool bState = LoadOCGState(pOCGDict);
+   ogcstate_cache_[pdfium::WrapRetain(pOCGDict)] = bState;
+   return bState;
+diff --git a/core/fpdfapi/parser/cpdf_document.cpp b/core/fpdfapi/parser/cpdf_document.cpp
+index b70120b..680df41 100644
+--- a/core/fpdfapi/parser/cpdf_document.cpp
++++ b/core/fpdfapi/parser/cpdf_document.cpp
+@@ -454,6 +454,26 @@ int CPDF_Document::GetPageIndex(uint32_t objnum) {
+   return found_index;
+ }
+ 
++// g-lab-bit fork (ocg_view_state.patch).
++void CPDF_Document::SetOCGViewOverride(uint32_t ocg_objnum,
++                                       std::optional<bool> visible) {
++  if (visible.has_value()) {
++    ocg_view_overrides_[ocg_objnum] = visible.value();
++  } else {
++    ocg_view_overrides_.erase(ocg_objnum);
++  }
++}
++
++// g-lab-bit fork (ocg_view_state.patch).
++std::optional<bool> CPDF_Document::GetOCGViewOverride(
++    uint32_t ocg_objnum) const {
++  auto it = ocg_view_overrides_.find(ocg_objnum);
++  if (it == ocg_view_overrides_.end()) {
++    return std::nullopt;
++  }
++  return it->second;
++}
++
+ int CPDF_Document::GetPageCount() const {
+   return fxcrt::CollectionSize<int>(page_list_);
+ }
+diff --git a/core/fpdfapi/parser/cpdf_document.h b/core/fpdfapi/parser/cpdf_document.h
+index 88425f7..18e0ac2 100644
+--- a/core/fpdfapi/parser/cpdf_document.h
++++ b/core/fpdfapi/parser/cpdf_document.h
+@@ -7,7 +7,9 @@
+ #ifndef CORE_FPDFAPI_PARSER_CPDF_DOCUMENT_H_
+ #define CORE_FPDFAPI_PARSER_CPDF_DOCUMENT_H_
+ 
++#include <map>
+ #include <memory>
++#include <optional>
+ #include <set>
+ #include <utility>
+ #include <vector>
+@@ -109,6 +111,13 @@ class CPDF_Document : public Observable,
+   bool MovePages(pdfium::span<const int> page_indices, int dest_page_index);
+ 
+   int GetPageCount() const;
++
++  // g-lab-bit fork (ocg_view_state.patch): render-only visibility override
++  // for optional content groups (keyed by the OCG's object number), applied
++  // by CPDF_OCContext for the "View" usage. Never stored in the document.
++  void SetOCGViewOverride(uint32_t ocg_objnum, std::optional<bool> visible);
++  void ClearOCGViewOverrides() { ocg_view_overrides_.clear(); }
++  std::optional<bool> GetOCGViewOverride(uint32_t ocg_objnum) const;
+   bool IsPageLoaded(int iPage) const;
+   RetainPtr<const CPDF_Dictionary> GetPageDictionary(int iPage);
+   RetainPtr<CPDF_Dictionary> GetMutablePageDictionary(int iPage);
+@@ -237,6 +246,7 @@ class CPDF_Document : public Observable,
+   std::unique_ptr<JBig2_DocumentContext> codec_context_;
+   std::unique_ptr<LinkListIface> links_context_;
+   std::set<uint32_t> modified_apstream_ids_;
++  std::map<uint32_t, bool> ocg_view_overrides_;  // ocg_view_state.patch
+   std::vector<uint32_t> page_list_;  // Page number to page's dict objnum.
+ 
+   // Must be second to last.
+diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
+index b1e05c7..919e1db 100644
+--- a/fpdfsdk/fpdf_doc.cpp
++++ b/fpdfsdk/fpdf_doc.cpp
+@@ -1130,6 +1130,43 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+   return -1;
+ }
+ 
++// g-lab-bit fork (ocg_view_state.patch).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGViewState(FPDF_DOCUMENT document, int index, int state) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  RetainPtr<const CPDF_Dictionary> ocg = GetOCGDict(document, index);
++  if (!doc || !ocg || ocg->GetObjNum() == 0 || state < -1 || state > 1) {
++    return false;
++  }
++  std::optional<bool> visible;
++  if (state != -1) {
++    visible = state == 1;
++  }
++  doc->SetOCGViewOverride(ocg->GetObjNum(), visible);
++  return true;
++}
++
++// g-lab-bit fork (ocg_view_state.patch).
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGViewState(FPDF_DOCUMENT document,
++                                                     int index) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  RetainPtr<const CPDF_Dictionary> ocg = GetOCGDict(document, index);
++  if (!doc || !ocg || ocg->GetObjNum() == 0) {
++    return -2;
++  }
++  std::optional<bool> state = doc->GetOCGViewOverride(ocg->GetObjNum());
++  return state.has_value() ? (state.value() ? 1 : 0) : -1;
++}
++
++// g-lab-bit fork (ocg_view_state.patch).
++FPDF_EXPORT void FPDF_CALLCONV
++FPDFDoc_ClearOCGViewState(FPDF_DOCUMENT document) {
++  auto* doc = CPDFDocumentFromFPDFDocument(document);
++  if (doc) {
++    doc->ClearOCGViewOverrides();
++  }
++}
++
+ // g-lab-bit fork (fork_p8.patch).
+ FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_DeleteOCG(FPDF_DOCUMENT document,
+                                                int index) {
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index c653b71..6f4a63c 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -598,6 +598,37 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+ FPDF_EXPORT int FPDF_CALLCONV FPDFAnnot_GetOCGIndex(FPDF_DOCUMENT document,
+                                                    FPDF_ANNOTATION annot);
+ 
++// g-lab-bit fork (ocg_view_state.patch)
++// Experimental API.
++// Render-only visibility override ("view state") for OCG |index| (in
++// /OCProperties /OCGs order). It is held by the document handle only: never
++// written to /OCProperties or any other dictionary, so saving (including
++// FPDF_SaveIncrementalObjects) and FPDF_VerifyIncrementalSave are unaffected.
++// It applies to the "View" usage, i.e. every render without FPDF_PRINTING:
++// page content, marked content inside annotation appearance streams, and OCMD
++// evaluation (FPDF_RenderPageBitmap[_Start/Continue], the fork's LOD paths,
++// FPDF_FFLDraw). Print rendering keeps following the document.
++//   state: -1 = follow the document (/D), 0 = hidden, 1 = visible.
++// Returns false for an invalid |index| or |state|, or a direct (non-indirect)
++// OCG. A render in progress uses the state current when it first evaluated
++// that group; the next render sees the new state. Not thread-safe: like all
++// PDFium calls, serialise with renders of the same document.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFDoc_SetOCGViewState(FPDF_DOCUMENT document, int index, int state);
++
++// g-lab-bit fork (ocg_view_state.patch)
++// Experimental API.
++// Returns the view state set for OCG |index|: -1 = none (follows /D),
++// 0 = hidden, 1 = visible; -2 for an invalid |index|.
++FPDF_EXPORT int FPDF_CALLCONV FPDFDoc_GetOCGViewState(FPDF_DOCUMENT document,
++                                                     int index);
++
++// g-lab-bit fork (ocg_view_state.patch)
++// Experimental API.
++// Removes every view state override of |document|.
++FPDF_EXPORT void FPDF_CALLCONV
++FPDFDoc_ClearOCGViewState(FPDF_DOCUMENT document);
++
+ // Experimental API (g-lab-bit fork).
+ // Delete optional content group |index| (index into /OCProperties /OCGs):
+ // removes it from /OCGs and from every configuration (/D and /Configs:
