@@ -472,3 +472,28 @@ Tests: `testing/ocg_layers/run_tests.py` (membership read-back after every
 `SetOCMembership` case and after `DeleteOCG`; ten /OC shapes other tools write;
 buffer sizing and bad arguments; one-group /AllOff and /AnyOff, indirect
 /OCGs array, direct OCMD, empty /OCGs, /OC null).
+
+## 20. `annot_undo_wrap.patch` (fork-p13): exact undo + appearance wrapper
+
+Exact undo (Rapida, founder decision 2026-10-08):
+- `FPDFAnnot_SaveState(doc, annot)` → id: a deep copy of the annotation
+  dictionary, held by the document (never written);
+  `FPDFAnnot_RestoreState(doc, annot, id)` puts every entry back (same object),
+  so an undone edit is no change for `FPDF_FilterUnchangedObjects`;
+  `FPDFPage_InsertAnnotState(doc, page, id, index)` puts a removed annotation
+  back at its /Annots position — the same indirect object (dictionary restored)
+  or a direct copy; `FPDFAnnot_ReleaseState`.
+- `FPDF_FilterUnchangedObjects` / `FPDF_VerifyIncrementalSave` (M6): an empty
+  `/Annots` on a page equals no `/Annots` (add + remove an annotation).
+
+Appearance wrapper (Rapida invariant 7, another tool's markup):
+`FPDFAnnot_WrapAppearance(doc, annot, tint_rgb, ocg_indices, count)` — /AP /N
+becomes a new form drawing the ORIGINAL form unchanged, plus an optional tint
+(user colour, soft-masked by the original's alpha, `/BM /Color` in a separate
+graphics state — pdf.js drops one when both share one), wrapped in nested
+`/OC` marks for the layers. `/RpOriginal` records the original; rewrapping
+starts from it; no tint and no layers restores the original /N. The original
+form object is never modified.
+
+Tests: `testing/annot_state/run_tests.py PDFIUM_DIR`.
+
