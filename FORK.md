@@ -497,3 +497,17 @@ form object is never modified.
 
 Tests: `testing/annot_state/run_tests.py PDFIUM_DIR`.
 
+## 21. `annot_wrap_color.patch` (fork-p14): the wrapper writes /C
+
+PDFium's `FPDFAnnot_SetColor` refuses while `/AP /N` exists, so after
+`FPDFAnnot_WrapAppearance` nothing could write the markup's `/C` (Rapida founder
+decision 2026-10-08: the wrapper writes it).
+- A tint writes `/C` = the tint; the tinted wrapper records `/RpTint` and the
+  `/C` from before the first tint as `/RpOriginalC` (an array, or `/None`).
+- No tint (unwrap, or rewrap for layers only) puts that first `/C` back, or
+  removes `/C` when there was none. Retinting keeps the first `/C`.
+- `FPDFAnnot_GetAppearanceTint(annot, rgb)`: the current tint, false when there
+  is none (not wrapped, or layers only) — so a layer change can keep the tint.
+
+Tests: `testing/annot_state/run_tests.py PDFIUM_DIR` (`color` cases).
+

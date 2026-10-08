@@ -1,0 +1,153 @@
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index d8d27d3..685e4a4 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -2480,6 +2480,38 @@ FPDF_EXPORT void FPDF_CALLCONV FPDFAnnot_ReleaseState(FPDF_DOCUMENT document,
+ namespace {
+ 
+ constexpr char kWrapOriginalKey[] = "RpOriginal";
++// A tinted wrapper records its tint and the annotation's /C from before the
++// first tint (an array, or /None when there was none), so removing the tint
++// puts /C back exactly.
++constexpr char kWrapTintKey[] = "RpTint";
++constexpr char kWrapOriginalColorKey[] = "RpOriginalC";
++
++// The tint of a wrapper form (|form| is a Rapida wrapper with /RpTint).
++std::optional<std::array<float, 3>> ReadWrapTint(const CPDF_Dictionary* form) {
++  RetainPtr<const CPDF_Array> tint =
++      form ? form->GetArrayFor(kWrapTintKey) : nullptr;
++  if (!tint || tint->size() != 3 || !form->KeyExist(kWrapOriginalKey)) {
++    return std::nullopt;
++  }
++  std::array<float, 3> rgb = {};
++  for (size_t i = 0; i < rgb.size(); ++i) {
++    RetainPtr<const CPDF_Number> n = tint->GetNumberAt(i);
++    if (!n) {
++      return std::nullopt;
++    }
++    rgb[i] = n->GetNumber();
++  }
++  return rgb;
++}
++
++// A colour entry as written — a direct array, or a reference to one (kept as
++// the reference, so putting it back is no change); nullptr for anything else.
++RetainPtr<const CPDF_Object> ColorEntry(const CPDF_Dictionary* dict,
++                                        ByteStringView key) {
++  RetainPtr<const CPDF_Object> entry = dict->GetObjectFor(key);
++  RetainPtr<const CPDF_Object> direct = entry ? entry->GetDirect() : nullptr;
++  return direct && direct->IsArray() ? entry : nullptr;
++}
+ 
+ RetainPtr<CPDF_Dictionary> NewTransparencyGroup(CPDF_Document* doc) {
+   auto group = doc->New<CPDF_Dictionary>();
+@@ -2547,6 +2579,14 @@ FPDFAnnot_WrapAppearance(FPDF_DOCUMENT document,
+   }
+   RetainPtr<CPDF_Stream> original =
+       ToStream(doc->GetOrParseIndirectObject(original_objnum));
++  // /C before the first tint: recorded on a tinted wrapper, else the
++  // annotation's own (nullptr: it has none).
++  // (Cloning a reference keeps the reference.)
++  const bool was_tinted = original_objnum != n_ref->GetRefObjNum() &&
++                          ReadWrapTint(current->GetDict().Get()).has_value();
++  RetainPtr<const CPDF_Object> original_color =
++      was_tinted ? ColorEntry(current->GetDict().Get(), kWrapOriginalColorKey)
++                 : ColorEntry(annot_dict.Get(), "C");
+ 
+   // Validate the layer indices before changing anything.
+   std::vector<uint32_t> ocg_objnums;
+@@ -2596,6 +2636,22 @@ FPDFAnnot_WrapAppearance(FPDF_DOCUMENT document,
+     annot_dict->SetFor("AP", ap_dict);
+   }
+ 
++  // /C follows the tint: the tint colour, or what it was before the first tint.
++  if (tint_rgb) {
++    // SAFETY: required from caller (3 floats).
++    auto rgb = UNSAFE_BUFFERS(pdfium::span(tint_rgb, 3u));
++    auto color = annot_dict->SetNewFor<CPDF_Array>("C");
++    for (float c : rgb) {
++      color->AppendNew<CPDF_Number>(c);
++    }
++  } else if (was_tinted) {
++    if (original_color) {
++      annot_dict->SetFor("C", original_color->Clone());
++    } else {
++      annot_dict->RemoveFor("C");
++    }
++  }
++
+   if (!tint_rgb && ocg_objnums.empty()) {
+     if (original_objnum != n_ref->GetRefObjNum()) {
+       ap_dict->SetNewFor<CPDF_Reference>("N", doc, original_objnum);  // unwrap
+@@ -2673,6 +2729,42 @@ FPDFAnnot_WrapAppearance(FPDF_DOCUMENT document,
+   RetainPtr<CPDF_Stream> wrapper = NewForm(doc, bbox, resources, false, content);
+   wrapper->GetMutableDict()->SetNewFor<CPDF_Reference>(kWrapOriginalKey, doc,
+                                                        original_objnum);
++  if (tint_rgb) {
++    // SAFETY: required from caller (3 floats).
++    auto rgb = UNSAFE_BUFFERS(pdfium::span(tint_rgb, 3u));
++    RetainPtr<CPDF_Dictionary> wrapper_dict = wrapper->GetMutableDict();
++    auto tint_record = wrapper_dict->SetNewFor<CPDF_Array>(kWrapTintKey);
++    for (float c : rgb) {
++      tint_record->AppendNew<CPDF_Number>(c);
++    }
++    if (original_color) {
++      wrapper_dict->SetFor(kWrapOriginalColorKey, original_color->Clone());
++    } else {
++      wrapper_dict->SetNewFor<CPDF_Name>(kWrapOriginalColorKey, "None");
++    }
++  }
+   ap_dict->SetNewFor<CPDF_Reference>("N", doc, wrapper->GetObjNum());
+   return true;
+ }
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_GetAppearanceTint(FPDF_ANNOTATION annot, float* rgb) {
++  const CPDF_Dictionary* annot_dict = GetAnnotDictFromFPDFAnnotation(annot);
++  if (!annot_dict || !rgb) {
++    return false;
++  }
++  RetainPtr<const CPDF_Dictionary> ap = annot_dict->GetDictFor("AP");
++  RetainPtr<const CPDF_Stream> n =
++      ap ? ToStream(ap->GetDirectObjectFor("N")) : nullptr;
++  std::optional<std::array<float, 3>> tint =
++      n ? ReadWrapTint(n->GetDict().Get()) : std::nullopt;
++  if (!tint) {
++    return false;
++  }
++  // SAFETY: required from caller (3 floats).
++  auto out = UNSAFE_BUFFERS(pdfium::span(rgb, 3u));
++  for (size_t i = 0; i < out.size(); ++i) {
++    out[i] = (*tint)[i];
++  }
++  return true;
++}
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index d021ed4..4f4b5c5 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -1294,6 +1294,9 @@ FPDF_EXPORT void FPDF_CALLCONV FPDFAnnot_ReleaseState(FPDF_DOCUMENT document,
+ // group, so the original's blend modes act on the page as before. Reports its
+ // changes to FPDFDoc_GetLastModifiedObjects(); no tint and no layers on an
+ // unwrapped annotation changes nothing.
++// The annotation's /C follows the tint (fork-p14): a tint writes /C = the
++// tint; no tint puts back the /C it had before the first tint (removed if it
++// had none). Rewrapping keeps that first /C.
+ // Returns false (nothing changed) without a normal appearance stream, for an
+ // invalid colour or layer index.
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+@@ -1303,6 +1306,14 @@ FPDFAnnot_WrapAppearance(FPDF_DOCUMENT document,
+                          const int* ocg_indices,
+                          int ocg_count);
+ 
++// g-lab-bit fork (annot_wrap_color.patch, fork-p14)
++// Experimental API.
++// The tint FPDFAnnot_WrapAppearance put on |annot|'s normal appearance:
++// true with |rgb| (3 floats) filled, false when it has no tint (not wrapped,
++// or wrapped for layers only).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_GetAppearanceTint(FPDF_ANNOTATION annot, float* rgb);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus
