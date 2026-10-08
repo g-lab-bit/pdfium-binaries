@@ -35,7 +35,7 @@ index 680df41..f16b110 100644
  std::optional<bool> CPDF_Document::GetOCGViewOverride(
      uint32_t ocg_objnum) const {
 diff --git a/core/fpdfapi/parser/cpdf_document.h b/core/fpdfapi/parser/cpdf_document.h
-index 9b04257..f44f5f9 100644
+index 9b04257..5c81030 100644
 --- a/core/fpdfapi/parser/cpdf_document.h
 +++ b/core/fpdfapi/parser/cpdf_document.h
 @@ -119,6 +119,18 @@ class CPDF_Document : public Observable,
@@ -46,7 +46,7 @@ index 9b04257..f44f5f9 100644
 +  // copies) for exact undo. Held by the document only, never written to it.
 +  struct AnnotState {
 +    RetainPtr<CPDF_Dictionary> dict;          // the saved copy
-+    RetainPtr<const CPDF_Dictionary> source;  // the annotation it belongs to
++    RetainPtr<CPDF_Dictionary> source;  // the annotation it belongs to (kept alive)
 +    uint32_t objnum = 0;  // 0: the annotation was a direct dictionary
 +    bool inserted = false;  // put back once by FPDFPage_InsertAnnotState
 +  };
@@ -67,7 +67,7 @@ index 9b04257..f44f5f9 100644
    std::vector<uint32_t> page_list_;  // Page number to page's dict objnum.
  
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index c5d2e20..f010fdb 100644
+index c5d2e20..d8d27d3 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
 @@ -46,6 +46,8 @@
@@ -79,7 +79,7 @@ index c5d2e20..f010fdb 100644
  #include "core/fxcrt/numerics/safe_conversions.h"
  #include "core/fxcrt/ptr_util.h"
  #include "core/fxcrt/stl_util.h"
-@@ -2317,3 +2319,349 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
+@@ -2317,3 +2319,360 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
    ap_dict->SetNewFor<CPDF_Reference>("N", doc, new_stream->GetObjNum());
    return true;
  }
@@ -114,12 +114,13 @@ index c5d2e20..f010fdb 100644
 +  if (!AnnotInDoc(doc, context) || !context->GetAnnotDict()) {
 +    return 0;
 +  }
-+  const CPDF_Dictionary* dict = context->GetAnnotDict();
++  RetainPtr<CPDF_Dictionary> dict = context->GetMutableAnnotDict();
 +  RetainPtr<CPDF_Dictionary> copy = ToDictionary(dict->Clone());
 +  if (!copy) {
 +    return 0;
 +  }
-+  return doc->AddAnnotState({std::move(copy), pdfium::WrapRetain(dict), dict->GetObjNum()});
++  const uint32_t objnum = dict->GetObjNum();
++  return doc->AddAnnotState({std::move(copy), std::move(dict), objnum});
 +}
 +
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -168,9 +169,9 @@ index c5d2e20..f010fdb 100644
 +      p_ref->GetRefObjNum() != page_dict->GetObjNum()) {
 +    return -1;
 +  }
-+  // The same indirect object, if it still exists and this page does not
-+  // already list it; a direct annotation (or one whose object is gone) comes
-+  // back as a direct copy.
++  // The same object: an indirect annotation's object if it still exists and
++  // this page does not already list it; a direct annotation's own dictionary
++  // (kept alive by the state), so every other state saved for it stays valid.
 +  RetainPtr<CPDF_Dictionary> target;
 +  if (state->objnum) {
 +    target = ToDictionary(doc->GetOrParseIndirectObject(state->objnum));
@@ -206,7 +207,17 @@ index c5d2e20..f010fdb 100644
 +  if (target) {
 +    ReplaceDictContents(target.Get(), state->dict.Get());
 +    annots->InsertNewAt<CPDF_Reference>(at, doc, state->objnum);
-+    state->source = target;
++  } else if (!state->objnum && state->source) {
++    // A direct annotation: its own dictionary object, unless it is still
++    // listed somewhere on this page.
++    RetainPtr<const CPDF_Array> listed = pPage->GetAnnotsArray();
++    for (size_t i = 0; listed && i < listed->size(); ++i) {
++      if (listed->GetObjectAt(i).Get() == state->source.Get()) {
++        return -1;
++      }
++    }
++    ReplaceDictContents(state->source.Get(), state->dict.Get());
++    annots->InsertAt(at, state->source);
 +  } else {
 +    RetainPtr<CPDF_Dictionary> copy = ToDictionary(state->dict->Clone());
 +    if (!copy) {
@@ -460,7 +471,7 @@ index 7f2ce70..45dd4f9 100644
          const ByteString fixed = mem->KeyExist("Kids") ? "Pages" : "Page";
          const bool saved_valid = saved_value && saved_value->IsName() &&
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index 661425a..0e0fb0e 100644
+index 661425a..d021ed4 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
 @@ -1236,6 +1236,73 @@ FPDFAnnot_GetFileAttachment(FPDF_ANNOTATION annot);
@@ -492,10 +503,10 @@ index 661425a..0e0fb0e 100644
 +// Experimental API.
 +// Puts the annotation saved as |id| back into |page|'s /Annots at raw position
 +// |index| (clamped; -1 = at the end) — e.g. undo of FPDFPage_RemoveAnnot. An
-+// annotation that was an indirect object comes back as the SAME object (its
-+// dictionary restored to the state), unless the page already lists it; one
-+// that was a direct dictionary — or whose object no longer exists — comes back
-+// as a direct copy. A state is put back once, and only onto the page its /P
++// annotation comes back as the SAME object (its dictionary restored to the
++// state) — an indirect one by reference, a direct one as its own dictionary —
++// so every other state saved for it stays valid; only an indirect one whose
++// object no longer exists comes back as a direct copy. A state is put back once, and only onto the page its /P
 +// names. Reports its changes to FPDFDoc_GetLastModifiedObjects(). Returns its
 +// position in /Annots, or -1.
 +FPDF_EXPORT int FPDF_CALLCONV FPDFPage_InsertAnnotState(FPDF_DOCUMENT document,
