@@ -84,7 +84,7 @@ static int Reinsert(const char* in) {
   FPDFPage_RemoveAnnot(page, 0);
   int removed = Kept(doc, 3, 0);
   int i0 = FPDFPage_InsertAnnotState(doc, page, s0, 0);
-  int reported = Modified(doc, 10);
+  int reported = Modified(doc, 3);   // the page (its /Annots); annotation 10 itself is unchanged
   int i1 = FPDFPage_InsertAnnotState(doc, page, s1, 1);
   int twice = FPDFPage_InsertAnnotState(doc, page, s0, 0);   // already on the page
   int twice_direct = FPDFPage_InsertAnnotState(doc, page, s1, 1);   // put back once only
