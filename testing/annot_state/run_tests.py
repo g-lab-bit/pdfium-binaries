@@ -132,6 +132,7 @@ def main():
     check("reinsert: back at their positions", r.get("inserted") == [0, 1], d)
     check("reinsert: the same object twice refused", r.get("twice") == -1, d)
     check("reinsert: a state is put back once", r.get("twice_direct") == -1, d)
+    check("reinsert: a direct annotation comes back as itself (older states still apply)", r.get("older_ok") == 1, d)
     check("reinsert: reports the page as modified", r.get("reported") == 1, d)
     check("reinsert: page and annotation unchanged (filter)", r.get("after") == 0, d)
     check("reinsert: indirect annotation is the same object", r.get("obj0") == 10 and r.get("count") == 3, d)

@@ -78,6 +78,8 @@ static int Reinsert(const char* in) {
   FPDF_DOCUMENT doc = FPDF_LoadDocument(in, NULL);
   FPDF_PAGE page = FPDF_LoadPage(doc, 0);
   FPDF_ANNOTATION a0 = FPDFPage_GetAnnot(page, 0), a1 = FPDFPage_GetAnnot(page, 1);
+  int older = FPDFAnnot_SaveState(doc, a1);   // an earlier undo step of the direct one
+  FPDFAnnot_SetColor(a1, FPDFANNOT_COLORTYPE_Color, 9, 9, 9, 255);
   int s0 = FPDFAnnot_SaveState(doc, a0), s1 = FPDFAnnot_SaveState(doc, a1);
   FPDFPage_CloseAnnot(a0); FPDFPage_CloseAnnot(a1);
   FPDFPage_RemoveAnnot(page, 1);
@@ -88,13 +90,16 @@ static int Reinsert(const char* in) {
   int i1 = FPDFPage_InsertAnnotState(doc, page, s1, 1);
   int twice = FPDFPage_InsertAnnotState(doc, page, s0, 0);   // already on the page
   int twice_direct = FPDFPage_InsertAnnotState(doc, page, s1, 1);   // put back once only
+  FPDF_ANNOTATION back1 = FPDFPage_GetAnnot(page, 1);
+  int older_ok = FPDFAnnot_RestoreState(doc, back1, older);   // still the same dictionary
+  FPDFPage_CloseAnnot(back1);
   int after = Kept(doc, 3, 10);
   FPDF_ANNOTATION b0 = FPDFPage_GetAnnot(page, 0);
   unsigned long obj0 = FPDFAnnot_GetObjectNumber(b0);
   FPDFPage_CloseAnnot(b0);
   int count = FPDFPage_GetAnnotCount(page);
-  printf("{\"removed\":%d,\"inserted\":[%d,%d],\"twice\":%d,\"twice_direct\":%d,\"after\":%d,\"obj0\":%lu,\"count\":%d,\"reported\":%d}\n",
-         removed, i0, i1, twice, twice_direct, after, obj0, count, reported);
+  printf("{\"removed\":%d,\"inserted\":[%d,%d],\"twice\":%d,\"twice_direct\":%d,\"after\":%d,\"obj0\":%lu,\"count\":%d,\"reported\":%d,\"older_ok\":%d}\n",
+         removed, i0, i1, twice, twice_direct, after, obj0, count, reported, older_ok);
   FPDF_ClosePage(page); FPDF_CloseDocument(doc);
   return 0;
 }
