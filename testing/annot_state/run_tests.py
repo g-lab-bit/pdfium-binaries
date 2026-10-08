@@ -101,7 +101,13 @@ def main():
                 out.update(json.loads(line))
         return out
     files = {}
-    for name, objs in (("edit", EDIT), ("empty", EMPTY), ("wrap", WRAP), ("half", HALF), ("rot", ROT), ("hl", HL)):
+    WRAPC = dict(WRAP)
+    WRAPC[10] = b"<< /Type /Annot /Subtype /Stamp /Rect [100 100 200 150] /F 4 /C [1 0 0] /AP << /N 20 0 R >> >>"
+    WRAPI = dict(WRAP)   # /C indirect
+    WRAPI[10] = b"<< /Type /Annot /Subtype /Stamp /Rect [100 100 200 150] /F 4 /C 50 0 R /AP << /N 20 0 R >> >>"
+    WRAPI[50] = b"[1 0 0]"
+    for name, objs in (("edit", EDIT), ("empty", EMPTY), ("wrap", WRAP), ("wrapc", WRAPC), ("wrapi", WRAPI),
+                       ("half", HALF), ("rot", ROT), ("hl", HL)):
         files[name] = os.path.join(WORK, name + ".pdf")
         open(files[name], "wb").write(classic(objs))
     failures, ran = [], 0
@@ -207,6 +213,61 @@ def main():
     if orig is not None:
         f20 = orig.get_object(20, 0)
         check("wrap: the original form is untouched", f20.read_bytes() == b"1 0 0 rg 0 0 100 50 re f\n")
+
+    # fork-p14: /C follows the tint; the first /C comes back; the getter.
+    def annot0(path):
+        pdf = pikepdf.open(path)
+        opened.append(pdf)
+        return pdf.pages[0].Annots[0]
+    def color_of(a):
+        return [round(float(x), 3) for x in a.C] if "/C" in a else None
+    BLUE, GREEN, ORIG = [0.0, 0.25, 1.0], [0.0, 0.5, 0.0], [1.0, 0.0, 0.0]
+    color_cases = [
+        # fixture, seq, expected /C, expected tint (None: not tinted), label
+        ("wrapc", "b", BLUE, BLUE, "tint writes /C = the tint"),
+        ("wrapc", "bU", ORIG, None, "unwrap puts the original /C back"),
+        ("wrapc", "bg", GREEN, GREEN, "retint: /C = the new tint"),
+        ("wrapc", "bgU", ORIG, None, "retint then unwrap: the FIRST /C comes back"),
+        ("wrapc", "BL", ORIG, None, "tint removed, layer kept: original /C back"),
+        ("wrapc", "LB", BLUE, BLUE, "layer then tint: /C = tint"),
+        ("wrapc", "LBL", ORIG, None, "layer, tint, layer: original /C back"),
+        ("wrapc", "L", ORIG, None, "layer only: /C untouched, no tint"),
+        ("wrap", "b", BLUE, BLUE, "no /C before: tint writes it"),
+        ("wrap", "bgU", None, None, "no /C before: unwrap removes it again"),
+        ("wrap", "bL", None, None, "no /C before: layer-only rewrap removes it"),
+        ("wrapc", "Bb", BLUE, BLUE, "tint + layer, then tint only: /C = tint"),
+        ("wrapc", "bx", BLUE, BLUE, "a refused call after a tint changes nothing"),
+        ("wrapi", "b", BLUE, BLUE, "indirect /C: tint writes a direct /C"),
+        ("wrapi", "bgU", ORIG, None, "indirect /C: the first /C comes back"),
+    ]
+    for fname, seq, want_c, want_tint, label in color_cases:
+        out = os.path.join(WORK, "color_%s_%s.pdf" % (fname, seq))
+        r = drv("color", files[fname], out, seq)
+        d = json.dumps(r)
+        a = annot0(out)
+        c = color_of(a)
+        tint_ok = (r.get("tinted") == 0) if want_tint is None else (
+            r.get("tinted") == 1 and [round(x, 3) for x in r.get("tint", [])] == want_tint)
+        check("color %s %s: %s" % (fname, seq, label),
+              r.get("ok") == 1 and r.get("refused_did") == 0 and r.get("saved") == 1 and r.get("tinted_before") == 0
+              and r.get("null_out") == 0 and c == want_c and tint_ok, "%s C=%r" % (d, c))
+    # The tinted wrapper records the first /C (an array, or /None).
+    n = annot0(os.path.join(WORK, "color_wrapc_bg.pdf")).AP.N
+    check("color: a retinted wrapper keeps the first /C", [float(x) for x in n.RpOriginalC] == ORIG
+          and [round(float(x), 3) for x in n.RpTint] == GREEN, repr(n.keys()))
+    n = annot0(os.path.join(WORK, "color_wrap_b.pdf")).AP.N
+    check("color: no /C before is recorded as /None", n.RpOriginalC == "/None", repr(n.get("/RpOriginalC")))
+    a = annot0(os.path.join(WORK, "color_wrapi_bgU.pdf"))
+    c = a.get("/C")
+    check("color: an indirect /C comes back as the same object",
+          c is not None and c.is_indirect and c.objgen[0] == 50, repr(c))
+    a = annot0(os.path.join(WORK, "color_wrapi_b.pdf"))
+    rec = a.AP.N.get("/RpOriginalC")
+    check("color: a tint records an indirect /C by reference, leaving its object alone",
+          rec is not None and rec.is_indirect and rec.objgen[0] == 50
+          and [float(x) for x in rec] == ORIG and not a.C.is_indirect, repr(rec))
+    n = annot0(os.path.join(WORK, "color_wrapc_L.pdf")).AP.N
+    check("color: a layer-only wrapper records no tint", "/RpTint" not in n and "/RpOriginalC" not in n, repr(n.keys()))
 
     print("\n%d case(s), %d failure(s)" % (ran, len(failures)))
     sys.exit(1 if failures else 0)

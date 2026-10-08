@@ -13,6 +13,11 @@
 //                            MODE tint | layer | both | unwrap | rewrap;
 //                            prints pixels (annotation centre) with the layer on
 //                            and off; full save to OUT.
+//   driver color IN OUT SEQ  (fork-p14) annotation 0 wrapped once per letter of
+//                            SEQ: b / g = blue / green tint, B = blue tint +
+//                            layer, L = layer only, U = unwrap, x = a refused
+//                            call (bad layer); prints the tint
+//                            FPDFAnnot_GetAppearanceTint reports; save to OUT.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,6 +176,37 @@ static int Wrap(const char* in, const char* out, const char* mode) {
   return 0;
 }
 
+static int Color(const char* in, const char* out, const char* seq) {
+  FPDF_DOCUMENT doc = FPDF_LoadDocument(in, NULL);
+  FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+  FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, 0);
+  const float blue[3] = {0.0f, 0.25f, 1.0f}, green[3] = {0.0f, 0.5f, 0.0f};
+  const int layers[1] = {0};
+  float before[3] = {-1, -1, -1};
+  int tinted_before = FPDFAnnot_GetAppearanceTint(a, before);
+  const int bad_layer[1] = {9};
+  int ok = 1, refused_did = 0;
+  for (const char* c = seq; *c; ++c) {
+    if (*c == 'b') ok &= FPDFAnnot_WrapAppearance(doc, a, blue, NULL, 0);
+    else if (*c == 'g') ok &= FPDFAnnot_WrapAppearance(doc, a, green, NULL, 0);
+    else if (*c == 'B') ok &= FPDFAnnot_WrapAppearance(doc, a, blue, layers, 1);
+    else if (*c == 'L') ok &= FPDFAnnot_WrapAppearance(doc, a, NULL, layers, 1);
+    else if (*c == 'U') ok &= FPDFAnnot_WrapAppearance(doc, a, NULL, NULL, 0);
+    else if (*c == 'x') refused_did |= FPDFAnnot_WrapAppearance(doc, a, green, bad_layer, 1);
+  }
+  float t[3] = {-1, -1, -1};
+  int tinted = FPDFAnnot_GetAppearanceTint(a, t);
+  int null_out = FPDFAnnot_GetAppearanceTint(a, NULL);
+  FPDFPage_CloseAnnot(a);
+  FPDF_ClosePage(page);
+  int saved = SaveTo(doc, out);
+  printf("{\"ok\":%d,\"refused_did\":%d,\"tinted_before\":%d,\"tinted\":%d,\"tint\":[%.3f,%.3f,%.3f],"
+         "\"null_out\":%d,\"saved\":%d}\n",
+         ok, refused_did, tinted_before, tinted, t[0], t[1], t[2], null_out, saved);
+  FPDF_CloseDocument(doc);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) return 2;
   FPDF_InitLibrary();
@@ -179,6 +215,7 @@ int main(int argc, char** argv) {
   else if (!strcmp(argv[1], "reinsert")) rc = Reinsert(argv[2]);
   else if (!strcmp(argv[1], "empty")) rc = Empty(argv[2]);
   else if (!strcmp(argv[1], "wrap") && argc >= 5) rc = Wrap(argv[2], argv[3], argv[4]);
+  else if (!strcmp(argv[1], "color") && argc >= 5) rc = Color(argv[2], argv[3], argv[4]);
   FPDF_DestroyLibrary();
   return rc;
 }
