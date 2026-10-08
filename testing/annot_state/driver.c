@@ -1,6 +1,6 @@
-// Driver for annot_undo_wrap.patch (FPDFAnnot_SaveState / RestoreState /
+// Driver for annot_undo_wrap.patch: FPDFAnnot_SaveState / RestoreState /
 // FPDFPage_InsertAnnotState / ReleaseState, empty /Annots = none in
-// FPDF_FilterUnchangedObjects) and annot_undo_wrap.patch (FPDFAnnot_WrapAppearance).
+// FPDF_FilterUnchangedObjects, and FPDFAnnot_WrapAppearance.
 //
 //   driver restore IN        edit annotation 0 (indirect) and 1 (direct), restore
 //                            both; prints what FPDF_FilterUnchangedObjects keeps.
@@ -39,17 +39,28 @@ static int Kept(FPDF_DOCUMENT doc, uint32_t a, uint32_t b) {
   return FPDF_FilterUnchangedObjects(doc, list, b ? 2 : 1);
 }
 
+static int Modified(FPDF_DOCUMENT doc, uint32_t objnum) {
+  uint32_t buf[16];
+  int n = FPDFDoc_GetLastModifiedObjects(doc, buf, 16);
+  for (int i = 0; i < n && i < 16; ++i) if (buf[i] == objnum) return 1;
+  return 0;
+}
+
 static int Restore(const char* in) {
   FPDF_DOCUMENT doc = FPDF_LoadDocument(in, NULL);
   FPDF_PAGE page = FPDF_LoadPage(doc, 0);
   FPDF_ANNOTATION a0 = FPDFPage_GetAnnot(page, 0), a1 = FPDFPage_GetAnnot(page, 1);
+  FPDF_ANNOTATION a2 = FPDFPage_GetAnnot(page, 2);
   int s0 = FPDFAnnot_SaveState(doc, a0), s1 = FPDFAnnot_SaveState(doc, a1);
   FPDFAnnot_SetColor(a0, FPDFANNOT_COLORTYPE_Color, 0, 0, 255, 255);
   FPDFAnnot_SetColor(a1, FPDFANNOT_COLORTYPE_Color, 0, 0, 255, 255);
   FPDFAnnot_SetStringValue(a0, "Contents", (FPDF_WIDESTRING) "x\0\0");
   int changed = Kept(doc, 10, 3);
-  int r0 = FPDFAnnot_RestoreState(doc, a0, s0), r1 = FPDFAnnot_RestoreState(doc, a1, s1);
+  int r0 = FPDFAnnot_RestoreState(doc, a0, s0);
+  int reported = Modified(doc, 10);
+  int r1 = FPDFAnnot_RestoreState(doc, a1, s1);
   int after = Kept(doc, 10, 3);
+  int wrong_direct = FPDFAnnot_RestoreState(doc, a2, s1);   // another direct annotation
   int wrong = FPDFAnnot_RestoreState(doc, a0, s1);   // a direct state on an indirect annotation
   int bad = FPDFAnnot_RestoreState(doc, a0, 999);
   int again = FPDFAnnot_RestoreState(doc, a0, s0);   // the state stays
@@ -57,7 +68,8 @@ static int Restore(const char* in) {
   int released = FPDFAnnot_RestoreState(doc, a0, s0);
   printf("{\"ids\":[%d,%d],\"changed\":%d,\"restored\":[%d,%d],\"after\":%d,\"wrong\":%d,\"bad\":%d,\"again\":%d,\"released\":%d}\n",
          s0, s1, changed, r0, r1, after, wrong, bad, again, released);
-  FPDFPage_CloseAnnot(a0); FPDFPage_CloseAnnot(a1);
+  printf("{\"reported\":%d,\"wrong_direct\":%d}\n", reported, wrong_direct);
+  FPDFPage_CloseAnnot(a0); FPDFPage_CloseAnnot(a1); FPDFPage_CloseAnnot(a2);
   FPDF_ClosePage(page); FPDF_CloseDocument(doc);
   return 0;
 }
@@ -72,15 +84,17 @@ static int Reinsert(const char* in) {
   FPDFPage_RemoveAnnot(page, 0);
   int removed = Kept(doc, 3, 0);
   int i0 = FPDFPage_InsertAnnotState(doc, page, s0, 0);
+  int reported = Modified(doc, 10);
   int i1 = FPDFPage_InsertAnnotState(doc, page, s1, 1);
   int twice = FPDFPage_InsertAnnotState(doc, page, s0, 0);   // already on the page
+  int twice_direct = FPDFPage_InsertAnnotState(doc, page, s1, 1);   // put back once only
   int after = Kept(doc, 3, 10);
   FPDF_ANNOTATION b0 = FPDFPage_GetAnnot(page, 0);
   unsigned long obj0 = FPDFAnnot_GetObjectNumber(b0);
   FPDFPage_CloseAnnot(b0);
   int count = FPDFPage_GetAnnotCount(page);
-  printf("{\"removed\":%d,\"inserted\":[%d,%d],\"twice\":%d,\"after\":%d,\"obj0\":%lu,\"count\":%d}\n",
-         removed, i0, i1, twice, after, obj0, count);
+  printf("{\"removed\":%d,\"inserted\":[%d,%d],\"twice\":%d,\"twice_direct\":%d,\"after\":%d,\"obj0\":%lu,\"count\":%d,\"reported\":%d}\n",
+         removed, i0, i1, twice, twice_direct, after, obj0, count, reported);
   FPDF_ClosePage(page); FPDF_CloseDocument(doc);
   return 0;
 }
@@ -98,15 +112,15 @@ static int Empty(const char* in) {
   return 0;
 }
 
-// BGRA at the annotation centre (150, 125), 72 dpi, with FPDF_ANNOT.
-static void Pixel(FPDF_DOCUMENT doc, int out[3]) {
+// RGB at page point (x, y), 72 dpi, with FPDF_ANNOT.
+static void PixelAt(FPDF_DOCUMENT doc, int x, int y, int out[3]) {
   FPDF_PAGE page = FPDF_LoadPage(doc, 0);
   int w = 300, h = 300;
   FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);
   FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
   FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, 0, FPDF_ANNOT);
   const unsigned char* p = (const unsigned char*)FPDFBitmap_GetBuffer(bmp) +
-                           (h - 125) * FPDFBitmap_GetStride(bmp) + 150 * 4;
+                           (h - y) * FPDFBitmap_GetStride(bmp) + x * 4;
   out[0] = p[2]; out[1] = p[1]; out[2] = p[0];
   FPDFBitmap_Destroy(bmp);
   FPDF_ClosePage(page);
@@ -124,6 +138,10 @@ static int Wrap(const char* in, const char* out, const char* mode) {
   else if (!strcmp(mode, "both")) ok = FPDFAnnot_WrapAppearance(doc, a, blue, layers, 1);
   else if (!strcmp(mode, "unwrap"))
     ok = FPDFAnnot_WrapAppearance(doc, a, blue, layers, 1) && FPDFAnnot_WrapAppearance(doc, a, NULL, NULL, 0);
+  else if (!strcmp(mode, "noop")) {   // never wrapped: no change at all
+    ok = FPDFAnnot_WrapAppearance(doc, a, NULL, NULL, 0);
+    printf("{\"noop_kept\":%d}\n", Kept(doc, 10, 0));
+  }
   else if (!strcmp(mode, "rewrap"))
     ok = FPDFAnnot_WrapAppearance(doc, a, blue, NULL, 0) && FPDFAnnot_WrapAppearance(doc, a, blue, layers, 1);
   const float bad_rgb[3] = {2.0f, 0, 0};
@@ -132,14 +150,18 @@ static int Wrap(const char* in, const char* out, const char* mode) {
   int bad2 = FPDFAnnot_WrapAppearance(doc, a, NULL, bad_layer, 1);
   FPDFPage_CloseAnnot(a);
   FPDF_ClosePage(page);
-  int on[3], off[3];
-  Pixel(doc, on);
+  int on[3], off[3], left[3], right[3];
+  PixelAt(doc, 150, 125, on);
+  PixelAt(doc, 125, 125, left);
+  PixelAt(doc, 175, 125, right);
   FPDFDoc_SetOCGViewState(doc, 0, 0);
-  Pixel(doc, off);
+  PixelAt(doc, 150, 125, off);
   FPDFDoc_SetOCGViewState(doc, 0, -1);
   int saved = SaveTo(doc, out);
-  printf("{\"ok\":%d,\"bad_rgb\":%d,\"bad_layer\":%d,\"on\":[%d,%d,%d],\"off\":[%d,%d,%d],\"saved\":%d}\n",
-         ok, bad1, bad2, on[0], on[1], on[2], off[0], off[1], off[2], saved);
+  printf("{\"ok\":%d,\"bad_rgb\":%d,\"bad_layer\":%d,\"on\":[%d,%d,%d],\"off\":[%d,%d,%d],"
+         "\"left\":[%d,%d,%d],\"right\":[%d,%d,%d],\"saved\":%d}\n",
+         ok, bad1, bad2, on[0], on[1], on[2], off[0], off[1], off[2],
+         left[0], left[1], left[2], right[0], right[1], right[2], saved);
   FPDF_CloseDocument(doc);
   return 0;
 }

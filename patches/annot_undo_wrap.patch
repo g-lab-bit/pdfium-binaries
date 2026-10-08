@@ -1,5 +1,5 @@
 diff --git a/core/fpdfapi/parser/cpdf_document.cpp b/core/fpdfapi/parser/cpdf_document.cpp
-index 680df41..a9f58f4 100644
+index 680df41..f16b110 100644
 --- a/core/fpdfapi/parser/cpdf_document.cpp
 +++ b/core/fpdfapi/parser/cpdf_document.cpp
 @@ -6,6 +6,8 @@
@@ -26,7 +26,7 @@ index 680df41..a9f58f4 100644
 +}
 +
 +// g-lab-bit fork (annot_undo_wrap.patch).
-+const CPDF_Document::AnnotState* CPDF_Document::GetAnnotState(int id) const {
++CPDF_Document::AnnotState* CPDF_Document::GetAnnotState(int id) {
 +  auto it = annot_states_.find(id);
 +  return it == annot_states_.end() ? nullptr : &it->second;
 +}
@@ -35,27 +35,29 @@ index 680df41..a9f58f4 100644
  std::optional<bool> CPDF_Document::GetOCGViewOverride(
      uint32_t ocg_objnum) const {
 diff --git a/core/fpdfapi/parser/cpdf_document.h b/core/fpdfapi/parser/cpdf_document.h
-index 9b04257..117a8d0 100644
+index 9b04257..f44f5f9 100644
 --- a/core/fpdfapi/parser/cpdf_document.h
 +++ b/core/fpdfapi/parser/cpdf_document.h
-@@ -119,6 +119,16 @@ class CPDF_Document : public Observable,
+@@ -119,6 +119,18 @@ class CPDF_Document : public Observable,
    void ClearOCGViewOverrides() { ocg_view_overrides_.clear(); }
    std::optional<bool> GetOCGViewOverride(uint32_t ocg_objnum) const;
  
 +  // g-lab-bit fork (annot_undo_wrap.patch): saved annotation dictionaries (deep
 +  // copies) for exact undo. Held by the document only, never written to it.
 +  struct AnnotState {
-+    RetainPtr<CPDF_Dictionary> dict;
++    RetainPtr<CPDF_Dictionary> dict;          // the saved copy
++    RetainPtr<const CPDF_Dictionary> source;  // the annotation it belongs to
 +    uint32_t objnum = 0;  // 0: the annotation was a direct dictionary
++    bool inserted = false;  // put back once by FPDFPage_InsertAnnotState
 +  };
 +  int AddAnnotState(AnnotState state);
-+  const AnnotState* GetAnnotState(int id) const;
++  AnnotState* GetAnnotState(int id);
 +  void ReleaseAnnotState(int id) { annot_states_.erase(id); }
 +
    // g-lab-bit fork (ocg_objnums.patch): object numbers of the existing
    // indirect objects modified by the most recent fork write call.
    void SetLastModifiedObjects(std::vector<uint32_t> objnums) {
-@@ -256,6 +266,8 @@ class CPDF_Document : public Observable,
+@@ -256,6 +268,8 @@ class CPDF_Document : public Observable,
    std::unique_ptr<LinkListIface> links_context_;
    std::set<uint32_t> modified_apstream_ids_;
    std::map<uint32_t, bool> ocg_view_overrides_;  // ocg_view_state.patch
@@ -65,10 +67,19 @@ index 9b04257..117a8d0 100644
    std::vector<uint32_t> page_list_;  // Page number to page's dict objnum.
  
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index c5d2e20..a114bd9 100644
+index c5d2e20..f010fdb 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
-@@ -2317,3 +2317,310 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
+@@ -46,6 +46,8 @@
+ #include "core/fxcrt/containers/unique_ptr_adapters.h"
+ #include "core/fxcrt/fx_safe_types.h"
+ #include "core/fxcrt/fx_string_wrappers.h"
++#include "core/fxcrt/stream_write_utils.h"
++#include "core/fxcrt/fx_string_wrappers.h"
+ #include "core/fxcrt/numerics/safe_conversions.h"
+ #include "core/fxcrt/ptr_util.h"
+ #include "core/fxcrt/stl_util.h"
+@@ -2317,3 +2319,349 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
    ap_dict->SetNewFor<CPDF_Reference>("N", doc, new_stream->GetObjNum());
    return true;
  }
@@ -108,7 +119,7 @@ index c5d2e20..a114bd9 100644
 +  if (!copy) {
 +    return 0;
 +  }
-+  return doc->AddAnnotState({std::move(copy), dict->GetObjNum()});
++  return doc->AddAnnotState({std::move(copy), pdfium::WrapRetain(dict), dict->GetObjNum()});
 +}
 +
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -121,9 +132,11 @@ index c5d2e20..a114bd9 100644
 +  if (!AnnotInDoc(doc, context)) {
 +    return false;
 +  }
-+  const CPDF_Document::AnnotState* state = doc->GetAnnotState(id);
++  CPDF_Document::AnnotState* state = doc->GetAnnotState(id);
 +  RetainPtr<CPDF_Dictionary> dict = context->GetMutableAnnotDict();
-+  if (!state || !dict || state->objnum != dict->GetObjNum()) {
++  // The same annotation: the same dictionary object (direct annotations all
++  // have object number 0, so the number alone cannot tell them apart).
++  if (!state || !dict || state->source.Get() != dict.Get()) {
 +    return false;
 +  }
 +  CPDFSDK_ModifiedObjectsTracker tracker(doc,
@@ -144,12 +157,20 @@ index c5d2e20..a114bd9 100644
 +  if (!doc || !pPage || pPage->GetDocument() != doc) {
 +    return -1;
 +  }
-+  const CPDF_Document::AnnotState* state = doc->GetAnnotState(id);
-+  if (!state) {
++  CPDF_Document::AnnotState* state = doc->GetAnnotState(id);
++  if (!state || state->inserted) {
++    return -1;  // unknown, or already put back once
++  }
++  RetainPtr<const CPDF_Dictionary> page_dict = pPage->GetDict();
++  // Only onto its own page (an annotation belongs to one page, /P).
++  const CPDF_Reference* p_ref = ToReference(state->dict->GetObjectFor("P").Get());
++  if (p_ref && page_dict && page_dict->GetObjNum() &&
++      p_ref->GetRefObjNum() != page_dict->GetObjNum()) {
 +    return -1;
 +  }
 +  // The same indirect object, if it still exists and this page does not
-+  // already list it; otherwise a direct copy.
++  // already list it; a direct annotation (or one whose object is gone) comes
++  // back as a direct copy.
 +  RetainPtr<CPDF_Dictionary> target;
 +  if (state->objnum) {
 +    target = ToDictionary(doc->GetOrParseIndirectObject(state->objnum));
@@ -162,6 +183,20 @@ index c5d2e20..a114bd9 100644
 +      }
 +    }
 +  }
++  // Record what this modifies: the page, its /Annots array, the annotation.
++  std::set<uint32_t> holders;
++  if (page_dict && page_dict->GetObjNum()) {
++    holders.insert(page_dict->GetObjNum());
++  }
++  if (const CPDF_Reference* annots_ref =
++          page_dict ? ToReference(page_dict->GetObjectFor("Annots").Get())
++                    : nullptr) {
++    holders.insert(annots_ref->GetRefObjNum());
++  }
++  if (target) {
++    holders.insert(state->objnum);
++  }
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, holders);
 +  RetainPtr<CPDF_Array> annots = pPage->GetOrCreateAnnotsArray();
 +  if (!annots) {
 +    return -1;
@@ -171,13 +206,16 @@ index c5d2e20..a114bd9 100644
 +  if (target) {
 +    ReplaceDictContents(target.Get(), state->dict.Get());
 +    annots->InsertNewAt<CPDF_Reference>(at, doc, state->objnum);
++    state->source = target;
 +  } else {
 +    RetainPtr<CPDF_Dictionary> copy = ToDictionary(state->dict->Clone());
 +    if (!copy) {
 +      return -1;
 +    }
++    state->source = copy;  // a later RestoreState applies to this copy
 +    annots->InsertAt(at, std::move(copy));
 +  }
++  state->inserted = true;
 +  return pdfium::checked_cast<int>(at);
 +}
 +
@@ -297,6 +335,10 @@ index c5d2e20..a114bd9 100644
 +    }
 +  }
 +
++  if (!tint_rgb && ocg_objnums.empty() &&
++      original_objnum == n_ref->GetRefObjNum()) {
++    return true;  // nothing wrapped, nothing to undo: no change at all
++  }
 +  CPDFSDK_ModifiedObjectsTracker tracker(doc,
 +                                         CPDFSDK_AnnotHolderObjects(context));
 +  // /AP as a direct dictionary of the annotation (an indirect one is copied,
@@ -308,7 +350,9 @@ index c5d2e20..a114bd9 100644
 +  }
 +
 +  if (!tint_rgb && ocg_objnums.empty()) {
-+    ap_dict->SetNewFor<CPDF_Reference>("N", doc, original_objnum);  // unwrap
++    if (original_objnum != n_ref->GetRefObjNum()) {
++      ap_dict->SetNewFor<CPDF_Reference>("N", doc, original_objnum);  // unwrap
++    }
 +    return true;
 +  }
 +
@@ -316,9 +360,16 @@ index c5d2e20..a114bd9 100644
 +  RetainPtr<const CPDF_Dictionary> original_dict = original->GetDict();
 +  const CFX_FloatRect bbox = original_dict->GetMatrixFor("Matrix").TransformRect(
 +      original_dict->GetRectFor("BBox"));
-+  const ByteString box = ByteString::Format("%.4f %.4f %.4f %.4f re f",
-+                                            bbox.left, bbox.bottom,
-+                                            bbox.Width(), bbox.Height());
++  // Numbers through WriteFloat: locale-independent (never "0,3").
++  auto numbers = [](std::initializer_list<float> values) {
++    fxcrt::ostringstream buf;
++    for (float v : values) {
++      WriteFloat(buf, v) << " ";
++    }
++    return ByteString(buf);
++  };
++  const ByteString box =
++      numbers({bbox.left, bbox.bottom, bbox.Width(), bbox.Height()}) + "re f";
 +
 +  auto resources = doc->New<CPDF_Dictionary>();
 +  auto xobjects = resources->SetNewFor<CPDF_Dictionary>("XObject");
@@ -347,9 +398,7 @@ index c5d2e20..a114bd9 100644
 +    auto rgb = UNSAFE_BUFFERS(pdfium::span(tint_rgb, 3u));
 +    RetainPtr<CPDF_Stream> tint = NewForm(
 +        doc, bbox, tint_resources, true,
-+        ByteString::Format("q /M gs %.4f %.4f %.4f rg ", rgb[0], rgb[1],
-+                           rgb[2]) +
-+            box + " Q\n");
++        "q /M gs " + numbers({rgb[0], rgb[1], rgb[2]}) + "rg " + box + " Q\n");
 +    auto blend_gs = doc->NewIndirect<CPDF_Dictionary>();
 +    blend_gs->SetNewFor<CPDF_Name>("Type", "ExtGState");
 +    blend_gs->SetNewFor<CPDF_Name>("BM", "Color");
@@ -372,22 +421,34 @@ index c5d2e20..a114bd9 100644
 +  for (size_t i = 0; i < ocg_objnums.size(); ++i) {
 +    content += "EMC\n";
 +  }
-+  RetainPtr<CPDF_Stream> wrapper =
-+      NewForm(doc, bbox, resources, tint_rgb != nullptr, content);
++  // The wrapper is NOT a transparency group: the original (e.g. a Multiply
++  // highlight) and the /Color tint blend with the page as before.
++  RetainPtr<CPDF_Stream> wrapper = NewForm(doc, bbox, resources, false, content);
 +  wrapper->GetMutableDict()->SetNewFor<CPDF_Reference>(kWrapOriginalKey, doc,
 +                                                       original_objnum);
 +  ap_dict->SetNewFor<CPDF_Reference>("N", doc, wrapper->GetObjNum());
 +  return true;
 +}
 diff --git a/fpdfsdk/fpdf_save.cpp b/fpdfsdk/fpdf_save.cpp
-index 7f2ce70..c30c19f 100644
+index 7f2ce70..45dd4f9 100644
 --- a/fpdfsdk/fpdf_save.cpp
 +++ b/fpdfsdk/fpdf_save.cpp
-@@ -797,6 +797,14 @@ class SaveVerifier {
+@@ -327,6 +327,10 @@ namespace {
+ //     is loaded (TraversePDFPages): NOT tolerated. FPDF_SaveIncrementalObjects
+ //     refuses such a document unless the /Pages node is listed, so a
+ //     mismatch here is real.
++//  M8 (g-lab-bit fork, annot_undo_wrap.patch) An empty /Annots on a page is the
++//     same as no /Annots (an annotation added and removed again): accepted only
++//     on page tree dictionaries, only for an empty array against a saved
++//     dictionary without /Annots.
+ //  M7 With an interactive form, CPDF_InteractiveForm::LoadField /
+ //     AddTerminalField (also via FixPageFields when a form page view is
+ //     created) (a) replaces an indirect /T with a direct copy of the string
+@@ -797,6 +801,14 @@ class SaveVerifier {
                               const CPDF_Object* mem_value,
                               const CPDF_Object* saved_value) {
      if (pdfium::Contains(page_tree_, mem)) {
-+      // g-lab-bit fork (annot_undo_wrap.patch), M6: an empty /Annots is the same
++      // g-lab-bit fork (annot_undo_wrap.patch), M8: an empty /Annots is the same
 +      // as none (an annotation added and removed again leaves "/Annots []").
 +      if (key == "Annots" && !saved_value) {
 +        RetainPtr<const CPDF_Object> annots =
@@ -399,10 +460,10 @@ index 7f2ce70..c30c19f 100644
          const ByteString fixed = mem->KeyExist("Kids") ? "Pages" : "Page";
          const bool saved_valid = saved_value && saved_value->IsName() &&
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index 661425a..244fdae 100644
+index 661425a..0e0fb0e 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
-@@ -1236,6 +1236,65 @@ FPDFAnnot_GetFileAttachment(FPDF_ANNOTATION annot);
+@@ -1236,6 +1236,73 @@ FPDFAnnot_GetFileAttachment(FPDF_ANNOTATION annot);
  FPDF_EXPORT FPDF_ATTACHMENT FPDF_CALLCONV
  FPDFAnnot_AddFileAttachment(FPDF_ANNOTATION annot, FPDF_WIDESTRING name);
  
@@ -421,7 +482,9 @@ index 661425a..244fdae 100644
 +// copy of the saved one (the same object; an indirect annotation keeps its
 +// object number). A restored dictionary equals the saved one value for value,
 +// so FPDF_FilterUnchangedObjects treats an undone edit as no change. The state
-+// stays saved. Returns false for an unknown id or a different annotation.
++// stays saved. Returns false for an unknown id or a different annotation (the
++// same dictionary object is required). Reports its changes to
++// FPDFDoc_GetLastModifiedObjects().
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 +FPDFAnnot_RestoreState(FPDF_DOCUMENT document, FPDF_ANNOTATION annot, int id);
 +
@@ -431,7 +494,9 @@ index 661425a..244fdae 100644
 +// |index| (clamped; -1 = at the end) — e.g. undo of FPDFPage_RemoveAnnot. An
 +// annotation that was an indirect object comes back as the SAME object (its
 +// dictionary restored to the state), unless the page already lists it; one
-+// that was a direct dictionary comes back as a direct copy. Returns its
++// that was a direct dictionary — or whose object no longer exists — comes back
++// as a direct copy. A state is put back once, and only onto the page its /P
++// names. Reports its changes to FPDFDoc_GetLastModifiedObjects(). Returns its
 +// position in /Annots, or -1.
 +FPDF_EXPORT int FPDF_CALLCONV FPDFPage_InsertAnnotState(FPDF_DOCUMENT document,
 +                                                       FPDF_PAGE page,
@@ -455,7 +520,11 @@ index 661425a..244fdae 100644
 +// any of them. The wrapper records the original (/RpOriginal); wrapping a
 +// wrapper rewraps the original. No tint and no layers puts the original back.
 +// Only the annotation's own dictionary (and its /Annots holder for a direct
-+// one) changes; an indirect /AP dictionary is replaced by a direct copy.
++// one) changes; an indirect /AP dictionary is replaced by a direct copy. Only
++// the normal appearance (/N) is wrapped. The wrapper is not a transparency
++// group, so the original's blend modes act on the page as before. Reports its
++// changes to FPDFDoc_GetLastModifiedObjects(); no tint and no layers on an
++// unwrapped annotation changes nothing.
 +// Returns false (nothing changed) without a normal appearance stream, for an
 +// invalid colour or layer index.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -468,3 +537,17 @@ index 661425a..244fdae 100644
  #ifdef __cplusplus
  }  // extern "C"
  #endif  // __cplusplus
+diff --git a/public/fpdf_doc.h b/public/fpdf_doc.h
+index c9a9981..b41043d 100644
+--- a/public/fpdf_doc.h
++++ b/public/fpdf_doc.h
+@@ -615,7 +615,8 @@ FPDFDoc_GetOCPropertiesObjectNumber(FPDF_DOCUMENT document);
+ //   FPDFDoc_CreateOCG, FPDFDoc_SetOCGDefaultVisibility,
+ //   FPDFDoc_SetOCGStringValue, FPDFDoc_SetOCGNumberValue,
+ //   FPDFDoc_SetOCGNumberArray, FPDFDoc_DeleteOCG, FPDFAnnot_SetOCG,
+-//   FPDFAnnot_SetOCMembership, FPDFAnnot_SetAPOptionalContent.
++//   FPDFAnnot_SetOCMembership, FPDFAnnot_SetAPOptionalContent,
++//   FPDFAnnot_RestoreState, FPDFPage_InsertAnnotState, FPDFAnnot_WrapAppearance.
+ // Each of these calls clears the list when it starts (a failed call leaves it
+ // empty). A modified direct dictionary or array is reported through the
+ // indirect object that holds it (e.g. /D inside an indirect /OCProperties
