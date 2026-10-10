@@ -1,0 +1,389 @@
+diff --git a/fpdfsdk/cpdfsdk_helpers.cpp b/fpdfsdk/cpdfsdk_helpers.cpp
+index ff47862..fc480e5 100644
+--- a/fpdfsdk/cpdfsdk_helpers.cpp
++++ b/fpdfsdk/cpdfsdk_helpers.cpp
+@@ -242,6 +242,46 @@ CPDFSDK_ModifiedObjectsTracker::CPDFSDK_ModifiedObjectsTracker(
+ }
+ 
+ // g-lab-bit fork (ocg_objnums.patch).
++// g-lab-bit fork (annot_tracker_scope.patch).
++CPDFSDK_ModifiedObjectsTracker::CPDFSDK_ModifiedObjectsTracker(
++    CPDF_Document* doc,
++    CPDF_AnnotContext* context)
++    : doc_(doc) {
++  doc_->SetLastModifiedObjects({});
++  RetainPtr<const CPDF_Dictionary> dict =
++      context ? context->GetAnnotDict() : nullptr;
++  if (!dict) {
++    return;
++  }
++  const CPDF_Parser* parser = doc_->GetParser();
++  const uint32_t last_obj_num = parser ? parser->GetLastObjNum() : 0;
++  const uint32_t objnum = dict->GetObjNum();
++  if (objnum) {
++    // Indirect: its holders list it by reference, which an edit of the
++    // dictionary never changes.
++    if (objnum <= last_obj_num) {
++      before_[objnum] = SerializeForTracking(dict.Get());
++    }
++    return;
++  }
++  // Direct: inside the page's /Annots array.
++  CPDF_Page* page =
++      context->GetPage() ? context->GetPage()->AsPDFPage() : nullptr;
++  RetainPtr<const CPDF_Dictionary> page_dict = page ? page->GetDict() : nullptr;
++  if (!page_dict) {
++    return;
++  }
++  const CPDF_Reference* annots =
++      ToReference(page_dict->GetObjectFor("Annots").Get());
++  const uint32_t holder = annots ? annots->GetRefObjNum() : page_dict->GetObjNum();
++  if (holder == 0 || holder > last_obj_num) {
++    return;  // a new holder is written by reachability, not listing
++  }
++  watched_ = dict;
++  watched_before_ = SerializeForTracking(dict.Get());
++  watched_holder_ = holder;
++}
++
+ CPDFSDK_ModifiedObjectsTracker::~CPDFSDK_ModifiedObjectsTracker() {
+   std::vector<uint32_t> modified;
+   for (const auto& [objnum, serialized] : before_) {
+@@ -250,6 +290,9 @@ CPDFSDK_ModifiedObjectsTracker::~CPDFSDK_ModifiedObjectsTracker() {
+       modified.push_back(objnum);
+     }
+   }
++  if (watched_ && SerializeForTracking(watched_.Get()) != watched_before_) {
++    modified.push_back(watched_holder_);   // annot_tracker_scope.patch
++  }
+   doc_->SetLastModifiedObjects(std::move(modified));
+ }
+ 
+diff --git a/fpdfsdk/cpdfsdk_helpers.h b/fpdfsdk/cpdfsdk_helpers.h
+index 54dd25a..fcde92a 100644
+--- a/fpdfsdk/cpdfsdk_helpers.h
++++ b/fpdfsdk/cpdfsdk_helpers.h
+@@ -65,11 +65,22 @@ class CPDFSDK_ModifiedObjectsTracker {
+  public:
+   CPDFSDK_ModifiedObjectsTracker(CPDF_Document* doc,
+                                  const std::set<uint32_t>& candidates);
++  // g-lab-bit fork (annot_tracker_scope.patch): a call that edits only the
++  // dictionary of the annotation of `context`. An indirect annotation is
++  // compared as itself; a direct one by its own dictionary, reported as its
++  // nearest indirect holder (the page's /Annots array, else the page) — the
++  // same result as comparing the holders, without serializing every other
++  // annotation of the page (that made each edit O(annotations on the page)).
++  CPDFSDK_ModifiedObjectsTracker(CPDF_Document* doc,
++                                 CPDF_AnnotContext* context);
+   ~CPDFSDK_ModifiedObjectsTracker();
+ 
+  private:
+   UnownedPtr<CPDF_Document> const doc_;
+   std::map<uint32_t, ByteString> before_;
++  RetainPtr<const CPDF_Dictionary> watched_;   // a direct annotation's dictionary
++  ByteString watched_before_;
++  uint32_t watched_holder_ = 0;                // reported if it changed
+ };
+ 
+ // g-lab-bit fork (ocg_objnums.patch): the indirect objects an edit of the
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index 685e4a4..fc8eecd 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -34,6 +34,8 @@
+ #include "core/fpdfapi/parser/cpdf_parser.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_stream.h"
++#include "core/fpdfapi/parser/cpdf_syntax_parser.h"
++#include "core/fpdfapi/edit/cpdf_stringarchivestream.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fpdfapi/parser/fpdf_parser_utility.h"
+ #include "core/fpdfdoc/cpdf_annot.h"
+@@ -41,6 +43,7 @@
+ #include "core/fpdfdoc/cpdf_formfield.h"
+ #include "core/fpdfdoc/cpdf_generateap.h"
+ #include "core/fpdfdoc/cpdf_interactiveform.h"
++#include "core/fxcrt/cfx_read_only_span_stream.h"
+ #include "core/fxcrt/check.h"
+ #include "core/fxcrt/containers/contains.h"
+ #include "core/fxcrt/containers/unique_ptr_adapters.h"
+@@ -2214,8 +2217,7 @@ FPDFAnnot_SetAPOptionalContent(FPDF_DOCUMENT document,
+ 
+   // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
+   // the call modifies.
+-  CPDFSDK_ModifiedObjectsTracker tracker(doc,
+-                                         CPDFSDK_AnnotHolderObjects(context));
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, context);   // annot_tracker_scope
+   if (!context->HasForm()) {
+     context->SetForm(old_stream);
+   }
+@@ -2376,8 +2378,7 @@ FPDFAnnot_RestoreState(FPDF_DOCUMENT document, FPDF_ANNOTATION annot, int id) {
+   if (!state || !dict || state->source.Get() != dict.Get()) {
+     return false;
+   }
+-  CPDFSDK_ModifiedObjectsTracker tracker(doc,
+-                                         CPDFSDK_AnnotHolderObjects(context));
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, context);   // annot_tracker_scope
+   ReplaceDictContents(dict.Get(), state->dict.Get());
+   return true;
+ }
+@@ -2626,8 +2627,7 @@ FPDFAnnot_WrapAppearance(FPDF_DOCUMENT document,
+       original_objnum == n_ref->GetRefObjNum()) {
+     return true;  // nothing wrapped, nothing to undo: no change at all
+   }
+-  CPDFSDK_ModifiedObjectsTracker tracker(doc,
+-                                         CPDFSDK_AnnotHolderObjects(context));
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, context);   // annot_tracker_scope
+   // /AP as a direct dictionary of the annotation (an indirect one is copied,
+   // so no object other than the annotation's holders changes).
+   RetainPtr<CPDF_Dictionary> ap_dict = annot_dict->GetMutableDictFor("AP");
+@@ -2768,3 +2768,180 @@ FPDFAnnot_GetAppearanceTint(FPDF_ANNOTATION annot, float* rgb) {
+   }
+   return true;
+ }
++
++// g-lab-bit fork (object_syntax_api.patch): read / write one key of an
++// annotation or page dictionary as PDF object syntax — /CL, /IT, /Measure
++// (annotations) and /VP (pages) for Rapida's callouts and measurements.
++namespace {
++
++constexpr size_t kMaxObjectSyntax = 1 << 16;
++
++// Only direct objects: no references (they could point anywhere), no streams.
++bool IsDirectValue(const CPDF_Object* obj, int depth) {
++  if (!obj || depth > 32 || obj->IsReference() || obj->IsStream()) {
++    return false;
++  }
++  if (const CPDF_Array* array = obj->AsArray()) {
++    for (size_t i = 0; i < array->size(); ++i) {
++      if (!IsDirectValue(array->GetObjectAt(i).Get(), depth + 1)) {
++        return false;
++      }
++    }
++  } else if (const CPDF_Dictionary* dict = obj->AsDictionary()) {
++    CPDF_DictionaryLocker locker(dict);
++    for (const auto& it : locker) {
++      if (!IsDirectValue(it.second.Get(), depth + 1)) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++// |syntax| as one direct object, or nullptr (empty, malformed, trailing text,
++// a reference or a stream inside).
++RetainPtr<CPDF_Object> ParseDirectObject(ByteStringView syntax) {
++  if (syntax.IsEmpty() || syntax.GetLength() > kMaxObjectSyntax) {
++    return nullptr;
++  }
++  ByteString copy(syntax);   // the stream reads from it while it is in scope
++  auto parser = std::make_unique<CPDF_SyntaxParser>(
++      pdfium::MakeRetain<CFX_ReadOnlySpanStream>(copy.unsigned_span()));
++  RetainPtr<CPDF_Object> obj = parser->GetObjectBody(nullptr);
++  if (!obj || obj->IsNull() || !IsDirectValue(obj.Get(), 0)) {
++    return nullptr;
++  }
++  // Nothing after it but white space.
++  for (FX_FILESIZE p = parser->GetPos(); p < static_cast<FX_FILESIZE>(copy.GetLength()); ++p) {
++    if (!PDFCharIsWhitespace(static_cast<uint8_t>(copy[static_cast<size_t>(p)]))) {
++      return nullptr;
++    }
++  }
++  return obj;
++}
++
++unsigned long WriteSyntax(const CPDF_Object* obj, char* buffer, unsigned long buflen) {
++  if (!obj) {
++    return 0;
++  }
++  fxcrt::ostringstream buf;
++  CPDF_StringArchiveStream archive(&buf);
++  if (!obj->WriteTo(&archive, nullptr)) {
++    return 0;
++  }
++  // SAFETY: required from caller.
++  return NulTerminateMaybeCopyAndReturnLength(
++      ByteString(buf), UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
++}
++
++// Keys the API never touches: the dictionaries' structure.
++bool IsReservedAnnotKey(ByteStringView key) {
++  return key == "Type" || key == "Subtype" || key == "P" || key == "Parent" ||
++         key == "AP" || key == "Popup" || key == "IRT";
++}
++bool IsReservedPageKey(ByteStringView key) {
++  return key == "Type" || key == "Parent" || key == "Contents" ||
++         key == "Resources" || key == "Annots" || key == "Kids";
++}
++
++}  // namespace
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetObjectSyntax(FPDF_DOCUMENT document,
++                          FPDF_ANNOTATION annot,
++                          FPDF_BYTESTRING key,
++                          FPDF_BYTESTRING syntax) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (doc) {
++    doc->SetLastModifiedObjects({});
++  }
++  if (!doc || !context || !context->GetPage() ||
++      context->GetPage()->GetDocument() != doc || !key || !*key ||
++      IsReservedAnnotKey(key)) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> dict = context->GetMutableAnnotDict();
++  if (!dict) {
++    return false;
++  }
++  RetainPtr<CPDF_Object> value;
++  if (syntax && *syntax) {
++    value = ParseDirectObject(syntax);
++    if (!value) {
++      return false;
++    }
++  }
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, context);
++  if (value) {
++    dict->SetFor(key, std::move(value));
++  } else {
++    dict->RemoveFor(key);
++  }
++  return true;
++}
++
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetObjectSyntax(FPDF_ANNOTATION annot,
++                          FPDF_BYTESTRING key,
++                          char* buffer,
++                          unsigned long buflen) {
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!context || !key || !*key) {
++    return 0;
++  }
++  const CPDF_Dictionary* dict = context->GetAnnotDict();
++  return dict ? WriteSyntax(dict->GetObjectFor(key).Get(), buffer, buflen) : 0;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFPage_SetObjectSyntax(FPDF_DOCUMENT document,
++                         FPDF_PAGE page,
++                         FPDF_BYTESTRING key,
++                         FPDF_BYTESTRING syntax) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
++  if (doc) {
++    doc->SetLastModifiedObjects({});
++  }
++  if (!doc || !pdf_page || pdf_page->GetDocument() != doc || !key || !*key ||
++      IsReservedPageKey(key)) {
++    return false;
++  }
++  RetainPtr<CPDF_Dictionary> dict = pdf_page->GetMutableDict();
++  if (!dict) {
++    return false;
++  }
++  RetainPtr<CPDF_Object> value;
++  if (syntax && *syntax) {
++    value = ParseDirectObject(syntax);
++    if (!value) {
++      return false;
++    }
++  }
++  std::set<uint32_t> candidates;
++  if (dict->GetObjNum()) {
++    candidates.insert(dict->GetObjNum());
++  }
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, candidates);
++  if (value) {
++    dict->SetFor(key, std::move(value));
++  } else {
++    dict->RemoveFor(key);
++  }
++  return true;
++}
++
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFPage_GetObjectSyntax(FPDF_PAGE page,
++                         FPDF_BYTESTRING key,
++                         char* buffer,
++                         unsigned long buflen) {
++  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
++  if (!pdf_page || !key || !*key) {
++    return 0;
++  }
++  RetainPtr<const CPDF_Dictionary> dict = pdf_page->GetDict();
++  return dict ? WriteSyntax(dict->GetObjectFor(key).Get(), buffer, buflen) : 0;
++}
++
+diff --git a/fpdfsdk/fpdf_doc.cpp b/fpdfsdk/fpdf_doc.cpp
+index 96798a7..d8c6792 100644
+--- a/fpdfsdk/fpdf_doc.cpp
++++ b/fpdfsdk/fpdf_doc.cpp
+@@ -1355,8 +1355,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetOCG(FPDF_DOCUMENT document,
+   }
+   // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
+   // the call modifies.
+-  CPDFSDK_ModifiedObjectsTracker tracker(doc,
+-                                         CPDFSDK_AnnotHolderObjects(context));
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, context);   // annot_tracker_scope
+   if (index == -1) {
+     annot_dict->RemoveFor("OC");
+     return true;
+@@ -1406,8 +1405,7 @@ FPDFAnnot_SetOCMembership(FPDF_DOCUMENT document,
+   }
+   // g-lab-bit fork (ocg_objnums.patch): arguments are valid; record what
+   // the call modifies.
+-  CPDFSDK_ModifiedObjectsTracker tracker(doc,
+-                                         CPDFSDK_AnnotHolderObjects(context));
++  CPDFSDK_ModifiedObjectsTracker tracker(doc, context);   // annot_tracker_scope
+   if (objnums.empty()) {
+     annot_dict->RemoveFor("OC");
+     return true;
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index 4f4b5c5..0880b85 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -1314,6 +1314,40 @@ FPDFAnnot_WrapAppearance(FPDF_DOCUMENT document,
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+ FPDFAnnot_GetAppearanceTint(FPDF_ANNOTATION annot, float* rgb);
+ 
++// g-lab-bit fork (object_syntax_api.patch) — one key of an annotation or page
++// dictionary as PDF object syntax (e.g. "[100 200 150 250]", "/LineDimension",
++// "<< /Type /Measure /Subtype /RL /R (1 in = 10 ft) ... >>").
++//
++// Set: |syntax| is parsed as ONE direct object (no references, no streams; at
++// most 64 KB; nothing after it but white space) and stored under |key|; NULL
++// or "" removes the key. Structural keys are refused (annotation: Type,
++// Subtype, P, Parent, AP, Popup, IRT; page: Type, Parent, Contents, Resources,
++// Annots, Kids). FPDFDoc_GetLastModifiedObjects reports what changed. Returns
++// false (nothing changed) on any refusal.
++// Get: the value under |key| as PDF syntax, NUL-terminated; returns the byte
++// count needed including the NUL (0: no such key); writes it when |buflen| is
++// enough.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetObjectSyntax(FPDF_DOCUMENT document,
++                          FPDF_ANNOTATION annot,
++                          FPDF_BYTESTRING key,
++                          FPDF_BYTESTRING syntax);
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFAnnot_GetObjectSyntax(FPDF_ANNOTATION annot,
++                          FPDF_BYTESTRING key,
++                          char* buffer,
++                          unsigned long buflen);
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFPage_SetObjectSyntax(FPDF_DOCUMENT document,
++                         FPDF_PAGE page,
++                         FPDF_BYTESTRING key,
++                         FPDF_BYTESTRING syntax);
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFPage_GetObjectSyntax(FPDF_PAGE page,
++                         FPDF_BYTESTRING key,
++                         char* buffer,
++                         unsigned long buflen);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus

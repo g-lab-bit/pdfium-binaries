@@ -539,3 +539,32 @@ the view state and by `/D`; shown again when the view state follows `/D`;
 printed by the document's state (not the view override); an OCMD `/AllOn`
 hides with any group off, `/AnyOn` stays with one on; no `/OC`, always drawn.
 
+## 23. `fork_p16.patch` (fork-p16): tracker scope + object syntax API
+
+Applied by `steps/03-patch.sh` after `annot_oc_render.patch`. Two parts.
+
+### annot_tracker_scope (Rapida ra-amttt)
+`CPDFSDK_ModifiedObjectsTracker(doc, context)`: the five calls that edit only
+one annotation's dictionary (FPDFAnnot_SetOCG, SetOCMembership,
+SetAPOptionalContent, RestoreState, WrapAppearance) now compare just that
+dictionary. An indirect annotation is compared as itself; a direct one (every
+FPDFPage_CreateAnnot annotation is direct in /Annots) by its own dictionary,
+reported as its nearest indirect holder (/Annots if indirect, else the page)
+— the same report as before (ocg_objnums: 125 cases), without serializing
+every other annotation on the page before and after each call, which made a
+batch of edits O(n²) in the page's annotations.
+
+### object_syntax_api (Rapida ra-c2kyq.13 /CL, ra-lctfw /Measure + /VP)
+`FPDFAnnot_SetObjectSyntax / GetObjectSyntax` and `FPDFPage_SetObjectSyntax /
+GetObjectSyntax`: one key of an annotation or page dictionary as PDF object
+syntax. Set parses ONE direct object (no references, no streams, at most 64 KB,
+nothing after it); NULL / "" removes the key; structural keys are refused
+(annotation: Type, Subtype, P, Parent, AP, Popup, IRT; page: Type, Parent,
+Contents, Resources, Annots, Kids). Changes are reported to
+FPDFDoc_GetLastModifiedObjects. Get returns the value as syntax (sized call).
+
+### Tests
+`testing/object_syntax/run_tests.py`: /CL, /IT, /Measure and page /VP set,
+read back and reopened (pikepdf); every refusal; removal; the tracker reports
+the holder and scales linearly (4x annotations ~ 4x time, was ~16x).
+
