@@ -13,7 +13,7 @@ index ff47862..fc480e5 100644
 +    : doc_(doc) {
 +  doc_->SetLastModifiedObjects({});
 +  RetainPtr<const CPDF_Dictionary> dict =
-+      context ? context->GetAnnotDict() : nullptr;
++      context ? pdfium::WrapRetain(context->GetAnnotDict()) : nullptr;
 +  if (!dict) {
 +    return;
 +  }
