@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Scripted test for ocg_view_state.patch, annot_ocmd.patch, annot_ap_oc.patch,
-annot_oc_membership.patch.
+annot_oc_membership.patch, annot_oc_render.patch.
 
 usage: run_tests.py PDFIUM_DIR [--work DIR]
 Requires pikepdf (to inspect saved files). Builds driver.c against the
@@ -51,6 +51,24 @@ def fixture(off):
         3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
            b"/Resources << /Properties << /P1 11 0 R >> >> >>",
         4: b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream",
+        10: b"<< /Type /OCG /Name (WS) >>",
+        11: b"<< /Type /OCG /Name (L) >>",
+    })
+
+
+def foreign(off, oc):
+    # Another tool's markup: a red Square whose /AP has no marked content, in
+    # optional content only through its own /OC (annot_oc_render.patch).
+    ap = b"1 0 0 rg 300 300 100 100 re f"
+    return classic({
+        1: b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [10 0 R 11 0 R] "
+           b"/D << /Order [10 0 R [11 0 R]] /OFF [%s] >> >> >>" % off,
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+        5: b"<< /Type /Annot /Subtype /Square /Rect [300 300 400 400] /F 4 /C [1 0 0]%s "
+           b"/AP << /N 6 0 R >> >>" % oc,
+        6: b"<< /Type /XObject /Subtype /Form /BBox [300 300 400 400] /Length %d >>\nstream\n" % len(ap)
+           + ap + b"\nendstream",
         10: b"<< /Type /OCG /Name (WS) >>",
         11: b"<< /Type /OCG /Name (L) >>",
     })
@@ -112,6 +130,29 @@ def main():
         case = "render %s %s %s" % (fname, " ".join(states) or "-", " ".join(flags))
         check(case, r.get("set_ok") == 1 and r.get("annot") == exp_annot and r.get("content") == exp_content,
               json.dumps(r))
+    # --- annot_oc_render: an annotation's own /OC (no marks in its /AP) ---
+    fcases = [
+        # name, /D OFF, /OC, view states, flags, expected annot
+        ("f_ocg", b"", b" /OC 10 0 R", [], [], RED),
+        ("f_ocg", b"", b" /OC 10 0 R", ["0=0"], [], WHITE),          # view state hides it
+        ("f_ocg", b"", b" /OC 10 0 R", ["0=0", "0=-1"], [], RED),    # back to /D
+        ("f_ocg", b"", b" /OC 10 0 R", ["1=0"], [], RED),            # another group: no effect
+        ("f_ocg", b"", b" /OC 10 0 R", ["0=0"], ["--print"], RED),   # Print follows the document
+        ("f_ocg_off", b"10 0 R", b" /OC 10 0 R", [], [], WHITE),     # /D hides it
+        ("f_ocg_off", b"10 0 R", b" /OC 10 0 R", [], ["--print"], WHITE),
+        ("f_ocg_off", b"10 0 R", b" /OC 10 0 R", ["0=1"], [], RED),  # the view shows what /D hides
+        ("f_ocmd", b"", b" /OC << /Type /OCMD /OCGs [10 0 R 11 0 R] /P /AllOn >>", ["1=0"], [], WHITE),
+        ("f_ocmd", b"", b" /OC << /Type /OCMD /OCGs [10 0 R 11 0 R] /P /AllOn >>", [], [], RED),
+        ("f_anyon", b"", b" /OC << /Type /OCMD /OCGs [10 0 R 11 0 R] /P /AnyOn >>", ["1=0"], [], RED),
+        ("f_none", b"", b"", ["0=0", "1=0"], [], RED),               # no /OC: always drawn
+    ]
+    for name, off, oc, states, flags, exp in fcases:
+        src = os.path.join(WORK, "%s.pdf" % name)
+        open(src, "wb").write(foreign(off, oc))
+        r = drv("render", src, *states, *flags)
+        check("annot /OC %s %s %s" % (name, " ".join(states) or "-", " ".join(flags)),
+              r.get("set_ok") == 1 and r.get("annot") == exp, json.dumps(r))
+
     r = drv("render", files["all_on"], "1=0")
     check("get view state reflects set", r.get("state0") == -1 and r.get("state1") == 0, json.dumps(r))
     r = drv("render", files["all_on"], "5=0")

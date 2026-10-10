@@ -511,3 +511,31 @@ decision 2026-10-08: the wrapper writes it).
 
 Tests: `testing/annot_state/run_tests.py PDFIUM_DIR` (`color` cases).
 
+## 22. `annot_oc_render.patch` (fork-p15): annotations follow their own /OC
+
+Applied by `steps/03-patch.sh` after `annot_wrap_color.patch`. Stock PDFium
+draws an annotation whatever its `/OC` says (`CPDF_AnnotList::DisplayPass`
+checks only the hidden / print / no-view flags), so another tool's markup in
+optional content — `/OC` on its dictionary, no marked content in its `/AP` —
+never hid with its layer, by `/D` or by the view state (Rapida ra-wom0a).
+Acrobat and pdf.js honour annotation `/OC` (ISO 32000-1 8.11.3.3).
+
+- `CPDF_AnnotList::DisplayAnnots(..., const CPDF_RenderOptions* options =
+  nullptr)`: with options, an annotation whose `/OC` (an OCG or an OCMD) is off
+  under the options' optional-content context is skipped.
+- `CPDFSDK_RenderPageWithContext` (FPDF_RenderPageBitmap[_Start/Continue] and
+  the LOD paths) passes its options, so the usage is the render's: View (with
+  `FPDFDoc_SetOCGViewState`, `ocg_view_state.patch`) or, with FPDF_PRINTING,
+  Print, which follows the document.
+- Other callers pass no options and are unchanged. FPDF_FFLDraw draws widgets
+  through `CPDF_Annot::DrawAppearance` without a context, as before.
+- Annotations whose `/AP` already carries the layer as marked content
+  (`annot_ap_oc.patch`) hide the same way: one check, consistent results.
+
+### Tests
+`testing/ocg_layers/run_tests.py` ("annot /OC" cases): a red Square with a
+plain `/AP` and only a dictionary `/OC` is drawn with its group on; hidden by
+the view state and by `/D`; shown again when the view state follows `/D`;
+printed by the document's state (not the view override); an OCMD `/AllOn`
+hides with any group off, `/AnyOn` stays with one on; no `/OC`, always drawn.
+

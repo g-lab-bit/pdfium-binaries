@@ -1,0 +1,101 @@
+diff --git a/core/fpdfdoc/cpdf_annotlist.cpp b/core/fpdfdoc/cpdf_annotlist.cpp
+index b2d3b2c..be9d8f7 100644
+--- a/core/fpdfdoc/cpdf_annotlist.cpp
++++ b/core/fpdfdoc/cpdf_annotlist.cpp
+@@ -264,7 +264,8 @@ bool CPDF_AnnotList::Contains(const CPDF_Annot* pAnnot) const {
+ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
+                                  bool bPrinting,
+                                  const CFX_Matrix& mtMatrix,
+-                                 bool bWidgetPass) {
++                                 bool bWidgetPass,
++                                 const CPDF_RenderOptions* options) {
+   CHECK(context);
+   for (const auto& pAnnot : annot_list_) {
+     bool bWidget = pAnnot->GetSubtype() == CPDF_Annot::Subtype::WIDGET;
+@@ -285,6 +286,19 @@ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
+       continue;
+     }
+ 
++    // g-lab-bit fork (annot_oc_render.patch): an annotation in optional
++    // content (/OC: an OCG or an OCMD, ISO 32000-1 8.11.3.3) is drawn only
++    // when that is on for the render's usage — View including the document's
++    // view override (ocg_view_state.patch), Print its print state — as
++    // Acrobat and pdf.js do.
++    if (options) {
++      RetainPtr<const CPDF_Dictionary> oc =
++          pAnnot->GetAnnotDict()->GetDictFor("OC");
++      if (oc && !options->CheckOCGDictVisible(oc.Get())) {
++        continue;
++      }
++    }
++
+     pAnnot->DrawInContext(page_, context, mtMatrix,
+                           CPDF_Annot::AppearanceMode::kNormal);
+   }
+@@ -293,10 +307,11 @@ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
+ void CPDF_AnnotList::DisplayAnnots(CPDF_RenderContext* context,
+                                    bool bPrinting,
+                                    const CFX_Matrix& mtUser2Device,
+-                                   bool bShowWidget) {
++                                   bool bShowWidget,
++                                   const CPDF_RenderOptions* options) {
+   CHECK(context);
+-  DisplayPass(context, bPrinting, mtUser2Device, false);
++  DisplayPass(context, bPrinting, mtUser2Device, false, options);
+   if (bShowWidget) {
+-    DisplayPass(context, bPrinting, mtUser2Device, true);
++    DisplayPass(context, bPrinting, mtUser2Device, true, options);
+   }
+ }
+diff --git a/core/fpdfdoc/cpdf_annotlist.h b/core/fpdfdoc/cpdf_annotlist.h
+index ad59697..6e34544 100644
+--- a/core/fpdfdoc/cpdf_annotlist.h
++++ b/core/fpdfdoc/cpdf_annotlist.h
+@@ -21,16 +21,20 @@ class CPDF_Annot;
+ class CPDF_Document;
+ class CPDF_Page;
+ class CPDF_RenderContext;
++class CPDF_RenderOptions;
+ 
+ class CPDF_AnnotList final : public CPDF_PageRenderContext::AnnotListIface {
+  public:
+   explicit CPDF_AnnotList(CPDF_Page* pPage);
+   ~CPDF_AnnotList() override;
+ 
++  // g-lab-bit fork (annot_oc_render.patch): with |options|, an annotation
++  // whose /OC is off under the options' optional-content context is not drawn.
+   void DisplayAnnots(CPDF_RenderContext* context,
+                      bool bPrinting,
+                      const CFX_Matrix& mtUser2Device,
+-                     bool bShowWidget);
++                     bool bShowWidget,
++                     const CPDF_RenderOptions* options = nullptr);
+ 
+   size_t Count() const { return annot_list_.size(); }
+   CPDF_Annot* GetAt(size_t index) const { return annot_list_[index].get(); }
+@@ -40,7 +44,8 @@ class CPDF_AnnotList final : public CPDF_PageRenderContext::AnnotListIface {
+   void DisplayPass(CPDF_RenderContext* context,
+                    bool bPrinting,
+                    const CFX_Matrix& mtMatrix,
+-                   bool bWidget);
++                   bool bWidget,
++                   const CPDF_RenderOptions* options);
+ 
+   UnownedPtr<CPDF_Page> const page_;
+   UnownedPtr<CPDF_Document> const document_;
+diff --git a/fpdfsdk/cpdfsdk_renderpage.cpp b/fpdfsdk/cpdfsdk_renderpage.cpp
+index 0510391..50853fd 100644
+--- a/fpdfsdk/cpdfsdk_renderpage.cpp
++++ b/fpdfsdk/cpdfsdk_renderpage.cpp
+@@ -79,8 +79,10 @@ void RenderPageImpl(CPDF_PageRenderContext* context,
+ 
+     // TODO(https://crbug.com/42271964) - maybe pass true here.
+     const bool bShowWidget = false;
++    // g-lab-bit fork (annot_oc_render.patch): the annotations' /OC follows
++    // the same optional-content context as the page content.
+     pList->DisplayAnnots(context->context_.get(), is_printing, matrix,
+-                         bShowWidget);
++                         bShowWidget, context->options_.get());
+   }
+ 
+   context->renderer_ = std::make_unique<CPDF_ProgressiveRenderer>(
