@@ -137,7 +137,7 @@ index 685e4a4..fc8eecd 100644
    // /AP as a direct dictionary of the annotation (an indirect one is copied,
    // so no object other than the annotation's holders changes).
    RetainPtr<CPDF_Dictionary> ap_dict = annot_dict->GetMutableDictFor("AP");
-@@ -2768,3 +2768,180 @@ FPDFAnnot_GetAppearanceTint(FPDF_ANNOTATION annot, float* rgb) {
+@@ -2768,3 +2768,226 @@ FPDFAnnot_GetAppearanceTint(FPDF_ANNOTATION annot, float* rgb) {
    }
    return true;
  }
@@ -171,10 +171,56 @@ index 685e4a4..fc8eecd 100644
 +  return true;
 +}
 +
++// PDFium's parser reads an unterminated string to the end of its input (and
++// takes it); refuse one: every literal / hex string must close.
++bool StringsTerminated(ByteStringView s) {
++  const size_t n = s.GetLength();
++  size_t i = 0;
++  while (i < n) {
++    const uint8_t c = s[i];
++    if (c == '%') {
++      while (i < n && s[i] != '\r' && s[i] != '\n') {
++        ++i;
++      }
++    } else if (c == '(') {
++      int depth = 0;
++      for (; i < n; ++i) {
++        if (s[i] == '\\') {
++          ++i;
++          continue;
++        }
++        if (s[i] == '(') {
++          ++depth;
++        } else if (s[i] == ')' && --depth == 0) {
++          break;
++        }
++      }
++      if (i >= n) {
++        return false;
++      }
++      ++i;
++    } else if (c == '<' && i + 1 < n && s[i + 1] == '<') {
++      i += 2;
++    } else if (c == '<') {
++      while (i < n && s[i] != '>') {
++        ++i;
++      }
++      if (i >= n) {
++        return false;
++      }
++      ++i;
++    } else {
++      ++i;
++    }
++  }
++  return true;
++}
++
 +// |syntax| as one direct object, or nullptr (empty, malformed, trailing text,
 +// a reference or a stream inside).
 +RetainPtr<CPDF_Object> ParseDirectObject(ByteStringView syntax) {
-+  if (syntax.IsEmpty() || syntax.GetLength() > kMaxObjectSyntax) {
++  if (syntax.IsEmpty() || syntax.GetLength() > kMaxObjectSyntax ||
++      !StringsTerminated(syntax)) {
 +    return nullptr;
 +  }
 +  ByteString copy(syntax);   // the stream reads from it while it is in scope

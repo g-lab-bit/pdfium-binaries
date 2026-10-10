@@ -558,7 +558,8 @@ batch of edits O(n²) in the page's annotations.
 `FPDFAnnot_SetObjectSyntax / GetObjectSyntax` and `FPDFPage_SetObjectSyntax /
 GetObjectSyntax`: one key of an annotation or page dictionary as PDF object
 syntax. Set parses ONE direct object (no references, no streams, at most 64 KB,
-nothing after it); NULL / "" removes the key; structural keys are refused
+nothing after it, every string closed — PDFium's parser would take an
+unterminated one up to the end of the input); NULL / "" removes the key; structural keys are refused
 (annotation: Type, Subtype, P, Parent, AP, Popup, IRT; page: Type, Parent,
 Contents, Resources, Annots, Kids). Changes are reported to
 FPDFDoc_GetLastModifiedObjects. Get returns the value as syntax (sized call).
