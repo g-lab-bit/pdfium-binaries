@@ -288,7 +288,9 @@ def main():
     data = pu.pages[0].Annots[0].AP.N.read_bytes()
     check("unmarked AP has no /OC", b"/OC" not in data, repr(data[:120]))
     r = drv("render", out)
-    check("unmarked: visible although L is off in /D", r.get("annot") == RED, json.dumps(r))
+    # annot_oc_render (fork-p15): without the marks the annotation's own /OC
+    # (membership on [WS, L], L off in /D) still hides it.
+    check("unmarked: hidden by its own /OC while L is off in /D", r.get("annot") == WHITE, json.dumps(r))
 
     # --- incremental save + verify (S1) ---
     GREEN = [0, 255, 0]
