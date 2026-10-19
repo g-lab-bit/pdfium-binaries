@@ -47,6 +47,7 @@ apply_patch "$PATCHES/annot_undo_wrap.patch"
 apply_patch "$PATCHES/annot_wrap_color.patch"
 apply_patch "$PATCHES/annot_oc_render.patch"
 apply_patch "$PATCHES/fork_p16.patch"
+apply_patch "$PATCHES/fork_p17.patch"
 apply_patch "$PATCHES/clang_rt.patch" build
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"

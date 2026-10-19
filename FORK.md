@@ -569,3 +569,25 @@ FPDFDoc_GetLastModifiedObjects. Get returns the value as syntax (sized call).
 read back and reopened (pikepdf); every refusal; removal; the tracker reports
 the holder and scales linearly (4x annotations ~ 4x time, was ~16x).
 
+## 24. `fork_p17.patch` (fork-p17): a dangling reference no longer refuses an in-place save
+
+Applied by `steps/03-patch.sh` after `fork_p16.patch`. Rapida ra-n1j65.3 P1
+(NAV-05.6a).
+
+`FPDF_SaveIncrementalObjects` refused, before writing, whenever a LOADED,
+unlisted existing object referenced a "new" object, "new" meaning an object
+number above the parser's last one. A reference to an object that never existed
+is above that number too: an outline item with `/Dest [999 0 R /Fit]` in a
+40-object file. Reading the outline (a Bookmarks panel: titles,
+`FPDFDest_GetDestPageIndex`) loads those items, so every later in-place save
+was refused, although nothing had changed. A reference now counts as new only
+when an object created since load exists for it
+(`document_->GetIndirectObject(ref)`); a dangling reference points at nothing
+the save could lose and is left as it is.
+
+### Tests
+`testing/incremental_dangling/run_tests.py`: a 6-object file whose outline has
+a good item and one pointing at object 999; save listing the page with the
+outline never read (control: ok) and after reading it (ok since p17;
+`--expect-p16` asserts the old refusal, which an unpatched artifact gives).
+

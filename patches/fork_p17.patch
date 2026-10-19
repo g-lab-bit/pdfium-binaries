@@ -1,0 +1,28 @@
+fork-p17 (Rapida ra-n1j65.3 P1, NAV-05.6a): FPDF_SaveIncrementalObjects no
+longer refuses a document whose loaded objects hold a dangling reference.
+
+The pre-write check refused when a loaded, unlisted existing object referenced
+a "new" object, "new" meaning an object number above the parser's last one.
+A reference to an object that never existed (e.g. an outline /Dest
+[999 0 R /Fit] in a 40-object file) is above that number too, so merely
+reading such an object (Rapida's Bookmarks panel walks the outline) made every
+later in-place save refuse, although nothing was changed. A reference now
+counts as new only when an object created since load exists for it; a dangling
+reference loses nothing and is left as it is.
+
+--- a/core/fpdfapi/edit/cpdf_creator.cpp
++++ b/core/fpdfapi/edit/cpdf_creator.cpp
+@@ -886,7 +886,12 @@
+         pdfium::Contains(listed, objnum)) {
+       continue;
+     }
+-    if (!ForEachReference(obj, [&](uint32_t ref) { return !is_new(ref); })) {
++    // A reference is to a new object only when one created since load exists
++    // for it: a dangling reference (to an object number never used, above the
++    // file's last) points at nothing that this save could lose.
++    if (!ForEachReference(obj, [&](uint32_t ref) {
++          return !is_new(ref) || !document_->GetIndirectObject(ref);
++        })) {
+       return false;
+     }
+   }
