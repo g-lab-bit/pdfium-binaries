@@ -1,0 +1,282 @@
+fork-p18 (Rapida ra-1okhu, ra-c2kyq.12, ra-4sj5g.1; founder approval
+2026-10-30). Three additions, all render-only or read-only:
+
+fork_version: FPDF_GetForkVersion() returns the fork release this library was
+built from ("chromium/8076-fork-p18"), so an embedder can check at run time
+which build it loaded. Each later fork patch bumps it.
+
+annot_render_hide: FPDFAnnot_SetRenderHidden(document, annot, hidden) leaves
+one annotation out of every render of the document (CPDF_AnnotList::DisplayPass)
+while set, e.g. while the user drags it; FPDFDoc_ClearRenderHiddenAnnots draws
+them all again. Held by the document handle only, keyed by the annotation
+dictionary: never written to the file.
+
+widget_oc_context: FPDF_FFLDraw built an optional-content context for the
+render but CPDFSDK_PageView::PageView_OnDraw passed widgets only a bool, so
+CPDF_Annot::DrawAppearance rendered their appearance streams with no OC context
+and marked content in an OCG that is off (or turned off by the document's view
+state) was drawn. The page view now holds the draw's render options while it
+draws, and the widget's appearance is rendered with them.
+
+diff --git a/core/fpdfapi/parser/cpdf_document.cpp b/core/fpdfapi/parser/cpdf_document.cpp
+index f16b110..0a5c988 100644
+--- a/core/fpdfapi/parser/cpdf_document.cpp
++++ b/core/fpdfapi/parser/cpdf_document.cpp
+@@ -492,6 +492,25 @@ std::optional<bool> CPDF_Document::GetOCGViewOverride(
+   return it->second;
+ }
+ 
++// g-lab-bit fork-p18 (annot_render_hide).
++void CPDF_Document::SetAnnotRenderHidden(RetainPtr<const CPDF_Dictionary> annot,
++                                         bool hidden) {
++  if (!annot) {
++    return;
++  }
++  if (hidden) {
++    const CPDF_Dictionary* key = annot.Get();
++    render_hidden_annots_[key] = std::move(annot);
++  } else {
++    render_hidden_annots_.erase(annot.Get());
++  }
++}
++
++// g-lab-bit fork-p18 (annot_render_hide).
++bool CPDF_Document::IsAnnotRenderHidden(const CPDF_Dictionary* annot) const {
++  return annot && render_hidden_annots_.count(annot) > 0;
++}
++
+ int CPDF_Document::GetPageCount() const {
+   return fxcrt::CollectionSize<int>(page_list_);
+ }
+diff --git a/core/fpdfapi/parser/cpdf_document.h b/core/fpdfapi/parser/cpdf_document.h
+index 5c81030..e5d38e3 100644
+--- a/core/fpdfapi/parser/cpdf_document.h
++++ b/core/fpdfapi/parser/cpdf_document.h
+@@ -119,6 +119,14 @@ class CPDF_Document : public Observable,
+   void ClearOCGViewOverrides() { ocg_view_overrides_.clear(); }
+   std::optional<bool> GetOCGViewOverride(uint32_t ocg_objnum) const;
+ 
++  // g-lab-bit fork-p18 (annot_render_hide): annotations left out of every
++  // render of this document while set (e.g. while the user drags one), keyed
++  // by the annotation dictionary. Render-only: never written to the file.
++  void SetAnnotRenderHidden(RetainPtr<const CPDF_Dictionary> annot,
++                            bool hidden);
++  bool IsAnnotRenderHidden(const CPDF_Dictionary* annot) const;
++  void ClearAnnotRenderHidden() { render_hidden_annots_.clear(); }
++
+   // g-lab-bit fork (annot_undo_wrap.patch): saved annotation dictionaries (deep
+   // copies) for exact undo. Held by the document only, never written to it.
+   struct AnnotState {
+@@ -268,6 +276,9 @@ class CPDF_Document : public Observable,
+   std::unique_ptr<LinkListIface> links_context_;
+   std::set<uint32_t> modified_apstream_ids_;
+   std::map<uint32_t, bool> ocg_view_overrides_;  // ocg_view_state.patch
++  // fork-p18 annot_render_hide: the value keeps the dictionary alive while hidden.
++  std::map<const CPDF_Dictionary*, RetainPtr<const CPDF_Dictionary>>
++      render_hidden_annots_;
+   std::map<int, AnnotState> annot_states_;        // annot_undo_wrap.patch
+   int next_annot_state_ = 1;                      // annot_undo_wrap.patch
+   std::vector<uint32_t> last_modified_objects_;  // ocg_objnums.patch
+diff --git a/core/fpdfdoc/cpdf_annot.cpp b/core/fpdfdoc/cpdf_annot.cpp
+index 4f56889..b62f8db 100644
+--- a/core/fpdfdoc/cpdf_annot.cpp
++++ b/core/fpdfdoc/cpdf_annot.cpp
+@@ -503,7 +503,8 @@ size_t CPDF_Annot::QuadPointCount(const CPDF_Array* pArray) {
+ bool CPDF_Annot::DrawAppearance(CPDF_Page* pPage,
+                                 CFX_RenderDevice* pDevice,
+                                 const CFX_Matrix& mtUser2Device,
+-                                AppearanceMode mode) {
++                                AppearanceMode mode,
++                                const CPDF_RenderOptions* options) {
+   if (!ShouldDrawAnnotation()) {
+     return false;
+   }
+@@ -525,7 +526,7 @@ bool CPDF_Annot::DrawAppearance(CPDF_Page* pPage,
+                              pPage->GetMutablePageResources(),
+                              pPage->GetPageImageCache());
+   context.AppendLayer(pForm, matrix);
+-  context.Render(pDevice, nullptr, nullptr, nullptr);
++  context.Render(pDevice, nullptr, options, nullptr);
+   return true;
+ }
+ 
+diff --git a/core/fpdfdoc/cpdf_annot.h b/core/fpdfdoc/cpdf_annot.h
+index 09d2c94..1cb0c02 100644
+--- a/core/fpdfdoc/cpdf_annot.h
++++ b/core/fpdfdoc/cpdf_annot.h
+@@ -29,6 +29,7 @@ class CPDF_Form;
+ class CPDF_IndirectObjectHolder;
+ class CPDF_Page;
+ class CPDF_RenderContext;
++class CPDF_RenderOptions;
+ 
+ class CPDF_Annot {
+  public:
+@@ -86,10 +87,13 @@ class CPDF_Annot {
+ 
+   bool IsHidden() const;
+ 
++  // |options| (Rapida fork-p18): render options for the appearance stream,
++  // e.g. the optional-content context of the page draw; null = defaults.
+   bool DrawAppearance(CPDF_Page* pPage,
+                       CFX_RenderDevice* pDevice,
+                       const CFX_Matrix& mtUser2Device,
+-                      AppearanceMode mode);
++                      AppearanceMode mode,
++                      const CPDF_RenderOptions* options = nullptr);
+   bool DrawInContext(CPDF_Page* pPage,
+                      CPDF_RenderContext* context,
+                      const CFX_Matrix& mtUser2Device,
+diff --git a/core/fpdfdoc/cpdf_annotlist.cpp b/core/fpdfdoc/cpdf_annotlist.cpp
+index be9d8f7..42023e5 100644
+--- a/core/fpdfdoc/cpdf_annotlist.cpp
++++ b/core/fpdfdoc/cpdf_annotlist.cpp
+@@ -278,6 +278,12 @@ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
+       continue;
+     }
+ 
++    // g-lab-bit fork-p18 (annot_render_hide): left out of renders while the
++    // embedder has it hidden (FPDFAnnot_SetRenderHidden).
++    if (document_->IsAnnotRenderHidden(pAnnot->GetAnnotDict())) {
++      continue;
++    }
++
+     if (bPrinting && (annot_flags & pdfium::annotation_flags::kPrint) == 0) {
+       continue;
+     }
+diff --git a/fpdfsdk/cpdfsdk_baannot.cpp b/fpdfsdk/cpdfsdk_baannot.cpp
+index 61c06af..e633c26 100644
+--- a/fpdfsdk/cpdfsdk_baannot.cpp
++++ b/fpdfsdk/cpdfsdk_baannot.cpp
+@@ -79,7 +79,7 @@ void CPDFSDK_BAAnnot::DrawAppearance(CFX_RenderDevice* pDevice,
+                                      const CFX_Matrix& mtUser2Device,
+                                      CPDF_Annot::AppearanceMode mode) {
+   annot_->DrawAppearance(GetPageView()->GetPDFPage(), pDevice, mtUser2Device,
+-                         mode);
++                         mode, GetPageView()->GetDrawOptions());
+ }
+ 
+ bool CPDFSDK_BAAnnot::IsAppearanceValid() {
+diff --git a/fpdfsdk/cpdfsdk_pageview.cpp b/fpdfsdk/cpdfsdk_pageview.cpp
+index 339201c..39faac6 100644
+--- a/fpdfsdk/cpdfsdk_pageview.cpp
++++ b/fpdfsdk/cpdfsdk_pageview.cpp
+@@ -88,6 +88,9 @@ void CPDFSDK_PageView::PageView_OnDraw(CFX_RenderDevice* pDevice,
+ #endif  // PDF_ENABLE_XFA
+ 
+   // for pdf/static xfa.
++  AutoRestorer<UnownedPtr<const CPDF_RenderOptions>> restore_options(
++      &draw_options_);
++  draw_options_ = pOptions;
+   auto annot_iteration = CPDFSDK_AnnotIteration::CreateForDrawing(this);
+   for (const auto& pSDKAnnot : annot_iteration) {
+     pSDKAnnot->OnDraw(pDevice, mtUser2Device, pOptions->GetDrawAnnots());
+diff --git a/fpdfsdk/cpdfsdk_pageview.h b/fpdfsdk/cpdfsdk_pageview.h
+index ed02672..60debe3 100644
+--- a/fpdfsdk/cpdfsdk_pageview.h
++++ b/fpdfsdk/cpdfsdk_pageview.h
+@@ -102,6 +102,10 @@ class CPDFSDK_PageView final : public CPDF_Page::View {
+   bool IsLocked() const { return locked_; }
+   void SetBeingDestroyed() { being_destroyed_ = true; }
+   bool IsBeingDestroyed() const { return being_destroyed_; }
++  // Rapida fork-p18 (widget_oc_context): the render options of the draw in
++  // progress (PageView_OnDraw), so a widget's appearance is drawn with them,
++  // optional content included. Null outside a draw.
++  const CPDF_RenderOptions* GetDrawOptions() const { return draw_options_; }
+ 
+  private:
+ #ifdef PDF_ENABLE_XFA
+@@ -130,6 +134,7 @@ class CPDFSDK_PageView final : public CPDF_Page::View {
+   bool valid_ = false;
+   bool locked_ = false;
+   bool being_destroyed_ = false;
++  UnownedPtr<const CPDF_RenderOptions> draw_options_;
+ };
+ 
+ #endif  // FPDFSDK_CPDFSDK_PAGEVIEW_H_
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index a260581..3ed9a9f 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -2991,3 +2991,25 @@ FPDFPage_GetObjectSyntax(FPDF_PAGE page,
+   return dict ? WriteSyntax(dict->GetObjectFor(key).Get(), buffer, buflen) : 0;
+ }
+ 
++// g-lab-bit fork-p18 (annot_render_hide).
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetRenderHidden(FPDF_DOCUMENT document,
++                          FPDF_ANNOTATION annot,
++                          FPDF_BOOL hidden) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!AnnotInDoc(doc, context) || !context->GetAnnotDict()) {
++    return false;
++  }
++  doc->SetAnnotRenderHidden(context->GetMutableAnnotDict(), !!hidden);
++  return true;
++}
++
++// g-lab-bit fork-p18 (annot_render_hide).
++FPDF_EXPORT void FPDF_CALLCONV
++FPDFDoc_ClearRenderHiddenAnnots(FPDF_DOCUMENT document) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (doc) {
++    doc->ClearAnnotRenderHidden();
++  }
++}
+diff --git a/fpdfsdk/fpdf_view.cpp b/fpdfsdk/fpdf_view.cpp
+index 524729d..2d964ac 100644
+--- a/fpdfsdk/fpdf_view.cpp
++++ b/fpdfsdk/fpdf_view.cpp
+@@ -1562,3 +1562,8 @@ FPDF_GetTrailerEnds(FPDF_DOCUMENT document,
+ 
+   return trailer_ends_len;
+ }
++
++// g-lab-bit fork-p18 (fork_version). Bump with every fork-pNN patch.
++FPDF_EXPORT const char* FPDF_CALLCONV FPDF_GetForkVersion() {
++  return "chromium/8076-fork-p18";
++}
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index 0880b85..92014ff 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -1348,6 +1348,21 @@ FPDFPage_GetObjectSyntax(FPDF_PAGE page,
+                          char* buffer,
+                          unsigned long buflen);
+ 
++// Experimental API (g-lab-bit fork-p18, annot_render_hide).
++// Leave |annot| out of every render of |document| while |hidden| is true (for
++// instance while the user drags it, so it is not drawn twice), or draw it
++// again. Render-only: nothing is written to the document, and the setting
++// does not survive closing it. Returns false on bad arguments.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_SetRenderHidden(FPDF_DOCUMENT document,
++                          FPDF_ANNOTATION annot,
++                          FPDF_BOOL hidden);
++
++// Experimental API (g-lab-bit fork-p18, annot_render_hide).
++// Draw every annotation of |document| hidden by FPDFAnnot_SetRenderHidden.
++FPDF_EXPORT void FPDF_CALLCONV
++FPDFDoc_ClearRenderHiddenAnnots(FPDF_DOCUMENT document);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus
+diff --git a/public/fpdfview.h b/public/fpdfview.h
+index 037def4..e80c299 100644
+--- a/public/fpdfview.h
++++ b/public/fpdfview.h
+@@ -1517,6 +1517,12 @@ FPDF_EXPORT FPDF_RESULT FPDF_CALLCONV FPDF_BStr_Set(FPDF_BSTR* bstr,
+ FPDF_EXPORT FPDF_RESULT FPDF_CALLCONV FPDF_BStr_Clear(FPDF_BSTR* bstr);
+ #endif  // PDF_ENABLE_XFA
+ 
++// Experimental API (g-lab-bit fork-p18, fork_version).
++// The fork release this library was built from, e.g. "chromium/8076-fork-p18":
++// a static, NUL-terminated string, so an embedder can check at run time which
++// build it loaded. Each later fork patch updates it.
++FPDF_EXPORT const char* FPDF_CALLCONV FPDF_GetForkVersion();
++
+ #ifdef __cplusplus
+ }
+ #endif

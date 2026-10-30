@@ -591,3 +591,38 @@ a good item and one pointing at object 999; save listing the page with the
 outline never read (control: ok) and after reading it (ok since p17;
 `--expect-p16` asserts the old refusal, which an unpatched artifact gives).
 
+## 25. `fork_p18.patch` (fork-p18): fork version, render-only annotation hide, OC in widgets
+
+Applied by `steps/03-patch.sh` after `fork_p17.patch`. Founder approval
+2026-10-30 (Rapida ra-1okhu, ra-c2kyq.12, ra-4sj5g.1).
+
+- **fork_version** (ra-1okhu): `FPDF_GetForkVersion()` returns
+  `"chromium/8076-fork-p18"`. Rapida compares it at `FPDF_InitLibrary` with the
+  release it was built for and refuses a mismatch, so a DLL with the same
+  exports but older behaviour no longer passes silently. **Bump the string in
+  every later fork patch.**
+- **annot_render_hide** (ra-c2kyq.12): `FPDFAnnot_SetRenderHidden(document,
+  annot, hidden)` and `FPDFDoc_ClearRenderHiddenAnnots(document)`. A hidden
+  annotation is skipped by `CPDF_AnnotList::DisplayPass`, i.e. every page
+  render with annotations. `CPDF_Document` keeps the set (dictionary pointer
+  -> a reference that keeps it alive); nothing is written to the file.
+- **widget_oc_context** (ra-4sj5g.1): `FPDF_FFLDraw` builds an
+  optional-content context (View, honouring the document's view state from
+  `ocg_view_state.patch`), but `CPDFSDK_PageView::PageView_OnDraw` passed
+  widgets only a bool, so `CPDF_Annot::DrawAppearance` rendered their
+  appearance streams with no OC context. The page view now holds the draw's
+  render options for the duration of the draw
+  (`CPDFSDK_PageView::GetDrawOptions`), `CPDFSDK_BAAnnot::DrawAppearance`
+  passes them on, and `CPDF_Annot::DrawAppearance` takes optional render
+  options for `CPDF_RenderContext::Render`.
+
+### Tests
+`testing/fork_p18/run_tests.py`: the version string; a red square
+annotation rendered, hidden (white), shown, hidden and cleared, with a save
+while hidden equal to one without (the random trailer `/ID` aside); a push
+button whose appearance has a plain blue bar and a red area in an OCG that
+`/D` turns off: under `FPDF_FFLDraw` the bar is drawn, the OC area is not,
+and `FPDFDoc_SetOCGViewState(doc, 0, 1)` draws it. A probe build of the driver
+against p17 (stubs for the new calls) gave the OC area red: the bug.
+`--expect-p17` passes when the driver cannot link against a pre-p18 artifact.
+
