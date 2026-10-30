@@ -44,10 +44,12 @@ def classic(objs):
 
 # A red square annotation at [20 20 80 80], and a push button widget at
 # [120 120 180 180] whose appearance has a blue bar (no optional content) at
-# its bottom and a red area marked /OC /oc1, an OCG that /D turns off.
+# its bottom and a red area marked /OC /oc1, an OCG that /D turns off for
+# viewing and its /Usage /Print turns on for printing (/AS Print event).
 FIXTURE = classic({
     1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >>"
-       b" /OCProperties << /OCGs [9 0 R] /D << /OFF [9 0 R] >> >> >>",
+       b" /OCProperties << /OCGs [9 0 R] /D << /OFF [9 0 R]"
+       b" /AS [<< /Event /Print /OCGs [9 0 R] /Category [/Print] >>] >> >> >>",
     2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
     3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R 7 0 R] >>",
     5: b"<< /Type /Annot /Subtype /Square /Rect [20 20 80 80] /F 4 /AP << /N 6 0 R >> >>",
@@ -56,7 +58,7 @@ FIXTURE = classic({
        b" /F 4 /P 3 0 R /AP << /N 8 0 R >> >>",
     8: stream(b"/Type /XObject /Subtype /Form /BBox [0 0 60 60] /Resources << /Properties << /oc1 9 0 R >> >>",
               b"0 0 1 rg 0 0 60 10 re f /OC /oc1 BDC 1 0 0 rg 0 20 60 40 re f EMC"),
-    9: b"<< /Type /OCG /Name (Layer 1) >>",
+    9: b"<< /Type /OCG /Name (Layer 1) /Usage << /Print << /PrintState /ON >> >> >>",
 })
 
 RED, WHITE, BLUE = "255,0,0", "255,255,255", "0,0,255"
@@ -72,6 +74,11 @@ WANT = {
     "widget.plain": BLUE,
     "widget.oc.default": WHITE,
     "widget.oc.on": RED,
+    "widget.oc.view": WHITE,
+    "widget.oc.print": RED,
+    "widget.hidden": WHITE,
+    "widget.again": BLUE,
+    "square.reloaded": WHITE,
 }
 
 

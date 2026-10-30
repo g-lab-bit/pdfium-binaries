@@ -12,6 +12,11 @@
 //   widget.plain       RGB of the widget's non-OC bar under FPDF_FFLDraw
 //   widget.oc.default  RGB of its OC-marked area: the OCG is /OFF in /D
 //   widget.oc.on       ... after FPDFDoc_SetOCGViewState(doc, 0, 1)
+//   widget.oc.view     ... after FPDFDoc_ClearOCGViewState (off again)
+//   widget.oc.print    ... drawn with FPDF_PRINTING: the OCG's print state is ON
+//   widget.hidden      the widget's bar after FPDFAnnot_SetRenderHidden(widget)
+//   widget.again       ... after unhiding it
+//   square.reloaded    the square, hidden, after FPDF_ClosePage + FPDF_LoadPage
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,8 +58,7 @@ static void Pixel(FPDF_BITMAP bmp, int x, int y, const char* key) {
 }
 
 // Page point (x, y) -> bitmap pixel, at scale 1 and no rotation.
-static void PagePixel(FPDF_DOCUMENT doc, FPDF_PAGE page, double x, double y, const char* key) {
-  (void)doc;
+static void PagePixel(FPDF_PAGE page, double x, double y, const char* key) {
   FPDF_BITMAP bmp = FPDFBitmap_Create(SIZE, SIZE, 0);
   FPDFBitmap_FillRect(bmp, 0, 0, SIZE, SIZE, 0xFFFFFFFF);
   FPDF_RenderPageBitmap(bmp, page, 0, 0, SIZE, SIZE, 0, FPDF_ANNOT);
@@ -62,10 +66,10 @@ static void PagePixel(FPDF_DOCUMENT doc, FPDF_PAGE page, double x, double y, con
   FPDFBitmap_Destroy(bmp);
 }
 
-static void FormPixel(FPDF_FORMHANDLE form, FPDF_PAGE page, double x, double y, const char* key) {
+static void FormPixel(FPDF_FORMHANDLE form, FPDF_PAGE page, double x, double y, const char* key, int flags) {
   FPDF_BITMAP bmp = FPDFBitmap_Create(SIZE, SIZE, 0);
   FPDFBitmap_FillRect(bmp, 0, 0, SIZE, SIZE, 0xFFFFFFFF);
-  FPDF_FFLDraw(form, bmp, page, 0, 0, SIZE, SIZE, 0, 0);
+  FPDF_FFLDraw(form, bmp, page, 0, 0, SIZE, SIZE, 0, flags);
   Pixel(bmp, (int)x, SIZE - (int)y, key);
   FPDFBitmap_Destroy(bmp);
 }
@@ -87,17 +91,17 @@ int main(int argc, char** argv) {
   if (!square) { printf("error square\n"); return 1; }
 
   // ra-c2kyq.12: render-only hide.
-  PagePixel(doc, page, 50, 50, "square.shown");
+  PagePixel(page, 50, 50, "square.shown");
   MemWriter before, during;
   Save(doc, &before, argv[1], "before");
   printf("hide.ok %d\n", FPDFAnnot_SetRenderHidden(doc, square, 1));
-  PagePixel(doc, page, 50, 50, "square.hidden");
+  PagePixel(page, 50, 50, "square.hidden");
   Save(doc, &during, argv[1], "during");
   FPDFAnnot_SetRenderHidden(doc, square, 0);
-  PagePixel(doc, page, 50, 50, "square.again");
+  PagePixel(page, 50, 50, "square.again");
   FPDFAnnot_SetRenderHidden(doc, square, 1);
   FPDFDoc_ClearRenderHiddenAnnots(doc);
-  PagePixel(doc, page, 50, 50, "square.cleared");
+  PagePixel(page, 50, 50, "square.cleared");
   printf("hide.badargs %d\n", FPDFAnnot_SetRenderHidden(NULL, square, 1));
   FPDFPage_CloseAnnot(square);
 
@@ -107,13 +111,39 @@ int main(int argc, char** argv) {
   info.version = 1;
   FPDF_FORMHANDLE form = FPDFDOC_InitFormFillEnvironment(doc, &info);
   FORM_OnAfterLoadPage(page, form);
-  FormPixel(form, page, 150, 125, "widget.plain");
-  FormPixel(form, page, 150, 160, "widget.oc.default");
+  FormPixel(form, page, 150, 125, "widget.plain", 0);
+  FormPixel(form, page, 150, 160, "widget.oc.default", 0);
   FPDFDoc_SetOCGViewState(doc, 0, 1);
-  FormPixel(form, page, 150, 160, "widget.oc.on");
+  FormPixel(form, page, 150, 160, "widget.oc.on", 0);
+  FPDFDoc_ClearOCGViewState(doc);
+  FormPixel(form, page, 150, 160, "widget.oc.view", 0);
+  FormPixel(form, page, 150, 160, "widget.oc.print", FPDF_PRINTING);
+  FPDF_ANNOTATION widget = NULL;
+  for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i) {
+    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, i);
+    if (FPDFAnnot_GetSubtype(a) == FPDF_ANNOT_WIDGET) { widget = a; break; }
+    FPDFPage_CloseAnnot(a);
+  }
+  FPDFAnnot_SetRenderHidden(doc, widget, 1);
+  FormPixel(form, page, 150, 125, "widget.hidden", 0);
+  FPDFAnnot_SetRenderHidden(doc, widget, 0);
+  FormPixel(form, page, 150, 125, "widget.again", 0);
+  FPDFPage_CloseAnnot(widget);
   FORM_OnBeforeClosePage(page, form);
   FPDFDOC_ExitFormFillEnvironment(form);
 
+  // The hidden state belongs to the document: it outlives the page object.
+  FPDF_ANNOTATION sq = NULL;
+  for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i) {
+    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, i);
+    if (FPDFAnnot_GetSubtype(a) == FPDF_ANNOT_SQUARE) { sq = a; break; }
+    FPDFPage_CloseAnnot(a);
+  }
+  FPDFAnnot_SetRenderHidden(doc, sq, 1);
+  FPDFPage_CloseAnnot(sq);
+  FPDF_ClosePage(page);
+  page = FPDF_LoadPage(doc, 0);
+  PagePixel(page, 50, 50, "square.reloaded");
   FPDF_ClosePage(page);
   FPDF_CloseDocument(doc);
   FPDF_DestroyLibrary();

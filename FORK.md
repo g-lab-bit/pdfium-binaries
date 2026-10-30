@@ -604,8 +604,11 @@ Applied by `steps/03-patch.sh` after `fork_p17.patch`. Founder approval
 - **annot_render_hide** (ra-c2kyq.12): `FPDFAnnot_SetRenderHidden(document,
   annot, hidden)` and `FPDFDoc_ClearRenderHiddenAnnots(document)`. A hidden
   annotation is skipped by `CPDF_AnnotList::DisplayPass`, i.e. every page
-  render with annotations. `CPDF_Document` keeps the set (dictionary pointer
-  -> a reference that keeps it alive); nothing is written to the file.
+  render with annotations, and by `CPDFSDK_PageView::PageView_OnDraw`, which
+  draws widgets and popups under `FPDF_FFLDraw`; a popup is hidden with its
+  `/Parent`. `CPDF_Document` keeps the set (dictionary pointer -> a reference
+  that keeps it alive); nothing is written to the file. Not thread-safe, like
+  the OCG view state.
 - **widget_oc_context** (ra-4sj5g.1): `FPDF_FFLDraw` builds an
   optional-content context (View, honouring the document's view state from
   `ocg_view_state.patch`), but `CPDFSDK_PageView::PageView_OnDraw` passed
@@ -614,7 +617,11 @@ Applied by `steps/03-patch.sh` after `fork_p17.patch`. Founder approval
   render options for the duration of the draw
   (`CPDFSDK_PageView::GetDrawOptions`), `CPDFSDK_BAAnnot::DrawAppearance`
   passes them on, and `CPDF_Annot::DrawAppearance` takes optional render
-  options for `CPDF_RenderContext::Render`.
+  options for `CPDF_RenderContext::Render`. FFLCommon's OC context takes the Print
+  usage under `FPDF_PRINTING` (it was always View). Side effects of passing the
+  render options: `FPDF_GRAYSCALE` and `FPDF_LCD_TEXT` now apply to widget
+  appearances too. Still open: a widget's own `/OC` entry (on its dictionary)
+  is not checked on the FFLDraw path.
 
 ### Tests
 `testing/fork_p18/run_tests.py`: the version string; a red square
@@ -622,7 +629,10 @@ annotation rendered, hidden (white), shown, hidden and cleared, with a save
 while hidden equal to one without (the random trailer `/ID` aside); a push
 button whose appearance has a plain blue bar and a red area in an OCG that
 `/D` turns off: under `FPDF_FFLDraw` the bar is drawn, the OC area is not,
-and `FPDFDoc_SetOCGViewState(doc, 0, 1)` draws it. A probe build of the driver
+and `FPDFDoc_SetOCGViewState(doc, 0, 1)` draws it. Cleared again, it is off for view but drawn with
+`FPDF_PRINTING` (its `/Usage /Print /PrintState /ON`). The widget hidden with
+`FPDFAnnot_SetRenderHidden` is not drawn by FFLDraw, and is again once shown;
+the square stays hidden after `FPDF_ClosePage` / `FPDF_LoadPage`. A probe build of the driver
 against p17 (stubs for the new calls) gave the OC area red: the bug.
 `--expect-p17` passes when the driver cannot link against a pre-p18 artifact.
 
