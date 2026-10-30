@@ -426,19 +426,20 @@ def main():
     pdf.Root.AcroForm = pikepdf.Dictionary(Fields=[widget])
     pdf.save(wfile)
     # FPDF_RenderPageBitmap never draws widgets (stock: bShowWidget = false);
-    # FPDF_FFLDraw draws them through CPDF_Annot::DrawAppearance, which
-    # renders WITHOUT an optional content context (stock), so the widget's
-    # /OC marked content is ignored there for /D and the view state alike.
-    # The checks pin that measured behaviour; the page is drawn without
-    # FPDF_ANNOT for FFLDraw, so the markup is not on that bitmap.
+    # FPDF_FFLDraw draws them through CPDF_Annot::DrawAppearance. Stock (and
+    # up to fork-p17) rendered that WITHOUT an optional content context, so the
+    # widget's /OC marked content was ignored; since fork-p18
+    # (widget_oc_context) it follows /D and the view state like page content.
+    # The page is drawn without FPDF_ANNOT for FFLDraw, so the markup is not
+    # on that bitmap.
     for states, on in (([], True), (["1=0"], False)):
         r = drv("paths", wfile, *states)
         for path in ("render", "progressive", "render_lod", "progressive_lod", "ffldraw"):
             d = r.get(path, {})
             if path == "ffldraw":
                 ok = (d.get("annot") == WHITE and d.get("content") == (BLUE if on else WHITE)
-                      and d.get("widget") == GREEN)
-                label = "view state %s via ffldraw (page content follows; widget OC ignored, stock)"
+                      and d.get("widget") == (GREEN if on else WHITE))
+                label = "view state %s via ffldraw (page content and widget OC follow, fork-p18)"
             else:
                 ok = (d.get("annot") == (RED if on else WHITE) and d.get("content") == (BLUE if on else WHITE)
                       and d.get("widget") == WHITE)
